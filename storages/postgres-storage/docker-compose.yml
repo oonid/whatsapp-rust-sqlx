@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wa
+      POSTGRES_PASSWORD: wa
+      POSTGRES_DB: whatsapp
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wa -d whatsapp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+# From the workspace root, run the bot with:
+#   DATABASE_URL=postgres://wa:wa@localhost:5433/whatsapp \
+#     cargo run --no-default-features --features postgres-storage,...
+#
+# Or copy .env.example to .env and source it before running.
+
+volumes:
+  postgres_data:

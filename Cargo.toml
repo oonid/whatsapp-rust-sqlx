@@ -14,6 +14,7 @@ members = [
     ".",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
+    "storages/postgres-storage",
     "tests/bench-integration",
     "tests/e2e",
     "transports/tokio-transport",
@@ -29,6 +30,7 @@ default-members = [
     ".",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
+    "storages/postgres-storage",
     "transports/tokio-transport",
     "wacore",
     "wacore/appstate",
@@ -115,6 +117,7 @@ tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
 tokio-runtime = ["dep:tokio"]
 signal = ["tokio-runtime", "tokio/signal"]
 sqlite-storage = ["whatsapp-rust-sqlite-storage"]
+postgres-storage = ["whatsapp-rust-postgres-storage"]
 tokio-native = ["tokio-runtime", "tokio/rt-multi-thread"]
 
 [dependencies]
@@ -144,6 +147,7 @@ wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
 whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.6.0", optional = true }
+whatsapp-rust-postgres-storage = { path = "./storages/postgres-storage", version = "0.6.0", optional = true }
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.6.0", optional = true }
 whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.6.0", optional = true }
 

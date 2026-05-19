@@ -10,6 +10,9 @@ pub mod traits;
 #[cfg(feature = "sqlite-storage")]
 pub use whatsapp_rust_sqlite_storage::SqliteStore;
 
+#[cfg(feature = "postgres-storage")]
+pub use whatsapp_rust_postgres_storage::PostgresStore;
+
 pub use crate::store::traits::*;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;

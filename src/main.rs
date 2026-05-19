@@ -6,7 +6,10 @@ use waproto::whatsapp as wa;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::{Bot, MessageContext};
 use whatsapp_rust::pair_code::PairCodeOptions;
+#[cfg(not(feature = "postgres-storage"))]
 use whatsapp_rust::store::SqliteStore;
+#[cfg(feature = "postgres-storage")]
+use whatsapp_rust::store::PostgresStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -53,6 +56,7 @@ fn main() {
         .expect("Failed to build tokio runtime");
 
     rt.block_on(async {
+        #[cfg(not(feature = "postgres-storage"))]
         let backend = match SqliteStore::new("whatsapp.db").await {
             Ok(store) => Arc::new(store),
             Err(e) => {
@@ -60,7 +64,22 @@ fn main() {
                 return;
             }
         };
+        #[cfg(not(feature = "postgres-storage"))]
         info!("SQLite backend initialized successfully.");
+
+        #[cfg(feature = "postgres-storage")]
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://wa:wa@localhost:5433/whatsapp".to_string());
+        #[cfg(feature = "postgres-storage")]
+        let backend = match PostgresStore::new(&db_url).await {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                error!("Failed to create Postgres backend: {}", e);
+                return;
+            }
+        };
+        #[cfg(feature = "postgres-storage")]
+        info!("Postgres backend initialized successfully.");
 
         let transport_factory = TokioWebSocketTransportFactory::new();
         let http_client = UreqHttpClient::new();
