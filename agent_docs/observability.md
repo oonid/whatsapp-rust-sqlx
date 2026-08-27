@@ -142,10 +142,27 @@ Walks every internal collection and returns entry counts plus estimated
 retained bytes (`MemoryReport`, per-collection `CollectionStats`). Byte
 figures come from the `wacore::stats::HeapSize` trait:
 
-- Signal records use their protobuf encoded size (`SessionRecord::
-  estimated_size`, buffa `compute_size` — no encode buffer allocated).
+- Signal records walk their live structures (`SessionRecord::estimated_size`,
+  `SenderKeyRecord::estimated_size`) — struct sizes, `Vec` capacities and the
+  bytes each field points at. Not the protobuf-encoded size, which is what
+  these reported until it was found to understate a session carrying skipped
+  message keys by roughly 5x: the encoded form omits both the `Option` slots a
+  seed-only `MessageKey` leaves empty and the `Vec` capacity behind the
+  backlog. Size computation only — no encode buffer is allocated.
 - Collections sum key/payload capacities (`GroupInfo`, `DeviceListRecord`,
-  `LidPnEntry`, `ResolvedGroupDevices`, ...).
+  `LidPnEntry`, `ResolvedGroupDevices`, ...). Where a report charges for a hash
+  table's slots it should go through `wacore::stats::hash_table_bytes`, which
+  converts a `capacity()` into the buckets hashbrown actually owns: it rounds to
+  a power of two and keeps an eighth free, so `capacity() * size_of::<(K, V)>()`
+  under-counts by up to a half. The device-list memos
+  (`GroupDevicesMemo`/`DmDevicesMemo`) and the sender-key device cache use it;
+  `SignalStoreCache::memory_stats` does **not** — it sums key and payload bytes
+  and does not charge for its tables' slots at all, so its figures are a floor.
+  `wacore/tests/hash_table_bytes_matches_the_allocator.rs` checks the conversion
+  against a counting `GlobalAlloc`. After removals the figure is a lower bound
+  rather than exact: hashbrown leaves tombstones that consume growth slots
+  without shrinking the bucket array, so `capacity()` can read below the
+  canonical capacity for the buckets really held.
 - Store-backed caches (Redis etc.) report `bytes: 0` — their entries are not
   process memory.
 - In-flight history sync reports queued/running task count, retained compressed

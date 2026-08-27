@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use buffa::{Message, MessageField};
+use buffa::MessageField;
 
 use hmac::{HmacReset, KeyInit, Mac};
 use sha2::Sha256;
@@ -945,28 +945,75 @@ impl SenderKeyRecord {
         Ok(buf)
     }
 
-    /// Estimated in-memory footprint proxy: encoded size of each state's
-    /// structure plus the out-of-order message-key backlog (held outside the
-    /// protobuf in memory). Size computation only — nothing is cloned or
-    /// encoded. Used by per-session memory reports.
+    /// Retained in-memory bytes of every state this record holds.
+    ///
+    /// Walks the live structures rather than asking for their protobuf-encoded
+    /// size, which is what this used to report — the encoded form omits the
+    /// `Option` slots and `Vec` capacity that memory actually pays for. Size
+    /// computation only: nothing is cloned or encoded.
+    ///
+    /// Each container's inline slots are charged once, here, and the walker
+    /// below adds only what hangs off them. `sender_chain` and `state` live
+    /// inline in `SenderKeyState`, so they are already inside the capacity
+    /// term; adding their `size_of` again would make the figure grow faster
+    /// than the memory it describes.
+    ///
+    /// Not counted: the lazily built signing/verifying key memos. They are
+    /// fixed-size, shared behind an `Arc` between every clone of a state, and
+    /// bounded by the number of cached states the report already lists as
+    /// entries — so charging them per owner would over-count sharing to
+    /// describe a constant.
     pub fn estimated_size(&self) -> usize {
-        let mut cache = buffa::SizeCache::new();
-        self.states
-            .iter()
-            .map(|s| {
-                s.state.compute_size(&mut cache) as usize
-                    + s.message_keys.len() * size_of::<StoredMessageKey>()
-                    + s.sender_chain.map_or(0, |_| size_of::<SenderChainKey>())
-            })
-            .sum()
+        size_of::<Self>()
+            + self.states.capacity() * size_of::<SenderKeyState>()
+            + self
+                .states
+                .iter()
+                .map(|s| {
+                    state_structure_pointed_bytes(&s.state)
+                        // The `Arc` owns a `Vec` header plus its buffer.
+                        + size_of::<Vec<StoredMessageKey>>()
+                        + s.message_keys.capacity() * size_of::<StoredMessageKey>()
+                })
+                .sum::<usize>()
     }
+}
+
+/// Heap bytes one sender-key state structure points at, excluding the
+/// `SenderKeyStateStructure` itself — it lives inline in `SenderKeyState`.
+///
+/// The skipped-key backlog is not walked here: this record keeps it in
+/// [`StoredMessageKey`] (36 bytes, seed inline) rather than in the protobuf's
+/// `SenderMessageKey`, and `estimated_size` counts it there.
+fn state_structure_pointed_bytes(state: &SenderKeyStateStructure) -> usize {
+    fn bytes_field(field: &Option<bytes::Bytes>) -> usize {
+        field.as_ref().map_or(0, |b| b.len())
+    }
+
+    // `MessageField` is an `Option<Box<T>>`, so a set one owns its `T`.
+    state.sender_chain_key.as_option().map_or(0, |chain| {
+        size_of::<sender_key_state_structure::SenderChainKey>() + bytes_field(&chain.seed)
+    }) + state.sender_signing_key.as_option().map_or(0, |signing| {
+        size_of::<sender_key_state_structure::SenderSigningKey>()
+            + bytes_field(&signing.public)
+            + bytes_field(&signing.private)
+    }) + state.sender_message_keys.capacity()
+        * size_of::<sender_key_state_structure::SenderMessageKey>()
+        + state
+            .sender_message_keys
+            .iter()
+            .map(|key| bytes_field(&key.seed))
+            .sum::<usize>()
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    // The protobuf encode helpers are only needed to build fixtures here; the
+    // module itself no longer encodes anything.
     use crate::protocol::KeyPair;
+    use buffa::Message;
 
     /// An injected derivation has to be indistinguishable from the one the
     /// state would have produced, or the API trades correctness for speed.

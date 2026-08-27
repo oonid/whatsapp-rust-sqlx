@@ -752,7 +752,7 @@ const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
 #[derive(Clone)]
 pub struct SessionRecord {
     current_session: Option<SessionState>,
-    previous_sessions: Arc<Vec<SessionStructure>>,
+    previous_sessions: Arc<Vec<ArchivedSession>>,
     /// Durability lease over sender-chain counters, or the consumer's
     /// declaration that it persists before the wire and needs none. Any state
     /// entering service from a snapshot must fast-forward past a live lease
@@ -760,6 +760,191 @@ pub struct SessionRecord {
     /// counter, so re-deriving a spent counter reuses a (key, IV) pair. The
     /// pending flag it carries is transient and never serialized.
     lease: CounterLease,
+}
+
+/// Bytes one `Bytes` field holds beyond its inline representation.
+///
+/// `Bytes` may point into a shared buffer, in which case the slice is counted
+/// against whichever field names it. That over-counts a session decoded from
+/// one contiguous blob and under-counts nothing, which is the safe direction
+/// for a report that exists to catch growth.
+fn bytes_field_retained(field: &Option<bytes::Bytes>) -> usize {
+    field.as_ref().map_or(0, |b| b.len())
+}
+
+fn vec_field_retained(field: &Option<Vec<u8>>) -> usize {
+    field.as_ref().map_or(0, Vec::capacity)
+}
+
+/// Heap bytes a chain points at, **excluding the `Chain` itself**.
+///
+/// Every one of these walkers follows that rule: whoever owns the value counts
+/// its inline size once — a `Vec` element through the buffer's capacity, a
+/// `MessageField` through the `Box` it always is — and the walker adds only
+/// what hangs off it. Counting `size_of::<Chain>()` here as well is how a
+/// report starts growing faster than the memory it describes.
+fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
+    vec_field_retained(&chain.sender_ratchet_key)
+        + vec_field_retained(&chain.sender_ratchet_key_private)
+        + chain.chain_key.as_option().map_or(0, |key| {
+            size_of::<session_structure::chain::ChainKey>() + bytes_field_retained(&key.key)
+        })
+        // The skipped-key backlog: capacity, not length, because the `Vec`
+        // keeps its allocation when keys are consumed or pruned.
+        + chain.message_keys.capacity() * size_of::<session_structure::chain::MessageKey>()
+        + chain
+            .message_keys
+            .iter()
+            .map(|key| {
+                bytes_field_retained(&key.cipher_key)
+                    + bytes_field_retained(&key.mac_key)
+                    + bytes_field_retained(&key.iv)
+                    + bytes_field_retained(&key.seed)
+            })
+            .sum::<usize>()
+}
+
+/// Heap bytes one session state points at, excluding the `SessionStructure`
+/// itself.
+fn session_pointed_bytes(session: &SessionStructure) -> usize {
+    vec_field_retained(&session.local_identity_public)
+        + vec_field_retained(&session.remote_identity_public)
+        + vec_field_retained(&session.root_key)
+        + vec_field_retained(&session.alice_base_key)
+        // `MessageField` is an `Option<Box<T>>`, so a set one owns a `T` on the
+        // heap; a `Vec` element does not, and is covered by the capacity term.
+        + session
+            .sender_chain
+            .as_option()
+            .map_or(0, |chain| {
+                size_of::<session_structure::Chain>() + chain_pointed_bytes(chain)
+            })
+        + session.receiver_chains.capacity() * size_of::<session_structure::Chain>()
+        + session
+            .receiver_chains
+            .iter()
+            .map(chain_pointed_bytes)
+            .sum::<usize>()
+        + session.pending_key_exchange.as_option().map_or(0, |pending| {
+            size_of::<session_structure::PendingKeyExchange>()
+                + vec_field_retained(&pending.local_base_key)
+                + vec_field_retained(&pending.local_base_key_private)
+                + vec_field_retained(&pending.local_ratchet_key)
+                + vec_field_retained(&pending.local_ratchet_key_private)
+                + vec_field_retained(&pending.local_identity_key)
+                + vec_field_retained(&pending.local_identity_key_private)
+        })
+        + session.pending_pre_key.as_option().map_or(0, |pending| {
+            size_of::<session_structure::PendingPreKey>()
+                + vec_field_retained(&pending.base_key)
+                + vec_field_retained(&pending.kyber_ciphertext)
+        })
+}
+
+/// One archived session state, retained as the protobuf bytes it was
+/// persisted as rather than as a parsed [`SessionStructure`].
+///
+/// A record may hold up to [`consts::ARCHIVED_STATES_MAX_LENGTH`] of these,
+/// and a parsed state is far larger than its encoding: every absent `optional`
+/// field still occupies its slot, and a chain's skipped-key backlog costs a
+/// 136-byte `MessageKey` per key against ~36 bytes on the wire. They are also
+/// cold — nothing reads an archived state until a message arrives for a
+/// session that was replaced, which is the out-of-order and re-pair case, not
+/// the steady one. Keeping the bytes shrinks the resident record, makes
+/// serialization a copy instead of a re-encode, and makes loading a record
+/// stop deep-copying states it will probably never look at.
+///
+/// Load-time validation is deliberately unchanged: `deserialize` still decodes
+/// every archived state to reject a malformed record there, because deferring
+/// that rejection to a promotion would turn a quarantined row into an error
+/// that strands the address (`agent_docs/signal_durability.md`). The parsed
+/// tree is then dropped instead of retained.
+#[derive(Clone, PartialEq, Eq)]
+struct ArchivedSession(Box<[u8]>);
+
+/// Append `msg`'s encoding to `out`.
+///
+/// Direct buffa calls, on the same grounds as `serialize_into_inner` below:
+/// the session storage protos are encoded only inside this file, so this
+/// duplicates nothing — `serialize_into_inner` already instantiates
+/// `SessionStructure`'s encode tree here. A `waproto::codec` pin would add a
+/// second copy of that tree to `waproto`, which is the cost the rule exists to
+/// avoid, not to incur.
+#[allow(clippy::disallowed_methods)]
+fn encode_message(msg: &impl Message, out: &mut Vec<u8>) {
+    let mut cache = buffa::SizeCache::new();
+    let len = msg.compute_size(&mut cache) as usize;
+    out.reserve(len);
+    msg.write_to(&mut cache, out);
+}
+
+impl ArchivedSession {
+    fn encode(session: &SessionStructure) -> Self {
+        let mut buf = Vec::new();
+        encode_message(session, &mut buf);
+        Self(buf.into_boxed_slice())
+    }
+
+    /// Decode through the view, which `deserialize` already instantiates for
+    /// every archived state — an owned `Message::decode` would be a second
+    /// decode tree for the same type.
+    fn decode(&self) -> Result<SessionStructure, InvalidSessionError> {
+        self.view()?
+            .to_owned_message()
+            .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))
+    }
+
+    /// Read just the two fields that identify a session, without building the
+    /// owned tree — this runs once per archived state on the promotion path.
+    fn view(&self) -> Result<waproto::whatsapp::SessionStructureView<'_>, InvalidSessionError> {
+        use buffa::view::MessageView as _;
+        waproto::whatsapp::SessionStructureView::decode_view(&self.0)
+            .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// The raw bytes of each `previousSessions` element, in wire order, capped at
+/// `limit`.
+///
+/// A scan of the record's own top-level fields rather than anything the
+/// decoded view offers: `RepeatedView` hands back decoded element views, and
+/// what is wanted here is the untouched encoding of each element so a
+/// re-serialized record is byte-for-byte what was read. The record has already
+/// been decoded as a view by the caller, so malformed input is rejected there;
+/// this pass fails closed on the same shapes anyway.
+fn archived_session_slices(
+    mut bytes: &[u8],
+    limit: usize,
+) -> Result<Vec<&[u8]>, InvalidSessionError> {
+    use buffa::encoding::{Tag, WireType, decode_varint, skip_field};
+
+    const PREVIOUS_SESSIONS_FIELD: u32 = 2;
+    let err = || InvalidSessionError("failed to decode session record protobuf");
+
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let tag = Tag::decode(&mut bytes).map_err(|_| err())?;
+        if tag.field_number() == PREVIOUS_SESSIONS_FIELD
+            && tag.wire_type() == WireType::LengthDelimited
+        {
+            let len = usize::try_from(decode_varint(&mut bytes).map_err(|_| err())?)
+                .map_err(|_| err())?;
+            if bytes.len() < len {
+                return Err(err());
+            }
+            if out.len() < limit {
+                out.push(&bytes[..len]);
+            }
+            bytes = &bytes[len..];
+        } else {
+            skip_field(tag, &mut bytes).map_err(|_| err())?;
+        }
+    }
+    Ok(out)
 }
 
 impl SessionRecord {
@@ -794,7 +979,9 @@ impl SessionRecord {
             .previous_sessions
             .into_iter()
             .take(consts::ARCHIVED_STATES_MAX_LENGTH)
-            .map(session_structure_from_components)
+            .map(|components| {
+                session_structure_from_components(components).map(|s| ArchivedSession::encode(&s))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -822,10 +1009,11 @@ impl SessionRecord {
             .current_session
             .map(|state| session_components_from_structure(state.session))
             .transpose()?;
-        let previous_sessions = Arc::try_unwrap(self.previous_sessions)
-            .unwrap_or_else(|shared| shared.as_ref().clone())
-            .into_iter()
-            .map(|session| {
+        let previous_sessions = self
+            .previous_sessions
+            .iter()
+            .map(|archived| {
+                let session = archived.decode()?;
                 if reserved_sender_chain_index == 0 {
                     return session_components_from_structure(session);
                 }
@@ -879,10 +1067,16 @@ impl SessionRecord {
         if let Some(state) = self.current_session.as_mut() {
             state.fast_forward_sender_chain_or_drop(ceiling);
         }
-        for session in Arc::make_mut(&mut self.previous_sessions) {
-            let mut state = SessionState::from_session_structure(std::mem::take(session));
+        for archived in Arc::make_mut(&mut self.previous_sessions) {
+            // A corrupt archived state cannot be burned, and must not be left
+            // holding a lease the record is about to forget. Decoding fails
+            // closed here the same way promoting it would.
+            let Ok(session) = archived.decode() else {
+                continue;
+            };
+            let mut state = SessionState::from_session_structure(session);
             state.fast_forward_sender_chain_or_drop(ceiling);
-            *session = state.session;
+            *archived = ArchivedSession::encode(&state.session);
         }
         self.lease.waive();
     }
@@ -957,14 +1151,23 @@ impl SessionRecord {
         let view = RecordStructureView::decode_view(bytes)
             .map_err(|_| InvalidSessionError("failed to decode session record protobuf"))?;
 
+        // Archived states are validated here exactly as before — the owned
+        // decode below is what rejects a malformed one, and dropping it would
+        // move that rejection to a later promotion, where an error strands the
+        // address instead of quarantining the row (see
+        // `agent_docs/signal_durability.md`). What changes is what is *kept*:
+        // their untouched encoding rather than the parsed tree, so a record
+        // holds a fraction of the bytes and re-serializes byte-for-byte.
         let limit = consts::ARCHIVED_STATES_MAX_LENGTH;
-        let previous_sessions: Vec<SessionStructure> = view
-            .previous_sessions
+        view.previous_sessions
             .iter()
             .take(limit)
-            .map(|sv| sv.to_owned_message())
-            .collect::<Result<_, _>>()
+            .try_for_each(|sv| sv.to_owned_message().map(drop))
             .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))?;
+        let previous_sessions: Vec<ArchivedSession> = archived_session_slices(bytes, limit)?
+            .into_iter()
+            .map(|raw| ArchivedSession(Box::from(raw)))
+            .collect();
 
         let local_fields = crate::protocol::local_field::decode_local_record_fields(
             bytes,
@@ -1059,11 +1262,14 @@ impl SessionRecord {
     /// The session is converted from SessionStructure to SessionState.
     pub fn take_previous_session(&mut self, index: usize) -> Option<SessionState> {
         if index < self.previous_sessions.len() {
-            Some(
-                Arc::make_mut(&mut self.previous_sessions)
-                    .remove(index)
-                    .into(),
-            )
+            let archived = Arc::make_mut(&mut self.previous_sessions).remove(index);
+            // Removed either way. A state that got past `deserialize` and
+            // still cannot be decoded is not promotable, and leaving it in
+            // place would have every later search trip over it again.
+            archived
+                .decode()
+                .ok()
+                .map(SessionState::from_session_structure)
         } else {
             None
         }
@@ -1079,11 +1285,12 @@ impl SessionRecord {
     /// the caller is expected to restore only what was taken.
     pub fn restore_previous_session(&mut self, index: usize, state: SessionState) {
         let structure: SessionStructure = state.into();
+        let archived = ArchivedSession::encode(&structure);
         let sessions = Arc::make_mut(&mut self.previous_sessions);
         if index <= sessions.len() {
-            sessions.insert(index, structure);
+            sessions.insert(index, archived);
         } else {
-            sessions.push(structure);
+            sessions.push(archived);
         }
     }
 
@@ -1092,7 +1299,7 @@ impl SessionRecord {
     ) -> impl ExactSizeIterator<Item = Result<SessionState, InvalidSessionError>> + '_ {
         self.previous_sessions
             .iter()
-            .map(|structure| Ok(structure.clone().into()))
+            .map(|archived| archived.decode().map(SessionState::from_session_structure))
     }
 
     /// Find the index of a previous session matching the given version and alice_base_key.
@@ -1105,9 +1312,11 @@ impl SessionRecord {
         version: u32,
         alice_base_key: &[u8],
     ) -> Result<Option<usize>, InvalidSessionError> {
-        for (i, session) in self.previous_sessions.iter().enumerate() {
-            // Check version directly from protobuf
-            let session_version = match session.session_version.unwrap_or(0) {
+        for (i, archived) in self.previous_sessions.iter().enumerate() {
+            // A view, not an owned decode: the search reads two scalar fields
+            // per candidate and only the winner is ever materialized.
+            let view = archived.view()?;
+            let session_version = match view.session_version.unwrap_or(0) {
                 0 => 2, // Default version
                 v => v,
             };
@@ -1116,8 +1325,7 @@ impl SessionRecord {
                 continue;
             }
 
-            // Check alice_base_key directly from protobuf
-            let session_base_key = session.alice_base_key.as_deref().unwrap_or(&[]);
+            let session_base_key = view.alice_base_key.unwrap_or(&[]);
             if alice_base_key.ct_eq(session_base_key).into() {
                 return Ok(Some(i));
             }
@@ -1167,7 +1375,7 @@ impl SessionRecord {
                 sessions.pop();
             }
             current_session.clear_unacknowledged_pre_key_message();
-            sessions.insert(0, current_session.session);
+            sessions.insert(0, ArchivedSession::encode(&current_session.session));
             true
         } else {
             false
@@ -1225,23 +1433,19 @@ impl SessionRecord {
             .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
 
-        // Sizing pass for the archived states. Their encoded lengths are needed
-        // twice (to reserve, then to write each length prefix), and a scratch
-        // `Vec` for them allocated on every flush. `previous_sessions` holds 0
-        // to 3 states in the common case, so the lengths land in a stack array
-        // and only a deep archive falls back to the heap.
-        const INLINE_PREVIOUS_LENS: usize = 8;
-        let mut inline_msg_lens = [0usize; INLINE_PREVIOUS_LENS];
-        let mut spilled_msg_lens: Vec<usize> = Vec::new();
-        let mut previous_len = 0usize;
-        for (i, session) in self.previous_sessions.iter().enumerate() {
-            let msg_len = session.compute_size(&mut cache) as usize;
-            previous_len += 1 + varint_len(msg_len as u64) + msg_len;
-            match inline_msg_lens.get_mut(i) {
-                Some(slot) => *slot = msg_len,
-                None => spilled_msg_lens.push(msg_len),
-            }
-        }
+        // Archived states are already encoded, so there is no sizing pass to
+        // run and no scratch array of lengths to carry: each contributes its
+        // own length, and writing it is a `extend_from_slice`. The stack array
+        // and heap spill this replaced existed only to avoid computing each
+        // length twice.
+        let previous_len: usize = self
+            .previous_sessions
+            .iter()
+            .map(|archived| {
+                let msg_len = archived.as_bytes().len();
+                1 + varint_len(msg_len as u64) + msg_len
+            })
+            .sum();
 
         let reserved = self.lease.ceiling();
         let incarnation = incarnation.filter(|_| reserved > 0);
@@ -1262,12 +1466,11 @@ impl SessionRecord {
         {
             write_len_delimited(1, &state.session, msg_len, &mut cache, buf);
         }
-        for (i, session) in self.previous_sessions.iter().enumerate() {
-            let msg_len = match inline_msg_lens.get(i) {
-                Some(msg_len) => *msg_len,
-                None => spilled_msg_lens[i - INLINE_PREVIOUS_LENS],
-            };
-            write_len_delimited(2, session, msg_len, &mut cache, buf);
+        for archived in self.previous_sessions.iter() {
+            let bytes = archived.as_bytes();
+            Tag::new(2, WireType::LengthDelimited).encode(buf);
+            encode_varint(bytes.len() as u64, buf);
+            buf.extend_from_slice(bytes);
         }
         if reserved > 0 {
             Tag::new(RESERVED_SENDER_CHAIN_INDEX_FIELD, WireType::Varint).encode(buf);
@@ -1278,22 +1481,36 @@ impl SessionRecord {
         }
     }
 
-    /// Estimated in-memory footprint proxy: the protobuf-encoded size of the
-    /// current plus archived states. Size computation only — no encode buffer
-    /// is allocated. Used by per-session memory reports.
+    /// Retained in-memory bytes of the current plus archived states.
+    ///
+    /// Walks the live structures rather than asking for their protobuf-encoded
+    /// size, which is what this used to report. The two are far apart: a
+    /// skipped message key is 36 bytes on the wire but a 136-byte
+    /// `MessageKey` plus a 32-byte `Bytes` allocation in memory, because the
+    /// three fields a modern seed-only key leaves empty still occupy their
+    /// `Option<Bytes>` slots. A session with a backlog of skipped keys was
+    /// therefore reported at roughly a fifth of what it costs — the wrong
+    /// direction for the one structure whose growth these reports exist to
+    /// catch. Size computation only: nothing is cloned or encoded.
+    ///
+    /// Each container's inline slots are charged once, by whoever owns them;
+    /// the walkers above add only what hangs off those slots.
     pub fn estimated_size(&self) -> usize {
-        let mut cache = buffa::SizeCache::new();
         let current = self
             .current_session
             .as_ref()
-            .map(|s| s.session.compute_size(&mut cache) as usize)
+            .map(|s| session_pointed_bytes(&s.session))
             .unwrap_or(0);
-        let previous: usize = self
-            .previous_sessions
-            .iter()
-            .map(|s| s.compute_size(&mut cache) as usize)
-            .sum();
-        current + previous
+        // The `Arc` owns a `Vec` header plus its buffer; each archived state
+        // is its own boxed slice of encoded bytes.
+        let previous = size_of::<Vec<ArchivedSession>>()
+            + self.previous_sessions.capacity() * size_of::<ArchivedSession>()
+            + self
+                .previous_sessions
+                .iter()
+                .map(|archived| archived.as_bytes().len())
+                .sum::<usize>();
+        size_of::<Self>() + current + previous
     }
 
     pub fn remote_registration_id(&self) -> Result<u32, SignalProtocolError> {
@@ -1710,6 +1927,159 @@ mod tests {
         }
     }
 
+    /// Every walker charges only what hangs off a slot, and the owner charges
+    /// the slot — so adding a receiver chain must raise the figure by one
+    /// chain's worth, not two. This is the shape that made the previous
+    /// version report memory growing faster than it did.
+    #[test]
+    fn a_chain_is_charged_once_not_once_per_walker() {
+        let empty = make_cache_shape_session(1, 0, 0);
+        let mut with_one = empty.clone();
+        with_one.receiver_chains = vec![session_structure::Chain {
+            sender_ratchet_key: None,
+            sender_ratchet_key_private: None,
+            chain_key: MessageField::none(),
+            message_keys: Vec::new(),
+        }];
+
+        let delta = session_pointed_bytes(&with_one) - session_pointed_bytes(&empty);
+        assert_eq!(
+            delta,
+            with_one.receiver_chains.capacity() * size_of::<session_structure::Chain>(),
+            "a bare receiver chain costs its slot and nothing more"
+        );
+    }
+
+    /// The archive is the deepest part of a record — up to
+    /// `ARCHIVED_STATES_MAX_LENGTH` states, each with its own chains and
+    /// skipped-key backlog — and the coldest: nothing reads one until a
+    /// message arrives for a session that was replaced. Held as bytes it
+    /// costs a fraction of the parsed tree, and the record still round-trips
+    /// byte-for-byte.
+    #[test]
+    fn archived_states_are_held_as_bytes_not_parsed_trees() {
+        // Seed-only message keys: the shape a session written by this code
+        // actually carries, and the one the parsed form is worst at — the
+        // three fields it leaves empty still occupy their `Option<Bytes>`
+        // slots in memory but cost nothing on the wire.
+        let archived: Vec<SessionStructure> = (0..8u8)
+            .map(|i| {
+                let mut session = make_cache_shape_session(i.wrapping_mul(7).wrapping_add(3), 0, 0);
+                session.receiver_chains = (0..3)
+                    .map(|c| session_structure::Chain {
+                        sender_ratchet_key: Some(vec![c as u8; 33]),
+                        sender_ratchet_key_private: Some(vec![c as u8; 32]),
+                        chain_key: MessageField::some(session_structure::chain::ChainKey {
+                            index: Some(c),
+                            key: Some(vec![c as u8; 32].into()),
+                        }),
+                        message_keys: (0..40)
+                            .map(|k| session_structure::chain::MessageKey {
+                                index: Some(k),
+                                cipher_key: None,
+                                mac_key: None,
+                                iv: None,
+                                seed: Some(vec![k as u8; 32].into()),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                session
+            })
+            .collect();
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(
+                make_cache_shape_session(1, 1, 2),
+            )),
+            previous_sessions: Arc::new(archived.iter().map(ArchivedSession::encode).collect()),
+            lease: CounterLease::default(),
+        };
+
+        let parsed: usize = archived
+            .iter()
+            .map(|session| size_of::<SessionStructure>() + session_pointed_bytes(session))
+            .sum();
+        let held: usize = record
+            .previous_sessions
+            .iter()
+            .map(|a| a.as_bytes().len())
+            .sum();
+        assert!(
+            held * 3 < parsed,
+            "the archive should cost a fraction of its parsed form: {held} B held vs \
+             {parsed} B parsed"
+        );
+
+        // Nothing is lost: the record still serializes to the same bytes and
+        // every archived state still decodes to what went in.
+        let round_tripped = SessionRecord::deserialize(&record.serialize().expect("serialize"))
+            .expect("deserialize");
+        assert_eq!(round_tripped.previous_session_count(), archived.len());
+        for (i, original) in archived.iter().enumerate() {
+            assert_eq!(
+                &round_tripped.previous_sessions[i]
+                    .decode()
+                    .expect("archived state decodes"),
+                original,
+                "archived state {i} changed across the round trip"
+            );
+        }
+    }
+
+    /// What these reports exist to catch is a receiver chain accumulating
+    /// skipped message keys — up to `MAX_MESSAGE_KEYS` of them per chain. That
+    /// only works if the figure is memory, not wire bytes: a modern seed-only
+    /// key is ~36 bytes encoded and 136 bytes of `MessageKey` plus a 32-byte
+    /// `Bytes` allocation in memory, because the three fields it leaves empty
+    /// still occupy their `Option<Bytes>` slots.
+    #[test]
+    fn skipped_message_keys_are_reported_at_their_in_memory_cost() {
+        const KEYS: usize = 500;
+
+        let message_keys: Vec<session_structure::chain::MessageKey> = (0..KEYS)
+            .map(|index| session_structure::chain::MessageKey {
+                index: Some(index as u32),
+                cipher_key: None,
+                mac_key: None,
+                iv: None,
+                seed: Some(vec![7u8; 32].into()),
+            })
+            .collect();
+        let chain = session_structure::Chain {
+            sender_ratchet_key: Some(vec![1u8; 33]),
+            sender_ratchet_key_private: Some(vec![2u8; 32]),
+            chain_key: MessageField::some(session_structure::chain::ChainKey {
+                index: Some(0),
+                key: Some(vec![3u8; 32].into()),
+            }),
+            message_keys,
+        };
+        let mut session = make_cache_shape_session(1, 0, 0);
+        session.receiver_chains = vec![chain];
+
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(session.clone())),
+            previous_sessions: Arc::new(Vec::new()),
+            lease: CounterLease::default(),
+        };
+
+        let reported = record.estimated_size();
+        let backlog = KEYS * size_of::<session_structure::chain::MessageKey>();
+        assert!(
+            reported >= backlog,
+            "a {KEYS}-key backlog occupies at least {backlog} B; reported {reported} B"
+        );
+
+        // And the figure this replaced: the encoded size, which is what the
+        // report used to hand back for the very same record.
+        let encoded = session.encode_to_vec().len();
+        assert!(
+            reported > encoded * 3,
+            "the in-memory figure ({reported} B) must be far above the encoded \
+             one ({encoded} B) for a seed-only backlog"
+        );
+    }
+
     fn make_cache_shape_session(
         seed: u8,
         receiver_chain_count: usize,
@@ -2104,7 +2474,11 @@ mod tests {
             current_session: MessageField::some(
                 record.current_session.as_ref().unwrap().session.clone(),
             ),
-            previous_sessions: record.previous_sessions.as_ref().clone(),
+            previous_sessions: record
+                .previous_sessions
+                .iter()
+                .map(|archived| archived.decode().expect("archived state decodes"))
+                .collect(),
         }
         .encode_to_vec();
 
@@ -2125,7 +2499,12 @@ mod tests {
         ];
         let record = SessionRecord {
             current_session: Some(SessionState::from_session_structure(current.clone())),
-            previous_sessions: Arc::new(previous_sessions.clone()),
+            previous_sessions: Arc::new(
+                previous_sessions
+                    .iter()
+                    .map(ArchivedSession::encode)
+                    .collect(),
+            ),
             lease: CounterLease::default(),
         };
         let expected = waproto::whatsapp::RecordStructure {
@@ -2169,7 +2548,12 @@ mod tests {
 
         let record = SessionRecord {
             current_session: Some(SessionState::from_session_structure(current.clone())),
-            previous_sessions: Arc::new(previous_sessions.clone()),
+            previous_sessions: Arc::new(
+                previous_sessions
+                    .iter()
+                    .map(ArchivedSession::encode)
+                    .collect(),
+            ),
             lease: CounterLease::default(),
         };
         let expected = waproto::whatsapp::RecordStructure {
@@ -2195,7 +2579,8 @@ mod tests {
         for _ in 0..(consts::ARCHIVED_STATES_MAX_LENGTH + 10) {
             let key = KeyPair::generate(&mut rng()).public_key;
             let state = create_test_session_state(3, &key);
-            Arc::make_mut(&mut record.previous_sessions).push(state.session);
+            Arc::make_mut(&mut record.previous_sessions)
+                .push(ArchivedSession::encode(&state.session));
         }
 
         // Serialize
