@@ -196,11 +196,28 @@ fn build_played_receipt_node(
 
 /// Pure builder for the read `<receipt>` node. Mirrors WA Web
 /// `WAWebSendReadReceiptJob` + `sendAggregateReceipts`: newsletters use
-/// `read-self`, everything else `read`; status reads carry `context="status"`
+/// `read-self`, everything else `read`; status reads carry `class="status"`
 /// and, for a LID author, `peer_participant_pn` (the resolved LID->PN).
 /// `read_receipts_disabled` is the `readreceipts==none` privacy gate: only a DM
 /// (not group, status, or broadcast list) then uses `read-self` (does not notify
 /// the sender), matching WA Web `ReadReceiptJob.js`.
+/// Stamps the status marker onto a `<receipt>`, on both the read and the
+/// delivery path.
+///
+/// The marker is the `class` attribute, not `context`. `sendAggregateReceipts`
+/// computes `h = isStatusReceipt || to == STATUS_JID ? "status" : null` and
+/// emits it as `class`; `WAWebSendDeliveryReceiptJob` reaches the same shape
+/// from its own flag (`class: isStatusContext ? CUSTOM_STRING("status") :
+/// DROP_ATTR`), and the IR carries the `class="status"` const of
+/// `WASmaxOutReceiptStatusClassMixin`. `context` is a `<usync>` attribute in
+/// WA Web and appears on no `<receipt>`.
+///
+/// Both builders go through here because writing the marker twice is how it
+/// came to be wrong in both places at once.
+fn with_status_class(builder: NodeBuilder) -> NodeBuilder {
+    builder.attr("class", "status")
+}
+
 fn build_read_receipt_node(
     chat: &Jid,
     sender: Option<&Jid>,
@@ -228,7 +245,7 @@ fn build_read_receipt_node(
     }
 
     if chat.is_status_broadcast() {
-        builder = builder.attr("context", "status");
+        builder = with_status_class(builder);
         if let Some(pn) = peer_participant_pn {
             builder = builder.attr("peer_participant_pn", pn);
         }
@@ -294,7 +311,7 @@ fn delivery_receipt_builder(info: &MessageInfo, active: bool) -> NodeBuilder {
     }
 
     if is_status {
-        builder = builder.attr("context", "status");
+        builder = with_status_class(builder);
     }
 
     builder
@@ -526,10 +543,8 @@ impl Client {
         // this companion device received the message.
         // For all other messages, skip receipts for our own messages.
         //
-        // status@broadcast: WA Web sends `<receipt context="status">`
-        // (`Send/DeliveryReceiptJob.js` + `Handle/MsgSendReceipt.js` —
-        // `C = y && isStatusStanzaReceiveEnabled() ? "status" : void 0`).
-        // The context attribute is added in send_delivery_receipt below.
+        // status@broadcast: WA Web sends `<receipt class="status">`; the
+        // marker is stamped by `with_status_class`, which says why.
         //
         // Self-fanout (own message echoed back, carrying a `recipient`) needs a
         // sender receipt to drain the offline queue; without it the server
@@ -746,8 +761,9 @@ impl Client {
     /// - Group messages — `<receipt participant=...>` to the group JID.
     /// - Peer device messages (`category="peer"`) — `<receipt type="peer_msg">`
     ///   to acknowledge self-synced messages from the primary phone.
-    /// - Status broadcasts — `<receipt context="status">` (WA Web's
-    ///   `Send/DeliveryReceiptJob.js`); these are NOT skipped anymore.
+    /// - Status broadcasts — `<receipt class="status">`; these are NOT
+    ///   skipped anymore. Why `class` and not `context` is stated once, at
+    ///   `with_status_class`.
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
@@ -1130,17 +1146,19 @@ mod tests {
     }
 
     #[test]
-    fn delivery_receipt_for_status_broadcast_carries_context_status_and_participant() {
-        // WA Web's gate is `(isGroup || isBroadcast) && participant` for the
-        // participant attr, and `isStatus && gating` for context — see
-        // `Send/DeliveryReceiptJob.js`. Status broadcasts must carry BOTH so
+    fn delivery_receipt_for_status_broadcast_carries_class_status_and_participant() {
+        // Status broadcasts must carry BOTH the class and the participant, so
         // the server can map the ack back to the status owner.
         let info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
         let node = build_delivery_receipt_node(&info, true);
         assert_eq!(node.tag, "receipt");
         assert_eq!(
-            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            node.attrs.get("class").map(|v| v.as_str()).as_deref(),
             Some("status")
+        );
+        assert!(
+            node.attrs.get("context").is_none(),
+            "the marker moved to `class`; emitting both would let the old attr survive"
         );
         assert_eq!(
             node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
@@ -1149,10 +1167,10 @@ mod tests {
     }
 
     #[test]
-    fn delivery_receipt_for_dm_has_no_context_no_participant() {
+    fn delivery_receipt_for_dm_has_no_class_no_participant() {
         let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
         let node = build_delivery_receipt_node(&info, true);
-        assert!(node.attrs.get("context").is_none());
+        assert!(node.attrs.get("class").is_none());
         assert!(node.attrs.get("participant").is_none());
         assert!(node.attrs.get("type").is_none());
     }
@@ -1190,7 +1208,7 @@ mod tests {
             Some("200000000000002@bot")
         );
         assert!(node.attrs.get("participant").is_none());
-        assert!(node.attrs.get("context").is_none());
+        assert!(node.attrs.get("class").is_none());
     }
 
     #[test]
@@ -1291,10 +1309,10 @@ mod tests {
     fn status_and_peer_receipts_ignore_inactive() {
         let status = info_with("status@broadcast", "12345@s.whatsapp.net", false);
         let node = build_delivery_receipt_node(&status, false);
-        // status keeps context, never type=inactive
+        // status keeps class="status", never type=inactive
         assert!(node.attrs.get("type").is_none());
         assert_eq!(
-            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            node.attrs.get("class").map(|v| v.as_str()).as_deref(),
             Some("status")
         );
 
@@ -1319,7 +1337,7 @@ mod tests {
             node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
             Some("15551234567@s.whatsapp.net")
         );
-        assert!(node.attrs.get("context").is_none());
+        assert!(node.attrs.get("class").is_none());
     }
 
     #[test]
@@ -1455,7 +1473,7 @@ mod tests {
             Some("156535032389744:7@lid")
         );
         assert_eq!(
-            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            node.attrs.get("class").map(|v| v.as_str()).as_deref(),
             Some("status")
         );
     }
@@ -1463,7 +1481,7 @@ mod tests {
     #[test]
     fn delivery_receipt_for_peer_dm_carries_type_peer_msg() {
         // category=Peer + DM (self device sync) → type="peer_msg", no
-        // participant, no context. Matches WA Web's DROP_ATTR gating.
+        // participant, no class. Matches WA Web's DROP_ATTR gating.
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
         info.category = MessageCategory::Peer;
         let node = build_delivery_receipt_node(&info, true);
@@ -1472,7 +1490,7 @@ mod tests {
             Some("peer_msg")
         );
         assert!(node.attrs.get("participant").is_none());
-        assert!(node.attrs.get("context").is_none());
+        assert!(node.attrs.get("class").is_none());
     }
 
     #[test]
@@ -1488,7 +1506,7 @@ mod tests {
             Some("12345@s.whatsapp.net")
         );
         assert_eq!(
-            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            node.attrs.get("class").map(|v| v.as_str()).as_deref(),
             Some("status")
         );
     }
@@ -3190,7 +3208,7 @@ mod tests {
     }
 
     #[test]
-    fn read_receipt_dm_is_read_without_context() {
+    fn read_receipt_dm_is_read_without_class() {
         let node = build_read_receipt_node(
             &jid("456@s.whatsapp.net"),
             None,
@@ -3203,7 +3221,7 @@ mod tests {
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("read")
         );
-        assert!(node.attrs.get("context").is_none());
+        assert!(node.attrs.get("class").is_none());
         assert!(node.attrs.get("peer_participant_pn").is_none());
     }
 
@@ -3218,7 +3236,7 @@ mod tests {
     }
 
     #[test]
-    fn read_receipt_status_carries_context_and_peer_pn() {
+    fn read_receipt_status_carries_class_and_peer_pn() {
         let pn = jid("559980000001@s.whatsapp.net");
         let node = build_read_receipt_node(
             &jid("status@broadcast"),
@@ -3233,8 +3251,12 @@ mod tests {
             Some("read")
         );
         assert_eq!(
-            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            node.attrs.get("class").map(|v| v.as_str()).as_deref(),
             Some("status")
+        );
+        assert!(
+            node.attrs.get("context").is_none(),
+            "the marker moved to `class`; emitting both would let the old attr survive"
         );
         assert_eq!(
             node.attrs

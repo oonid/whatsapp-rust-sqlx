@@ -256,6 +256,73 @@ mod tests {
         assert_eq!(adv_secret(&client).await, before);
     }
 
+    // ── `<notification type="encrypt">` prekey-low routing
+    //
+    // What these pin: a `<count>` child reaches the prekey-low path wherever it
+    // sits among the children, and a PQ-only notification reaches nothing. Why
+    // WA Web splits it that way is stated once, at `handle_encrypt_notification`.
+
+    fn encrypt_notif(children: &[&'static str]) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "prekey-low-1")
+            .children(children.iter().map(|c| NodeBuilder::new(c).build()))
+            .build()
+    }
+
+    /// `handle_prekey_low` clears `server_has_prekeys` synchronously, before it
+    /// spawns the upload, so the flag is the observable that says the stanza was
+    /// routed to the prekey-low path at all.
+    async fn server_has_prekeys(client: &Arc<Client>) -> bool {
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_has_prekeys
+    }
+
+    async fn dispatch_encrypt(client: &Arc<Client>, children: &[&'static str]) -> bool {
+        client
+            .persistence_manager
+            .modify_device(|d| d.server_has_prekeys = true)
+            .await;
+        handle_notification_impl(client, node_to_arc(encrypt_notif(children))).await;
+        !server_has_prekeys(client).await
+    }
+
+    /// Every child arrangement that carries `<count>` must reach the prekey-low
+    /// path, whatever the tag order.
+    #[tokio::test]
+    async fn a_pq_count_first_encrypt_notification_still_refills_the_classic_pool() {
+        let client = create_test_client().await;
+
+        assert!(
+            dispatch_encrypt(&client, &["count"]).await,
+            "<count> alone must reach the prekey-low path"
+        );
+        assert!(
+            dispatch_encrypt(&client, &["count", "pq_count"]).await,
+            "<count> first must reach the prekey-low path"
+        );
+        assert!(
+            dispatch_encrypt(&client, &["pq_count", "count"]).await,
+            "<count> after <pq_count> must reach the prekey-low path"
+        );
+    }
+
+    /// A notification with no `<count>` anywhere must reach nothing. This one
+    /// holds on both sides of the fix; it is here to pin the other half of the
+    /// routing condition, not to demonstrate the bug.
+    #[tokio::test]
+    async fn a_pq_count_only_encrypt_notification_uploads_nothing() {
+        let client = create_test_client().await;
+
+        assert!(
+            !dispatch_encrypt(&client, &["pq_count"]).await,
+            "a PQ-only prekey-low notification must not trigger the classic upload"
+        );
+    }
+
     /// Regression: the displayed-code window and the pending-link window are not
     /// the same. A `primary_hello` accepted near the end of the 180s validity
     /// leaves `companion_finish` waiting up to another minute for pair-success,

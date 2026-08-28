@@ -94,7 +94,7 @@ async fn test_ack_behavior_for_incoming_stanzas() {
     // status@broadcast gets the transport <ack> as a fallback so that
     // drop paths in process_group_enc_batch (expired status, missing
     // sender key, decrypt error) don't leave the server retransmitting.
-    // The success path also emits <receipt context="status">; the
+    // The success path also emits <receipt class="status">; the
     // duplicate is tolerated.
     let mut status_attrs = Attrs::new();
     status_attrs.insert("from".to_string(), "status@broadcast".to_string());
@@ -2408,13 +2408,34 @@ fn test_encrypt_identity_notification_omits_type() {
         .build();
 
     assert!(
-        is_encrypt_identity_notification(&node.as_node_ref()),
+        is_encrypt_notification(&node.as_node_ref()),
         "identity-change notification ACK must omit type to match WA Web"
     );
 }
 
+/// Every `<notification type="encrypt">` acks without a `type`, not just the
+/// identity-change one. The three WA Web handlers this mirrors are named at
+/// `encode_ack_bytes`.
 #[test]
-fn test_device_notification_is_not_encrypt_identity() {
+fn test_encrypt_count_and_digest_notifications_also_omit_type() {
+    for child in ["count", "pq_count", "digest"] {
+        let node = NodeBuilder::new("notification")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "4128735302")
+            .attr("type", "encrypt")
+            .children([NodeBuilder::new(child).build()])
+            .build();
+
+        let ack = build_ack_node(&node.as_node_ref(), None).expect("ack");
+        assert!(
+            ack.attrs.get("type").is_none(),
+            "<{child}> encrypt notification ack must omit type to match WA Web"
+        );
+    }
+}
+
+#[test]
+fn test_device_notification_is_not_an_encrypt_notification() {
     let node = NodeBuilder::new("notification")
         .attr("from", "186303081611421@lid")
         .attr("id", "269488578")
@@ -2423,8 +2444,8 @@ fn test_device_notification_is_not_encrypt_identity() {
         .build();
 
     assert!(
-        !is_encrypt_identity_notification(&node.as_node_ref()),
-        "device notification is not an encrypt+identity notification"
+        !is_encrypt_notification(&node.as_node_ref()),
+        "device notification is not an encrypt notification"
     );
 }
 
