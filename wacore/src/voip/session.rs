@@ -68,6 +68,14 @@ pub struct CallSession {
     pub answering_device: Option<Jid>,
     /// Initial group snapshot for a native group call or active-call invitation.
     pub group: Option<GroupCallUpdate>,
+    /// The rotation the peer announced on the `<offer>`'s `<video>` child, with
+    /// the device that announced it -- a group call stamps rotation per sending
+    /// device, so the bare user JID would hand the same rotation to every
+    /// sibling. Rides the session for the same reason [`Self::is_video`] does:
+    /// both are facts the offer states and the engine needs. What happens to it
+    /// afterwards is `CallEntry::peer_video_orientations`, which holds one such
+    /// pair per announcer.
+    pub peer_video_orientation: Option<(Jid, u8)>,
     phase: CallPhase,
 }
 
@@ -83,6 +91,7 @@ impl CallSession {
             ring_devices: Vec::new(),
             answering_device: None,
             group: None,
+            peer_video_orientation: None,
             phase: CallPhase::Idle,
         }
     }
@@ -98,6 +107,7 @@ impl CallSession {
             ring_devices: Vec::new(),
             answering_device: None,
             group: None,
+            peer_video_orientation: None,
             phase: CallPhase::Ringing,
         }
     }
@@ -159,6 +169,10 @@ impl crate::stats::HeapSize for CallSession {
                 .answering_device
                 .as_ref()
                 .map_or(0, HeapSize::heap_bytes)
+            + self
+                .peer_video_orientation
+                .as_ref()
+                .map_or(0, |(announcer, _)| announcer.heap_bytes())
             + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
     }
 }

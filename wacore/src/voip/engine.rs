@@ -550,6 +550,22 @@ pub enum CallEvent {
         /// were already resolved by the signaling state machine.
         upgrade_token: Option<super::VideoUpgradeToken>,
     },
+    /// Outbound video needs an IDR before anything can go on the wire, and the
+    /// engine cannot make one — it transports encoded access units and never
+    /// touches pixels, so only the application's encoder can.
+    ///
+    /// Raised the moment the requirement appears, not once per dropped frame:
+    /// an upgrade being ungated, a group epoch commit, a source switch, or the
+    /// peer's own RTCP asking for one. Until an access unit carrying an IDR
+    /// arrives, every frame handed to the engine is dropped — so a consumer
+    /// that ignores this event sends nothing until its encoder's own keyframe
+    /// period comes round, which for a mid-call upgrade is the difference
+    /// between a picture appearing at once and appearing seconds later.
+    ///
+    /// The shipped client does the same thing at the same moments
+    /// (`pjmedia_vid_stream_request_keyframe`, and its "requesting keyframe
+    /// after dropped frames" / "will request keyframe on resume" paths).
+    VideoKeyframeNeeded,
     /// A newer authoritative group membership/relay snapshot was committed.
     GroupUpdated(Box<GroupCallUpdate>),
     /// A newer authoritative call-link admission snapshot was committed.
@@ -654,6 +670,8 @@ impl CallEvent {
         use crate::stats::HeapSize;
 
         match self {
+            // A unit variant: no heap behind it.
+            Self::VideoKeyframeNeeded => 0,
             Self::ForeignAudio(data) => data.len(),
             Self::ForeignGroupAudio(frame) => {
                 frame.data.len()
@@ -902,6 +920,15 @@ struct VideoPlaneState {
     send_gated: bool,
     /// PLI/FIR means dependent frames only prolong the peer's undecodable jitter-buffer state.
     keyframe_required: bool,
+    /// Whether the application has been told about the current requirement.
+    ///
+    /// Separate from the requirement itself because the two end at different
+    /// moments: the requirement ends when an IDR reaches the wire, the request
+    /// ends when it is made. Asking again for a requirement already announced
+    /// would raise one event per dropped frame; not tracking it at all would
+    /// leave a plane that was born requiring an IDR -- every plane is --
+    /// waiting for a request nobody ever made.
+    keyframe_announced: bool,
 }
 
 fn requests_keyframe(feedback: &[RtcpFeedback], video_ssrc: u32) -> bool {
@@ -956,6 +983,7 @@ fn make_video_plane(
         active: true,
         send_gated: false,
         keyframe_required: true,
+        keyframe_announced: false,
     })
 }
 
@@ -1191,7 +1219,7 @@ impl CallEngine {
             None
         };
 
-        Ok(Self {
+        let mut engine = Self {
             call_id: config.call_id,
             direction: config.direction,
             relay_token: config.relay_token,
@@ -1219,7 +1247,13 @@ impl CallEngine {
             media_stats: CallMediaStats::default(),
             health: AudioHealthWatch::default(),
             outbox: VecDeque::new(),
-        })
+        };
+        // A video-from-start call builds its plane here, already requiring an
+        // IDR, and the application may never call `enable_video` on a plane that
+        // is up before it asks. Announced now so the request does not depend on
+        // one arriving; the flag makes a later `enable_video` a no-op.
+        engine.announce_video_keyframe();
+        Ok(engine)
     }
 
     pub fn call_id(&self) -> &str {
@@ -1769,6 +1803,11 @@ impl CallEngine {
         // epoch creates the receiver pipelines, so refresh the allowlist at the same commit point.
         group.mixer.retain(group.registry.active_participant_ids());
         epoch.zeroize();
+        // After the borrows above end. A rekey that began before this epoch was
+        // installable had its IDR discarded by the gate in `on_video`, which
+        // cleared the announcement so this asks again for the one request that
+        // can finally be served.
+        self.announce_video_keyframe();
         if self.allocated {
             self.announce_audio_rtcp_session();
         }
@@ -1817,6 +1856,38 @@ impl CallEngine {
         true
     }
 
+    /// Whether outbound video could reach the wire at all right now: a plane
+    /// that is up and not gated.
+    ///
+    /// The driver's send queue can come to require an IDR on a call that has no
+    /// picture to unblock -- a relay reconnect sets that requirement whether or
+    /// not video was ever enabled -- and asking an audio-only application for a
+    /// keyframe is asking for something it has no way to produce.
+    pub(crate) fn video_send_active(&self) -> bool {
+        self.media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .is_some_and(|v| v.active && !v.send_gated)
+    }
+
+    /// Whether outbound video is still dropping access units for want of an IDR.
+    ///
+    /// The driver reads this before retrying a keyframe request a saturated
+    /// consumer queue refused: the encoder's own periodic IDR can settle the
+    /// requirement in the meantime, and a request nobody is waiting on would
+    /// cost the application a keyframe for nothing.
+    ///
+    /// Sendability is part of the answer, matching what
+    /// [`Self::announce_video_keyframe`] is willing to ask for: an IDR made for
+    /// a plane that has since been downgraded or re-gated is one the engine
+    /// would drop, and whatever re-enables the plane asks again anyway.
+    pub(crate) fn video_keyframe_required(&self) -> bool {
+        self.media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .is_some_and(|v| v.active && !v.send_gated && v.keyframe_required)
+    }
+
     /// The peer picked up.
     ///
     /// Separate from [`rekey_recv`](Self::rekey_recv), which the caller also does on an `<accept>`,
@@ -1846,11 +1917,37 @@ impl CallEngine {
             .is_some_and(|v| v.active)
     }
 
+    /// Ask the application for the IDR the outbound plane is waiting on, once
+    /// per requirement.
+    ///
+    /// Every site that sets `keyframe_required` ends here, because the engine
+    /// never produces a frame itself: until the application sends an IDR,
+    /// `on_video` drops everything, and the request is the only thing that
+    /// tells it so. Silent while the plane cannot send one anyway (inactive, or
+    /// send-gated behind an upgrade the peer has not accepted yet) -- the
+    /// moment it can, the ungate calls this again.
+    fn announce_video_keyframe(&mut self) {
+        let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
+            return;
+        };
+        if !video.keyframe_required || video.keyframe_announced || !video.active || video.send_gated
+        {
+            return;
+        }
+        video.keyframe_announced = true;
+        self.outbox
+            .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+    }
+
     /// Re-arm outbound H.264 recovery after the application switches camera/screen sources.
     pub fn require_video_keyframe(&mut self) {
         if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+            // A new requirement, not the standing one: the frames already asked
+            // for are from the retired source, so this asks again.
             video.keyframe_required = true;
+            video.keyframe_announced = false;
         }
+        self.announce_video_keyframe();
     }
 
     /// Set the nominal RTP cadence for subsequent video access units. The source must pace access
@@ -1891,10 +1988,20 @@ impl CallEngine {
             return false;
         };
         if let Some(v) = m.video.as_mut() {
+            // Resuming a plane is a fresh requirement: the peer's decoder lost
+            // whatever it had while this one was off or gated.
             let needs_recovery = !v.active || (v.send_gated && !send_gated);
             v.active = true;
             v.send_gated = send_gated;
-            v.keyframe_required |= needs_recovery;
+            if needs_recovery {
+                v.keyframe_required = true;
+                v.keyframe_announced = false;
+            }
+            // Unconditional, because this is also where a plane the constructor
+            // built for a video-from-start call first becomes announceable: it
+            // is already active and already requires an IDR, so `needs_recovery`
+            // is false and nothing else would ever ask on its behalf.
+            self.announce_video_keyframe();
             return true;
         }
         let rtcp_cname = build_whatsapp_rtcp_cname(&self.tx_ids.next_tx_id());
@@ -1911,6 +2018,7 @@ impl CallEngine {
             Some(mut v) => {
                 v.send_gated = send_gated;
                 m.video = Some(v);
+                self.announce_video_keyframe();
                 true
             }
             None => false,
@@ -2469,6 +2577,7 @@ impl CallEngine {
                 && let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
             {
                 video.keyframe_required = true;
+                self.announce_video_keyframe();
             }
             if let Some((sender, ntp_seconds, ntp_fraction)) =
                 parse_sender_report_timing(&participant.payload)
@@ -2504,6 +2613,7 @@ impl CallEngine {
                 }));
             return;
         }
+        let mut newly_needs_keyframe = false;
         let event = {
             let Some(m) = self.media.as_mut() else {
                 return;
@@ -2520,6 +2630,7 @@ impl CallEngine {
                 && requests_keyframe(&summary.feedback, video_ssrc)
                 && let Some(video) = m.video.as_mut()
             {
+                newly_needs_keyframe = true;
                 video.keyframe_required = true;
             }
             if let Some((sender, ntp_seconds, ntp_fraction)) = parse_sender_report_timing(&plain) {
@@ -2541,6 +2652,11 @@ impl CallEngine {
                 feedback: summary.feedback,
             }
         };
+        // After the media borrow ends: the peer's RTCP asked for a keyframe, and
+        // only the application's encoder can make one.
+        if newly_needs_keyframe {
+            self.announce_video_keyframe();
+        }
         self.outbox.push_back(Output::Event(event));
     }
 
@@ -3551,6 +3667,17 @@ impl CallEngine {
 
     fn on_video(&mut self, au: &[u8]) {
         if !self.group_epoch_ready() {
+            // Everything here is discarded, an IDR included -- so a request the
+            // application has already answered has to be made again once the
+            // epoch installs, or the requirement outlives every request for it.
+            // Only for an IDR: a delta was never an answer, so discarding one
+            // costs nothing that has to be asked for a second time.
+            if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
+                && video.keyframe_required
+                && au_has_idr(au)
+            {
+                video.keyframe_announced = false;
+            }
             return;
         }
         // Drop unless the plane is active AND ungated: an inactive plane (audio-only / post-
@@ -3572,6 +3699,7 @@ impl CallEngine {
             return;
         }
         v.keyframe_required = false;
+        v.keyframe_announced = false;
         for packet in packets {
             self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
         }
@@ -4166,6 +4294,45 @@ mod encoded_tests {
         ));
     }
 
+    /// The registry restates a retained rotation on the video-control channel
+    /// and the roster travels on the group-control channel, so the driver can
+    /// install the rotation before applying the roster. That is safe because
+    /// the restated key is the roster's own name for the announcer: the prune
+    /// below reads the same snapshot the key came from. Only a participant the
+    /// snapshot no longer carries loses its rotation.
+    #[test]
+    fn a_rotation_installed_before_its_roster_survives_the_prune() {
+        let mut engine = group_engine();
+        let peer = group_update().participants[1].jid.clone();
+        let departed = Jid::new("15550003333", Server::Lid);
+        engine.set_participant_video_orientation(peer.clone(), 3);
+        engine.set_participant_video_orientation(departed.clone(), 2);
+
+        let mut update = group_update();
+        update.media = "video".to_string();
+        update.relay = Some(group_relay());
+        update.transaction_id = 8;
+        assert_eq!(
+            engine.apply_group_update(1, &update).unwrap(),
+            GroupRosterApply::Applied
+        );
+
+        let orientations = &engine
+            .group
+            .as_ref()
+            .expect("group state")
+            .video_orientations;
+        assert_eq!(
+            orientations.get(&peer),
+            Some(&3),
+            "a rotation keyed by the roster survives the roster landing after it"
+        );
+        assert!(
+            !orientations.contains_key(&departed),
+            "a rotation the snapshot cannot name is still retired"
+        );
+    }
+
     #[test]
     fn participant_pid_change_discards_queued_audio_from_the_old_session() {
         let mut engine = group_engine();
@@ -4449,6 +4616,167 @@ mod encoded_tests {
                         .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
             )),
             "the first video frame under a new group epoch must be an IDR"
+        );
+    }
+
+    /// The gate discards deltas too, and a delta was never an answer to the
+    /// standing request. Treating one as if it were would ask a second time for
+    /// a requirement the application is already working on.
+    #[test]
+    fn a_gated_delta_does_not_re_ask_for_a_keyframe_already_requested() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        let delta = [0, 0, 0, 1, 0x41, 4, 5, 6];
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        let _ = drain(&mut engine);
+
+        let mut expanded = group_update();
+        expanded.transaction_id = 8;
+        expanded.media = "video".to_string();
+        expanded.relay = Some(group_relay());
+        expanded.rekey_requested = true;
+        let participant = Jid::new("15550003333", Server::Lid);
+        expanded.participants.push(GroupCallParticipant {
+            jid: participant.clone(),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: participant,
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert_eq!(
+            engine.apply_group_update(3, &expanded).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert_eq!(
+            keyframe_requests(&drain(&mut engine)),
+            1,
+            "the rekey asks once for the IDR it needs"
+        );
+
+        // Only deltas arrive while the epoch is pending, and a delta was never
+        // an answer to that request.
+        engine.handle_input(4, Input::VideoFrame(&delta));
+        assert_eq!(keyframe_requests(&drain(&mut engine)), 0);
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &[0x48; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        assert_eq!(
+            keyframe_requests(&drain(&mut engine)),
+            0,
+            "the request already standing is not made a second time"
+        );
+
+        // Still owed, though: the plane keeps dropping until it arrives.
+        engine.handle_input(5, Input::VideoFrame(&delta));
+        assert!(drain(&mut engine).iter().all(|output| !matches!(
+            output,
+            Output::Transmit(packet)
+                if parse_rtp_header(packet)
+                    .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+        )));
+        engine.handle_input(6, Input::VideoFrame(&idr));
+        assert!(drain(&mut engine).iter().any(|output| matches!(
+            output,
+            Output::Transmit(packet)
+                if parse_rtp_header(packet)
+                    .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+        )));
+    }
+
+    fn keyframe_requests(outputs: &[Output]) -> usize {
+        outputs
+            .iter()
+            .filter(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded)))
+            .count()
+    }
+
+    /// The keyframe an application produces for a rekey it cannot yet encrypt
+    /// under is dropped by the epoch gate, and dropping it does not clear the
+    /// requirement. Installing the epoch must therefore ask again even though
+    /// the flag was already set, or the requirement outlives every request for
+    /// it and outbound video stays dark until the encoder's own IDR interval.
+    #[test]
+    fn installing_a_gated_epoch_asks_again_for_the_keyframe_it_swallowed() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        let _ = drain(&mut engine);
+
+        let mut expanded = group_update();
+        expanded.transaction_id = 8;
+        expanded.media = "video".to_string();
+        expanded.relay = Some(group_relay());
+        expanded.rekey_requested = true;
+        let participant = Jid::new("15550003333", Server::Lid);
+        expanded.participants.push(GroupCallParticipant {
+            jid: participant.clone(),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: participant,
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert_eq!(
+            engine.apply_group_update(3, &expanded).unwrap(),
+            GroupRosterApply::Applied
+        );
+        let _ = drain(&mut engine);
+
+        // The application answers the rekey with an IDR the gate discards.
+        engine.handle_input(4, Input::VideoFrame(&idr));
+        let gated = drain(&mut engine);
+        assert!(
+            gated.iter().all(|output| !matches!(
+                output,
+                Output::Transmit(packet)
+                    if parse_rtp_header(packet)
+                        .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+            )),
+            "media under a requested-but-uninstalled epoch stays off the wire"
+        );
+
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &[0x48; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "the request the gate swallowed has to be raised again on install"
+        );
+
+        engine.handle_input(5, Input::VideoFrame(&idr));
+        assert!(
+            drain(&mut engine).iter().any(|output| matches!(
+                output,
+                Output::Transmit(packet)
+                    if parse_rtp_header(packet)
+                        .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+            )),
+            "and the IDR that answers it resumes video"
         );
     }
 
@@ -9772,6 +10100,130 @@ mod tests {
             count_transmits(&drain(&mut eng).0),
             1,
             "the next IDR resumes outbound video"
+        );
+    }
+
+    /// Ungating an upgrade drops every frame until an IDR arrives, and the
+    /// engine cannot make one — it never touches pixels. Saying so is the
+    /// difference between the peer's picture appearing at once and appearing a
+    /// keyframe period later, which for a three-second GOP is most of a short
+    /// call. The shipped client requests one at the same moment.
+    #[test]
+    fn ungating_an_upgrade_asks_the_application_for_a_keyframe() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video_gated());
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+
+        assert!(eng.enable_video());
+        let events = drain(&mut eng).0;
+        assert!(
+            events
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "ungating must ask for the IDR it is about to start dropping frames for"
+        );
+
+        // Raised once for the requirement, not once per dropped frame: a
+        // consumer that reacts by asking its encoder must not be asked again
+        // for every delta that arrives before the IDR does.
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(200)));
+        assert!(
+            !drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "a dropped delta must not re-raise the request"
+        );
+
+        // Satisfied, and the next requirement raises it again.
+        eng.handle_input(3, Input::VideoFrame(&video_au(200)));
+        let _ = drain(&mut eng);
+        eng.require_video_keyframe();
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "a fresh requirement is a fresh request"
+        );
+    }
+
+    /// A video-from-start call brings the plane up ungated and immediately
+    /// drops every access unit until an IDR arrives, and nothing on that path
+    /// would otherwise ask: the plane is built by the constructor, so it is
+    /// already active by the time `enable_video` runs and the resume arm sees
+    /// nothing to recover. The caller's picture would appear a keyframe period
+    /// late.
+    #[test]
+    fn a_video_plane_that_starts_ungated_asks_for_its_first_keyframe() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "a plane born requiring an IDR must say so, without waiting to be enabled"
+        );
+
+        // Satisfying the requirement ends the request; a plane already asked
+        // for and still waiting is not asked again.
+        assert!(eng.enable_video());
+        assert!(
+            !drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "one request per requirement, not one per call"
+        );
+
+        // A gated plane has nowhere to put one, so it stays quiet until the
+        // ungate, which asks on its own.
+        let mut gated = engine(true);
+        assert!(gated.enable_video_gated());
+        assert!(
+            !drain(&mut gated)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "an upgrade initiator cannot send video yet, so it must not ask"
+        );
+        assert!(gated.enable_video());
+        assert!(
+            drain(&mut gated)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded)))
+        );
+    }
+
+    /// The driver retries a refused request only while the engine could still
+    /// use the answer. A plane that was downgraded or re-gated in the meantime
+    /// would drop the IDR it asked for, and its own re-enable asks again.
+    #[test]
+    fn a_plane_that_cannot_send_reports_no_keyframe_requirement() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        assert!(eng.video_keyframe_required(), "a fresh plane is waiting");
+
+        eng.disable_video();
+        assert!(
+            !eng.video_keyframe_required(),
+            "a downgraded plane sends nothing"
+        );
+
+        assert!(eng.enable_video_gated());
+        assert!(
+            !eng.video_keyframe_required(),
+            "an upgrade the peer has not accepted sends nothing either"
+        );
+
+        assert!(eng.enable_video());
+        assert!(
+            eng.video_keyframe_required(),
+            "the ungate is a fresh requirement"
         );
     }
 

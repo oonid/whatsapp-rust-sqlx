@@ -27,6 +27,7 @@ use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
 use crate::voip::group_media::GroupMediaError;
 use crate::voip::h264::VideoFrame;
+use crate::voip::registry::force_send_call_event;
 use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 
@@ -306,11 +307,10 @@ impl VideoControlSender {
             .len()
             .saturating_mul(size_of::<VideoControlMessage>())
             .saturating_add(self.orientation.len().saturating_mul(size_of::<u8>()))
-            .saturating_add(
-                pending
-                    .capacity()
-                    .saturating_mul(size_of::<(wacore_binary::Jid, u8)>()),
-            )
+            .saturating_add(crate::stats::hash_table_bytes(
+                pending.capacity(),
+                size_of::<(wacore_binary::Jid, u8)>(),
+            ))
             .saturating_add(pending.keys().map(HeapSize::heap_bytes).sum::<usize>())
     }
 }
@@ -597,7 +597,7 @@ fn record_drop(dropped: &mut DroppedMedia, batch: &SendBatch) {
 
 fn purge_unstarted_video(
     queue: &mut VecDeque<SendBatch>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
 ) -> DroppedMedia {
     let mut dropped = DroppedMedia::default();
     queue.retain(|batch| {
@@ -608,7 +608,7 @@ fn purge_unstarted_video(
         !discard
     });
     if dropped.video_access_units != 0 {
-        *awaiting_video_keyframe = true;
+        awaiting_video_keyframe.raise();
     }
     dropped
 }
@@ -616,7 +616,7 @@ fn purge_unstarted_video(
 fn purge_queued(
     queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
     discard: impl Fn(&SendBatch) -> bool,
 ) -> DroppedMedia {
     let mut dropped = DroppedMedia::default();
@@ -635,7 +635,7 @@ fn purge_queued(
         pending_video.clear();
     }
     if dropped.video_access_units != 0 {
-        *awaiting_video_keyframe = true;
+        awaiting_video_keyframe.raise();
     }
     dropped
 }
@@ -643,7 +643,7 @@ fn purge_queued(
 fn purge_group_transition_media(
     queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
     epoch_advanced: bool,
     audio_only: bool,
 ) -> DroppedMedia {
@@ -661,7 +661,7 @@ fn apply_group_epoch_control(
     epoch: GroupRawEpoch,
     send_queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
     sending: &mut InFlightSend,
     events: &async_channel::Sender<CallEvent>,
 ) {
@@ -697,6 +697,8 @@ fn apply_group_epoch_control(
     }
 }
 
+/// `false` when a saturated queue swallowed the event.
+///
 /// Force-sent: an event that is emitted ONCE and that the consumer has to act on. Both halves are
 /// required, and they are what keeps this list from growing to everything.
 ///
@@ -710,7 +712,12 @@ fn apply_group_epoch_control(
 /// the engine has already re-pointed its own decoder, so nothing is asked of the consumer. Where a
 /// switch DOES demand action -- an encoded source that cannot follow it -- the demand rides on
 /// `AudioCodecSourceIsFixed`, which carries both codecs and is force-sent.
-fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) {
+///
+/// Forcing goes through [`force_send_call_event`], which never sheds a keyframe request to make
+/// room, here or from the registry's own publishers. Everything else, the request included, is
+/// offered without evicting anything; see [`retry_keyframe_request`] for how the one event that
+/// cannot be lost survives being refused outright.
+fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) -> bool {
     if matches!(
         &event,
         CallEvent::RelayAllocated
@@ -720,9 +727,71 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
             | CallEvent::AudioReceptionStalled { .. }
             | CallEvent::AudioCodecSourceIsFixed { .. }
     ) {
-        let _ = events.force_send(event);
+        force_send_call_event(events, event)
     } else {
-        let _ = events.try_send(event);
+        events.try_send(event).is_ok()
+    }
+}
+
+/// Re-offer a keyframe request the consumer has not taken yet, clearing
+/// `outstanding` once it lands.
+///
+/// The request is one-shot and actionable: the engine sets `keyframe_required`
+/// before publishing, so a request that never arrives is never reissued while
+/// every delta the application sends keeps being dropped. Evicting an older
+/// event to force room would only move the loss, and the next forced event
+/// would evict this one in turn -- so the drive loop keeps offering it instead,
+/// which costs nothing on the overwhelmingly common path where it fit the
+/// first time.
+/// Ask for the IDR the SEND QUEUE is waiting on, once per requirement.
+///
+/// The queue comes to require one on its own account: a relay reconnect reopens
+/// the replacement path on an IDR, and a shed that discarded a protected access
+/// unit leaves a hole no delta can be decoded across. `enqueue_batch` then drops
+/// every delta until one arrives, and the engine's own `keyframe_required` says
+/// nothing about any of it -- so this is the only place the application can be
+/// told.
+///
+/// `requirement` is the gate's raise count while one stands, which is what
+/// separates one requirement from the next: the IDR the application produced
+/// can be accepted and then shed within a single iteration, and asking again
+/// for that replacement is the whole point. A refused request joins
+/// `outstanding` and is retried below.
+fn announce_send_queue_keyframe(
+    events: &async_channel::Sender<CallEvent>,
+    requirement: Option<u64>,
+    announced: &mut Option<u64>,
+    outstanding: &mut bool,
+) {
+    let Some(requirement) = requirement else {
+        *announced = None;
+        return;
+    };
+    if *announced == Some(requirement) {
+        return;
+    }
+    *announced = Some(requirement);
+    if !publish_engine_event(events, CallEvent::VideoKeyframeNeeded) {
+        *outstanding = true;
+    }
+}
+
+fn retry_keyframe_request(
+    events: &async_channel::Sender<CallEvent>,
+    outstanding: &mut bool,
+    still_required: bool,
+) {
+    if !*outstanding {
+        return;
+    }
+    if !still_required {
+        // The encoder's own periodic IDR reached the wire while the request was
+        // waiting for room. Asking now would buy a keyframe nobody needs.
+        *outstanding = false;
+        return;
+    }
+    if events.try_send(CallEvent::VideoKeyframeNeeded).is_ok() {
+        *outstanding = false;
     }
 }
 
@@ -743,16 +812,58 @@ fn is_fatal_group_update_error(error: &engine::EngineError) -> bool {
     ) || !matches!(error, engine::EngineError::GroupMedia(_))
 }
 
+/// Whether the send queue is holding outbound video until an IDR arrives, and
+/// how many times that requirement has been raised.
+///
+/// The count is what makes one requirement distinguishable from the next. A
+/// requirement can be satisfied and raised again inside a single drive-loop
+/// iteration -- `enqueue_batch` accepts the IDR the application just produced,
+/// and the shed that follows discards that very access unit -- so the loop can
+/// never see the `false` in between. Comparing counts rather than levels means
+/// the replacement request is still made.
+#[derive(Default)]
+struct SendKeyframeGate {
+    awaiting: bool,
+    raised: u64,
+}
+
+impl SendKeyframeGate {
+    fn awaiting(&self) -> bool {
+        self.awaiting
+    }
+
+    fn set(&mut self, awaiting: bool) {
+        if awaiting {
+            self.raise();
+        } else {
+            self.awaiting = false;
+        }
+    }
+
+    /// Hold outbound video until an IDR arrives. Raising a requirement that is
+    /// already standing is not a new one.
+    fn raise(&mut self) {
+        if !self.awaiting {
+            self.awaiting = true;
+            self.raised = self.raised.saturating_add(1);
+        }
+    }
+
+    fn satisfied(&mut self) {
+        self.awaiting = false;
+    }
+}
+
 fn prepare_relay_reconnect(
     queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
 ) {
     queue.clear();
     pending_video.clear();
     // Discarding access units leaves remote decoders with a hole. Reopen the replacement path on
     // an IDR rather than forwarding a delta that references frames lost with the retired relay.
-    *awaiting_video_keyframe = true;
+    awaiting_video_keyframe.raise();
 }
 
 fn discard_video_until_keyframe(
@@ -777,7 +888,7 @@ fn discard_video_until_keyframe(
 
 fn shed_to_cap(
     queue: &mut VecDeque<SendBatch>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
 ) -> DroppedMedia {
     let mut dropped = DroppedMedia::default();
     loop {
@@ -804,7 +915,7 @@ fn shed_to_cap(
         let dropped_video = batch.kind == SendBatchKind::Video;
         record_drop(&mut dropped, &batch);
         if dropped_video {
-            *awaiting_video_keyframe = discard_video_until_keyframe(queue, &mut dropped);
+            awaiting_video_keyframe.set(discard_video_until_keyframe(queue, &mut dropped));
         }
     }
     dropped
@@ -812,16 +923,16 @@ fn shed_to_cap(
 
 fn enqueue_batch(
     queue: &mut VecDeque<SendBatch>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
     batch: SendBatch,
 ) -> DroppedMedia {
-    if batch.kind == SendBatchKind::Video && *awaiting_video_keyframe {
+    if batch.kind == SendBatchKind::Video && awaiting_video_keyframe.awaiting() {
         if !batch.video_keyframe {
             let mut dropped = DroppedMedia::default();
             record_drop(&mut dropped, &batch);
             return dropped;
         }
-        *awaiting_video_keyframe = false;
+        awaiting_video_keyframe.satisfied();
     }
     queue.push_back(batch);
     shed_to_cap(queue, awaiting_video_keyframe)
@@ -832,7 +943,7 @@ fn enqueue_batch(
 fn queue_transmit(
     queue: &mut VecDeque<SendBatch>,
     pending_video: &mut Vec<Bytes>,
-    awaiting_video_keyframe: &mut bool,
+    awaiting_video_keyframe: &mut SendKeyframeGate,
     data: Bytes,
 ) -> DroppedMedia {
     if let Some(header) = parse_rtp_header(&data)
@@ -983,7 +1094,12 @@ async fn run_call_with_clock_and_wallclock(
     // worst whatsapp-rust<->whatsapp-rust where both ends stalled; the official client decouples them).
     // Video is queued per access unit so overload never leaves half an IDR on the wire.
     let mut send_queue: VecDeque<SendBatch> = VecDeque::new();
-    let mut awaiting_video_keyframe = false;
+    let mut awaiting_video_keyframe = SendKeyframeGate::default();
+    // Which of the send queue's own requirements the application has been told
+    // about; see `announce_send_queue_keyframe`.
+    let mut send_keyframe_announced: Option<u64> = None;
+    // A keyframe request a saturated consumer queue refused, retried below.
+    let mut undelivered_keyframe_request = false;
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
@@ -1041,7 +1157,15 @@ async fn run_call_with_clock_and_wallclock(
                     let _ = channels.video_out.try_send(frame);
                 }
                 Output::Event(ev) => {
-                    publish_engine_event(&channels.events, ev);
+                    let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
+                    let delivered = publish_engine_event(&channels.events, ev);
+                    if keyframe_request {
+                        // Assigned, not just set: a request that lands retires
+                        // whatever an earlier refusal left outstanding, which by
+                        // then is a requirement the consumer has heard about or
+                        // one the encoder already satisfied on its own.
+                        undelivered_keyframe_request = !delivered;
+                    }
                 }
                 Output::ReconnectRelay(endpoint) => {
                     // Anything queued before this intent targets the retired relay. Later outputs in
@@ -1078,6 +1202,28 @@ async fn run_call_with_clock_and_wallclock(
             eng.note_audio_sink_dropped(sink_dropped);
         }
 
+        // Only where there is a picture to unblock: a relay reconnect raises the
+        // requirement whether or not video was ever enabled, and an audio-only
+        // application has no IDR to give.
+        let send_queue_needs_keyframe = (awaiting_video_keyframe.awaiting()
+            && eng.video_send_active())
+        .then_some(awaiting_video_keyframe.raised);
+        announce_send_queue_keyframe(
+            &channels.events,
+            send_queue_needs_keyframe,
+            &mut send_keyframe_announced,
+            &mut undelivered_keyframe_request,
+        );
+        retry_keyframe_request(
+            &channels.events,
+            &mut undelivered_keyframe_request,
+            // Either requirement keeps the request owed: an IDR the engine no
+            // longer needs can still be the one the send queue is holding the
+            // picture for, and cancelling on the engine's flag alone would
+            // leave every delta dropped with nobody asked for a keyframe.
+            eng.video_keyframe_required() || send_queue_needs_keyframe.is_some(),
+        );
+
         // The terminal event above must reach the consumer before transport teardown.
         if eng.is_terminated() {
             break 'drive;
@@ -1094,7 +1240,7 @@ async fn run_call_with_clock_and_wallclock(
             let reconnect_result = futures::select_biased! {
                 result = reconnect => result,
                 () = timeout => {
-                    publish_engine_event(&channels.events, CallEvent::RelayReconnectTimedOut);
+                    let _ = publish_engine_event(&channels.events, CallEvent::RelayReconnectTimedOut);
                     break 'drive;
                 },
             };
@@ -1724,6 +1870,188 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
+    /// A refused request survives without displacing what the queue holds.
+    #[test]
+    fn a_refused_keyframe_request_waits_rather_than_evicting_or_vanishing() {
+        let (tx, rx) = async_channel::bounded(1);
+        let diagnostic = CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        };
+        tx.try_send(diagnostic.clone()).expect("fills the queue");
+
+        assert!(
+            !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded),
+            "a full queue refuses it"
+        );
+        let mut outstanding = true;
+        retry_keyframe_request(&tx, &mut outstanding, true);
+        assert!(outstanding, "still no room, so still outstanding");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(diagnostic),
+            "and the event it would have evicted is still there"
+        );
+
+        retry_keyframe_request(&tx, &mut outstanding, true);
+        assert!(!outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+
+        // Nothing to retry once it has landed.
+        retry_keyframe_request(&tx, &mut outstanding, true);
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// The send queue can require an IDR the engine does not: a relay
+    /// reconnect, or a shed that discarded the protected access unit. Nothing
+    /// else tells the application, and the retry must not cancel on the
+    /// engine's flag while the queue is still dropping every delta.
+    #[test]
+    fn the_send_queues_own_keyframe_requirement_is_asked_for_and_kept() {
+        let (tx, rx) = async_channel::bounded(4);
+        let mut gate = SendKeyframeGate::default();
+        let mut announced = None;
+        let mut outstanding = false;
+
+        gate.raise();
+        announce_send_queue_keyframe(&tx, Some(gate.raised), &mut announced, &mut outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+        assert!(!outstanding, "it landed");
+
+        // One requirement, one request -- including a raise while it stands.
+        gate.raise();
+        announce_send_queue_keyframe(&tx, Some(gate.raised), &mut announced, &mut outstanding);
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+
+        // The engine can stop needing an IDR while the queue still does, and a
+        // refused request stays owed across that.
+        outstanding = true;
+        retry_keyframe_request(&tx, &mut outstanding, false || true);
+        assert!(!outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+
+        // The IDR arrives and the queue stops waiting.
+        gate.satisfied();
+        announce_send_queue_keyframe(&tx, None, &mut announced, &mut outstanding);
+        assert_eq!(announced, None);
+        gate.raise();
+        announce_send_queue_keyframe(&tx, Some(gate.raised), &mut announced, &mut outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+    }
+
+    /// The IDR the application produced can be accepted and then shed inside a
+    /// single drive-loop iteration, so the loop never sees the requirement end.
+    /// The replacement must still be asked for, or the queue drops every delta
+    /// until the encoder's next natural keyframe.
+    #[test]
+    fn an_idr_shed_as_soon_as_it_was_accepted_is_asked_for_again() {
+        let (tx, rx) = async_channel::bounded(4);
+        let mut gate = SendKeyframeGate::default();
+        let mut announced = None;
+        let mut outstanding = false;
+
+        gate.raise();
+        announce_send_queue_keyframe(&tx, Some(gate.raised), &mut announced, &mut outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+
+        // Within one iteration: `enqueue_batch` takes the IDR, the shed that
+        // follows discards it.
+        gate.satisfied();
+        gate.raise();
+
+        announce_send_queue_keyframe(&tx, Some(gate.raised), &mut announced, &mut outstanding);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(CallEvent::VideoKeyframeNeeded),
+            "the requirement is a new one, so it is asked for again"
+        );
+    }
+
+    /// A refused announcement is owed, not lost.
+    #[test]
+    fn a_refused_send_queue_request_becomes_outstanding() {
+        let (tx, rx) = async_channel::bounded(1);
+        tx.try_send(CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        })
+        .expect("fills the queue");
+        let mut announced = None;
+        let mut outstanding = false;
+
+        announce_send_queue_keyframe(&tx, Some(1), &mut announced, &mut outstanding);
+        assert!(outstanding, "refused, so still owed");
+        let _ = rx.try_recv();
+        retry_keyframe_request(&tx, &mut outstanding, true);
+        assert!(!outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+    }
+
+    /// A lifecycle event makes room by displacing the queue's oldest entry,
+    /// which can be the keyframe request -- the one event whose loss is
+    /// permanent. It goes back, and the next entry is shed in its place.
+    #[test]
+    fn a_lifecycle_event_sheds_something_other_than_the_keyframe_request() {
+        let (tx, rx) = async_channel::bounded(2);
+        assert!(publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded));
+        let diagnostic = CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        };
+        assert!(publish_engine_event(&tx, diagnostic.clone()));
+
+        assert!(publish_engine_event(&tx, CallEvent::RelayAllocated));
+        let kept = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec![CallEvent::RelayAllocated, CallEvent::VideoKeyframeNeeded],
+            "the diagnostic is what the lifecycle event cost, not the request"
+        );
+    }
+
+    /// The engine settles its own requirement when an IDR reaches the wire, and
+    /// the driver's outstanding request is about that same requirement: retrying
+    /// it afterwards would buy a keyframe nobody is waiting on.
+    #[test]
+    fn an_idr_that_settled_the_requirement_cancels_the_retry() {
+        let (tx, rx) = async_channel::bounded(1);
+        tx.try_send(CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        })
+        .expect("fills the queue");
+        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
+        assert!(outstanding);
+
+        // Room returns, but so did the encoder's own IDR.
+        let _ = rx.try_recv();
+        retry_keyframe_request(&tx, &mut outstanding, false);
+        assert!(!outstanding);
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// The refusal is about one requirement. If the encoder satisfies that one
+    /// on its own and a later request lands, retrying the first would ask for a
+    /// keyframe nothing is waiting on.
+    #[test]
+    fn a_delivered_request_retires_an_earlier_refusal() {
+        let (tx, rx) = async_channel::bounded(1);
+        tx.try_send(CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        })
+        .expect("fills the queue");
+        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
+        assert!(outstanding);
+
+        let _ = rx.try_recv();
+        outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
+        assert!(!outstanding, "the later request landed, so nothing is owed");
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+
+        retry_keyframe_request(&tx, &mut outstanding, true);
+        assert_eq!(
+            rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty),
+            "and no second copy follows it"
+        );
+    }
+
     // A slow consumer fills the event queue exactly when a call goes wrong. An event that is said
     // ONCE and is lost there is lost for good: the two audio ones below mean a call is deaf, or is
     // sending audio its peer cannot decode, and neither repeats.
@@ -1749,7 +2077,7 @@ mod tests {
             })
             .expect("diagnostic fills the event queue");
 
-            publish_engine_event(&tx, said_once.clone());
+            let _ = publish_engine_event(&tx, said_once.clone());
 
             assert_eq!(rx.try_recv(), Ok(said_once));
             assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
@@ -1822,7 +2150,7 @@ mod tests {
             batch(SendBatchKind::Video, 2, true),
         ]);
         let mut pending_video = vec![Bytes::from_static(b"fragment")];
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
         let dropped = purge_group_transition_media(
             &mut downgrade_queue,
             &mut pending_video,
@@ -1838,7 +2166,7 @@ mod tests {
                 .iter()
                 .all(|batch| batch.kind != SendBatchKind::Video)
         );
-        assert!(awaiting_keyframe);
+        assert!(awaiting_keyframe.awaiting());
 
         downgrade_queue.push_back(batch(SendBatchKind::Video, 2, false));
         pending_video.push(Bytes::from_static(b"fragment"));
@@ -1870,12 +2198,12 @@ mod tests {
         };
         let mut queue = VecDeque::from([video(false)]);
         let mut pending_video = vec![Bytes::from_static(b"fragment")];
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
 
         prepare_relay_reconnect(&mut queue, &mut pending_video, &mut awaiting_keyframe);
         assert!(queue.is_empty());
         assert!(pending_video.is_empty());
-        assert!(awaiting_keyframe);
+        assert!(awaiting_keyframe.awaiting());
 
         let dropped = enqueue_batch(&mut queue, &mut awaiting_keyframe, video(false));
         assert_eq!(dropped.video_access_units, 1);
@@ -1884,7 +2212,7 @@ mod tests {
         let dropped = enqueue_batch(&mut queue, &mut awaiting_keyframe, video(true));
         assert_eq!(dropped.video_access_units, 0);
         assert_eq!(queue.len(), 1);
-        assert!(!awaiting_keyframe);
+        assert!(!awaiting_keyframe.awaiting());
     }
 
     /// CallChannels with idle video plumbing (senders/receivers dropped immediately), for the
@@ -3049,7 +3377,7 @@ mod tests {
         let control = || Bytes::from(vec![0x00, 0x01]);
 
         let mut q: VecDeque<SendBatch> = VecDeque::new();
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
         q.push_back(SendBatch::packet(control())); // oldest, must survive
         for n in 0..SEND_QUEUE_BATCH_CAP as u8 {
             q.push_back(SendBatch::packet(media(n)));
@@ -3073,7 +3401,7 @@ mod tests {
         let mut q: VecDeque<SendBatch> = (0..=SEND_QUEUE_BATCH_CAP as u8)
             .map(|n| SendBatch::packet(Bytes::from(vec![0x00, n])))
             .collect();
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
         let _ = shed_to_cap(&mut q, &mut awaiting_keyframe);
         assert_eq!(q.len(), SEND_QUEUE_BATCH_CAP);
         assert_eq!(
@@ -3097,7 +3425,7 @@ mod tests {
         // The old 32-datagram queue truncated this AU before its marker.
         let mut queue = VecDeque::new();
         let mut pending = Vec::new();
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
         for seq in 0..40u16 {
             let dropped = queue_transmit(
                 &mut queue,
@@ -3153,7 +3481,7 @@ mod tests {
             .map(|_| Bytes::from(vec![0x90; 64 * 1024]))
             .collect();
         let mut queue = VecDeque::new();
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
         let dropped = enqueue_batch(
             &mut queue,
             &mut awaiting_keyframe,
@@ -3162,7 +3490,7 @@ mod tests {
         assert_eq!(dropped.video_access_units, 1);
         assert_eq!(dropped.packets, 40);
         assert!(queue.is_empty(), "no partial AU may remain queued");
-        assert!(awaiting_keyframe);
+        assert!(awaiting_keyframe.awaiting());
     }
 
     #[test]
@@ -3178,13 +3506,13 @@ mod tests {
             SendBatch::video(vec![Bytes::from_static(b"stale")]),
             SendBatch::packet(Bytes::from_static(&[0x00, 0x01])),
         ]);
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
 
         let dropped = purge_unstarted_video(&mut queue, &mut awaiting_keyframe);
 
         assert_eq!(dropped.video_access_units, 1);
         assert_eq!(dropped.packets, 1);
-        assert!(awaiting_keyframe);
+        assert!(awaiting_keyframe.awaiting());
         assert_eq!(queue.len(), 3);
         assert!(queue.iter().any(|batch| {
             batch.kind == SendBatchKind::Video && batch.started && batch.packets.len() == 2
@@ -3225,7 +3553,11 @@ mod tests {
         }
 
         let mut queue = VecDeque::new();
-        let mut awaiting_keyframe = true;
+        let mut awaiting_keyframe = {
+            let mut gate = SendKeyframeGate::default();
+            gate.raise();
+            gate
+        };
 
         let dropped = enqueue_batch(
             &mut queue,
@@ -3241,7 +3573,7 @@ mod tests {
             SendBatch::video(vec![video_packet(2, true)]),
         );
         assert_eq!(dropped.video_access_units, 0);
-        assert!(!awaiting_keyframe);
+        assert!(!awaiting_keyframe.awaiting());
 
         let dropped = enqueue_batch(
             &mut queue,
@@ -3256,11 +3588,14 @@ mod tests {
         let mut queued: VecDeque<_> = (0..=SEND_QUEUE_BATCH_CAP as u16)
             .map(|seq| SendBatch::video(vec![video_packet(seq, seq == 10)]))
             .collect();
-        let mut awaiting_keyframe = false;
+        let mut awaiting_keyframe = SendKeyframeGate::default();
         let dropped = shed_to_cap(&mut queued, &mut awaiting_keyframe);
         assert_eq!(dropped.video_access_units, 10);
         assert!(queued.front().is_some_and(|batch| batch.video_keyframe));
-        assert!(!awaiting_keyframe, "a queued IDR is a valid recovery point");
+        assert!(
+            !awaiting_keyframe.awaiting(),
+            "a queued IDR is a valid recovery point"
+        );
     }
 
     /// Virtual-time runtime for the deadline-timer tests. `sleep` only records the arm; the clock

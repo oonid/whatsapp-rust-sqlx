@@ -225,6 +225,9 @@ impl StanzaHandler for CallHandler {
                             );
                             session.is_video =
                                 matches!(&call.action, CallAction::Offer { is_video: true, .. });
+                            session.peer_video_orientation = call
+                                .video_orientation
+                                .map(|orientation| (routed_call_sender(&call), orientation));
                             session.group = Some(group.clone());
                             duplicate_active_group_offer = match client
                                 .call_registry()
@@ -403,6 +406,21 @@ impl StanzaHandler for CallHandler {
                         client
                             .call_registry()
                             .set_answering_device(call.action.call_id(), sender.clone());
+                        // The answering device's camera rotation, announced on
+                        // the `<accept>`'s `<video>` and nowhere else until it
+                        // turns. After `set_answering_device`, so the registry
+                        // can tell a winning answer from a late sibling's.
+                        if let Some(orientation) = call.video_orientation
+                            && let Some(generation) =
+                                client.call_registry().generation_of(call.action.call_id())
+                        {
+                            client.call_registry().set_peer_video_orientation(
+                                call.action.call_id(),
+                                generation,
+                                &sender,
+                                orientation,
+                            );
+                        }
                         // The peer's capability and the answering device land in the same stanza
                         // and both have to be applied before the first inbound packet, so they
                         // travel as one message rather than racing.
@@ -830,13 +848,14 @@ impl StanzaHandler for CallHandler {
                                     })
                                     .flatten()
                                     .unwrap_or(participant);
-                                registry.send_video_ctl(
+                                // Through the registry rather than straight down
+                                // the channel: a rotation the peer states once
+                                // has to survive the plane it was stated to.
+                                registry.set_peer_video_orientation(
                                     call_id,
                                     generation,
-                                    VideoControl::SetParticipantOrientation {
-                                        participant: orientation_key,
-                                        orientation: *orientation,
-                                    },
+                                    &orientation_key,
+                                    *orientation,
                                 );
                             }
                             // A group participant's `<video>` state describes only that sender.
@@ -965,10 +984,11 @@ impl StanzaHandler for CallHandler {
                         transition_current &= registry.is_current(call_id, generation);
                         if transition_current {
                             if let Some(orientation) = orientation {
-                                registry.send_video_ctl(
+                                registry.set_peer_video_orientation(
                                     call_id,
                                     generation,
-                                    VideoControl::SetOrientation(*orientation),
+                                    &routed_call_sender(&call),
+                                    *orientation,
                                 );
                             }
                             let event_delivered = event_permit.as_ref().is_some_and(|permit| {

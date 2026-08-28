@@ -60,6 +60,17 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
 
     let is_offer = action_tag == CallActionTag::Offer;
+    // Read before `parse_action` consumes the child: an <offer> and an <accept>
+    // are the only actions whose <video> child announces the sending device's
+    // camera rotation, and the value belongs on the payload rather than in
+    // either action variant (see `IncomingCall::video_orientation`).
+    let video_orientation = matches!(action_tag, CallActionTag::Offer | CallActionTag::Accept)
+        .then(|| {
+            child
+                .get_optional_child("video")
+                .and_then(|video| parse_video_orientation(video))
+        })
+        .flatten();
     let action = parse_action(child, action_tag)?;
     let group = if is_offer {
         super::group_call::parse_group_invite_snapshot(child)?.map(Box::new)
@@ -83,6 +94,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .timestamp(timestamp)
         .offline(offline)
         .action(action)
+        .maybe_video_orientation(video_orientation)
         .maybe_group(group);
     let call = call.build();
     // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
@@ -210,6 +222,22 @@ pub fn find_relay<'a, 'b>(nr: &'b NodeRef<'a>) -> Option<&'b NodeRef<'a>> {
         return Some(nr);
     }
     nr.children().and_then(|cs| cs.iter().find_map(find_relay))
+}
+
+/// The `device_orientation` a `<video>` advertisement child carries, in quarter
+/// turns.
+///
+/// One definition for the offer and the accept, and deliberately the same
+/// filter the mid-call `<video>` parser applies: a value outside `0..=3` is a
+/// peer counting something other than quarter turns, and folding it into range
+/// would stamp every frame with a rotation nobody announced. `None` there means
+/// "not announced", which the caller already has to handle for a `<video>` that
+/// carries no rotation at all.
+fn parse_video_orientation(node: &NodeRef<'_>) -> Option<u8> {
+    node.attrs()
+        .optional_string("device_orientation")
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|orientation| *orientation <= 3)
 }
 
 fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
@@ -353,9 +381,8 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
         }
         CallActionTag::Accept => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
-            let audio = node
-                .children()
-                .unwrap_or_default()
+            let children = node.children().unwrap_or_default();
+            let audio = children
                 .iter()
                 .filter(|child| child.tag == "audio")
                 .map(parse_audio_codec)
@@ -383,10 +410,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
                 .optional_string("state")
                 .and_then(|s| s.parse::<i32>().ok())
                 .ok_or_else(|| anyhow!("<video> missing or non-numeric 'state'"))?;
-            let orientation = attrs
-                .optional_string("device_orientation")
-                .and_then(|s| s.parse::<u8>().ok())
-                .filter(|orientation| *orientation <= 3);
+            let orientation = parse_video_orientation(node);
             let dec = attrs.optional_string("dec").map(|s| s.into_owned());
             // The upgrade-request marker attr and the server-enriched knobs; consumed (their
             // semantics ride on `state`), plus a possible `<voip_settings>` blob child we ignore.
@@ -822,12 +846,39 @@ const INITIAL_DEVICE_ORIENTATION: &str = "0";
 const VIDEO_SCREEN_WIDTH: &str = "1920";
 const VIDEO_SCREEN_HEIGHT: &str = "1080";
 
-/// `<video>` for an `<offer>`: full decoder + geometry advertisement (the initiator side).
+/// The codec names a `<video>` advertisement carries. The two attributes use
+/// *different* spellings of the same codec, which is not a typo on either side.
+///
+/// `enc` names an encoding, and WA Web's `<video>` parser (`fill_video`, in
+/// `call_xml_utils.h`) accepts exactly `h.264` and `vp8/h.264` — anything else
+/// takes its `fill_video: unknown video encoding %s` path. The dotless `h264`
+/// we used to send is one of those anything-elses.
+///
+/// `dec` names decoder *capabilities*, built by
+/// `vid_codec_bitmask_to_capability_string` (`codec_utils.cc`) as a
+/// comma-joined list over a five-entry table: `H264`, `VP8`, `VP9`, `H265`,
+/// `AV1`. Upper-case, no dot. We list only `H264`, because a callee that takes
+/// a wider list at its word and encodes H.265 leaves us with a stream we cannot
+/// decode.
+const VIDEO_ENC_H264: &str = "h.264";
+const VIDEO_DEC_H264: &str = "H264";
+
+/// `<video>` for an `<offer>`: codec + geometry advertisement (the initiator side).
+///
+/// Rebuilt against WA Web's own `<video>` reader after the hand-written version
+/// was found to be silently discarded: a video offer carrying it was delivered
+/// and acked and then never rang, while an audio offer to the same callee —
+/// byte-identical apart from this child — was answered in three seconds.
+///
+/// The attribute set is `fill_video`'s: `enc`/`dec` (at least one is required),
+/// `device_orientation`, `screen_width`, `screen_height`, `enc_supported`.
+/// There is no `orientation` — the rotation rides `device_orientation`, and the
+/// spare attribute we used to send is not in the grammar at all. See
+/// [`VIDEO_ENC_H264`] for why the two codec attributes are spelled differently.
 fn video_offer_node() -> Node {
     NodeBuilder::new("video")
-        .attr("enc", "h264")
-        .attr("dec", "h264")
-        .attr("orientation", "0")
+        .attr("enc", VIDEO_ENC_H264)
+        .attr("dec", VIDEO_DEC_H264)
         .attr("screen_width", VIDEO_SCREEN_WIDTH)
         .attr("screen_height", VIDEO_SCREEN_HEIGHT)
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
@@ -837,7 +888,7 @@ fn video_offer_node() -> Node {
 /// `<video>` byte-matching a captured from-start video callee.
 fn video_accept_node() -> Node {
     NodeBuilder::new("video")
-        .attr("dec", "H264")
+        .attr("dec", VIDEO_DEC_H264)
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
@@ -846,7 +897,7 @@ fn video_accept_node() -> Node {
 /// `device_orientation` + `screen_width="0" screen_height="0"` (the real client sends zero here).
 fn video_preaccept_node() -> Node {
     NodeBuilder::new("video")
-        .attr("dec", "H264")
+        .attr("dec", VIDEO_DEC_H264)
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .attr("screen_width", "0")
         .attr("screen_height", "0")
@@ -1678,6 +1729,10 @@ mod tests {
                 group_jid,
             } => {
                 assert_eq!(call_id, "CALL-ID-0001");
+                assert_eq!(
+                    call.video_orientation, None,
+                    "this fixture carries no <video>"
+                );
                 assert_eq!(call_creator, fake_caller_lid());
                 assert_eq!(caller_pn, Some(fake_caller_pn()));
                 assert_eq!(caller_country_code.as_deref(), Some("BR"));
@@ -2850,6 +2905,96 @@ mod tests {
         ));
     }
 
+    /// The rotation a video-from-start peer announces rides the `<offer>`'s and
+    /// `<accept>`'s `<video>` child, not only the mid-call `<video>` stanza.
+    /// Both were parsed for `is_video` alone, so a caller holding the phone
+    /// sideways had every frame stamped upright until they happened to turn it.
+    ///
+    /// The offer shape is the one a real Android client sent us; the accept
+    /// mirrors what we ourselves send.
+    #[test]
+    fn offer_and_accept_carry_the_peers_device_orientation() {
+        let offer = NodeBuilder::new("call")
+            .attr("from", "5511999990000@lid")
+            .attr("id", "STANZA-1")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("offer")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([
+                    NodeBuilder::new("audio")
+                        .attr("rate", "16000")
+                        .attr("enc", "opus")
+                        .build(),
+                    NodeBuilder::new("video")
+                        .attr("screen_width", "1280")
+                        .attr("dec", "H264,H265,AV1")
+                        .attr("screen_height", "2772")
+                        .attr("device_orientation", "1")
+                        .attr("enc", "h.264")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&offer.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        assert_eq!(parsed.video_orientation, Some(1));
+        match parsed.action {
+            CallAction::Offer { is_video, .. } => assert!(is_video),
+            other => panic!("expected an offer, got {other:?}"),
+        }
+
+        let accept = NodeBuilder::new("call")
+            .attr("from", "5511999990000:3@lid")
+            .attr("id", "STANZA-2")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([NodeBuilder::new("video")
+                    .attr("dec", "H264")
+                    .attr("device_orientation", "3")
+                    .build()])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&accept.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        assert_eq!(parsed.video_orientation, Some(3));
+        assert!(matches!(parsed.action, CallAction::Accept { .. }));
+    }
+
+    /// Out of range is "not announced", never a folded-in value: `4` is a peer
+    /// counting something other than quarter turns, and answering it with `0`
+    /// would stamp an upright picture that stays wrong for the whole call.
+    #[test]
+    fn an_out_of_range_offer_orientation_is_dropped_not_folded() {
+        let offer = NodeBuilder::new("call")
+            .attr("from", "5511999990000@lid")
+            .attr("id", "STANZA-3")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("offer")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([NodeBuilder::new("video")
+                    .attr("dec", "H264")
+                    .attr("device_orientation", "4")
+                    .build()])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&offer.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        assert_eq!(parsed.video_orientation, None);
+        match parsed.action {
+            CallAction::Offer { is_video, .. } => {
+                assert!(is_video, "the <video> child still means a video offer")
+            }
+            other => panic!("expected an offer, got {other:?}"),
+        }
+    }
+
     #[test]
     fn offer_and_accept_video_advertisement() {
         let peer = peer();
@@ -2923,7 +3068,11 @@ mod tests {
         );
         assert_eq!(vr.attrs().optional_string("screen_width"), None);
 
-        // The offer's <video> carries the decoder/geometry advertisement (WaCalls reference form).
+        // The offer's <video> carries the codec/geometry advertisement in the
+        // shape WA Web's `fill_video` reads: `enc` one of the two encodings it
+        // accepts, `dec` from its five-name capability table, and no
+        // `orientation` — the hand-written form had all three the other way and
+        // its offers were delivered, acked and never rung.
         let ovnode = offer.as_node_ref().children().unwrap()[0]
             .children()
             .unwrap()
@@ -2932,8 +3081,17 @@ mod tests {
             .unwrap()
             .to_owned();
         let ovr = ovnode.as_node_ref();
-        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h264"));
-        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("h264"));
+        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h.264"));
+        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ovr.attrs().optional_string("orientation"),
+            None,
+            "the real client sends no `orientation`; the rotation rides `device_orientation`"
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
 
         let accept = build_accept(&AcceptParams {
             call_id: "CID",
