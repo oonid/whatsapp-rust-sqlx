@@ -1601,7 +1601,15 @@ impl Client {
                             ) {
                                 None => {
                                     self.device_memo_counters.record_skdm_targets(Outcome::Hit);
-                                    return Some((all_devices, memo.4));
+                                    // `Cache::get` already cloned the stored
+                                    // slice, and that clone is exact, so
+                                    // reclaiming it as a `Vec` reuses its
+                                    // buffer instead of adding a second one.
+                                    // The hit still pays that one clone —
+                                    // same as the `Vec` this replaced; what
+                                    // the boxed form buys is retention, not a
+                                    // cheaper hit.
+                                    return Some((all_devices, memo.4.into_vec()));
                                 }
                                 Some(term) => self.device_memo_counters.record_skdm_targets(term),
                             }
@@ -1638,7 +1646,17 @@ impl Client {
                                     std::sync::Arc::downgrade(&cached_map),
                                     cached_map_gen,
                                     own_sending_jid.clone(),
-                                    needs_skdm.clone(),
+                                    // Frozen only here, on the one path that
+                                    // retains it: what the filter returns
+                                    // carries the growth capacity of a scan
+                                    // over every device, and the entry keeps
+                                    // it for the life of the group. Built
+                                    // straight from the slice, so storing
+                                    // costs the one exact allocation a
+                                    // `Vec` clone would have cost anyway —
+                                    // and the send keeps its own `Vec`
+                                    // untouched.
+                                    Box::from(needs_skdm.as_slice()),
                                 ),
                             )
                             .await;
@@ -3456,7 +3474,7 @@ mod tests {
         // The same predicate the send path applies, not a second copy of it.
         skdm_memo_entry_stale_term(&memo, &devices, &cached_map, generation, &own)
             .is_none()
-            .then_some(memo.4)
+            .then(|| memo.4.into_vec())
     }
 
     /// The premise of every "the warm group send is flat in group size" claim:

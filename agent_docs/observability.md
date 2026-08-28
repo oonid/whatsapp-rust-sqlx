@@ -155,9 +155,20 @@ figures come from the `wacore::stats::HeapSize` trait:
   converts a `capacity()` into the buckets hashbrown actually owns: it rounds to
   a power of two and keeps an eighth free, so `capacity() * size_of::<(K, V)>()`
   under-counts by up to a half. The device-list memos
-  (`GroupDevicesMemo`/`DmDevicesMemo`) and the sender-key device cache use it;
-  `SignalStoreCache::memory_stats` does **not** — it sums key and payload bytes
-  and does not charge for its tables' slots at all, so its figures are a floor.
+  (`GroupDevicesMemo`/`DmDevicesMemo`), the sender-key device cache and
+  `SignalStoreCache::memory_stats` all use it — the last charges each store's
+  own tables (`UserIndexedCache::overhead_bytes`: the primary map, the user
+  index, the removal ring) plus the dirty/deleted sets and pre-wire gates
+  beside it. Those sets are charged for their **slots only**: their addresses
+  are the cache's own `Arc<str>` keys, which eviction cannot drop while an
+  address is dirty, deleted or pending, so charging the payloads again would
+  double-count them. `sender_keys.bytes` additionally covers
+  `pending_distributions` — table slots, distribution payloads, and the key
+  bytes of pending entries the cache no longer holds — and `sender_keys.entries`
+  counts those pending-only addresses. One overlap is accepted rather than
+  tracked: an address evicted while still pending is charged both as a
+  pending-only key and in the 64-entry removal window that named it, which
+  bounds the overstatement to a handful of addresses.
   `wacore/tests/hash_table_bytes_matches_the_allocator.rs` checks the conversion
   against a counting `GlobalAlloc`. After removals the figure is a lower bound
   rather than exact: hashbrown leaves tombstones that consume growth slots

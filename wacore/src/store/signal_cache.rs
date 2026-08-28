@@ -1,6 +1,8 @@
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard};
+use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock};
 
 use anyhow::Result;
 use async_lock::Mutex;
@@ -165,6 +167,14 @@ impl PendingWireGate {
         self.addresses.iter()
     }
 
+    /// Bytes the gate's table allocates. The addresses themselves are the
+    /// cache's own `Arc<str>` keys — the gate is always a subset of `dirty` +
+    /// `deleted`, which eviction cannot drop — so charging their payloads here
+    /// would count them twice.
+    fn table_bytes(&self) -> usize {
+        crate::stats::hash_table_bytes(self.addresses.capacity(), size_of::<Arc<str>>())
+    }
+
     /// `Release` so a reader whose `Acquire` load sees the lowered flag also
     /// sees the removals that emptied the set.
     fn publish(&self) {
@@ -188,6 +198,20 @@ fn user_of_protocol_address(address: &str) -> &str {
     }
 }
 
+/// One `RandomState` for the whole process, drawn once. The user index only
+/// ever compares a fingerprint against its own set, so nothing requires a
+/// shared seed — but sharing one keeps the hasher out of every cache, and
+/// drawing it randomly keeps a peer from choosing identifiers that collide.
+fn fingerprint_hasher() -> &'static RandomState {
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    HASHER.get_or_init(RandomState::new)
+}
+
+/// The 64-bit stand-in for a user identifier in [`UserIndexedCache::users`].
+fn user_fingerprint(user: &str) -> u64 {
+    fingerprint_hasher().hash_one(user)
+}
+
 /// A cache map that can answer "is any address here owned by this user?"
 /// without scanning every key.
 ///
@@ -197,9 +221,14 @@ fn user_of_protocol_address(address: &str) -> &str {
 /// user that has some, which is the direction that would silently skip a
 /// migration. `insert` is the only way in, so an entry cannot reach the map
 /// without registering its user.
+///
+/// Because a false `true` is already the accepted error, the set holds
+/// 64-bit fingerprints rather than the identifiers: a hash collision produces
+/// exactly that same error and nothing else, and the index stops duplicating
+/// every user string the three Signal stores already key on.
 struct UserIndexedCache<V> {
     map: HashMap<Arc<str>, V>,
-    users: HashSet<Arc<str>>,
+    users: HashSet<u64>,
     /// Counts removal events. A cold reader that saw a slot absent, released
     /// the lock, and finds it absent again cannot otherwise tell "never
     /// written" from "written, flushed, and evicted": a clean removal keeps the
@@ -227,10 +256,8 @@ impl<V> UserIndexedCache<V> {
     }
 
     fn insert(&mut self, key: Arc<str>, value: V) -> Option<V> {
-        let user = user_of_protocol_address(&key);
-        if !self.users.contains(user) {
-            self.users.insert(Arc::from(user));
-        }
+        self.users
+            .insert(user_fingerprint(user_of_protocol_address(&key)));
         self.map.insert(key, value)
     }
 
@@ -273,35 +300,44 @@ impl<V> UserIndexedCache<V> {
         // address begins with `user`, so a separator inside `user` is also the
         // address's first one and both collapse to the same key: an addressed
         // `19995551006:5` and a bare `19995551006` are one entry here.
-        self.users.contains(user_of_protocol_address(user))
+        self.users
+            .contains(&user_fingerprint(user_of_protocol_address(user)))
     }
 
     /// Drop users no longer backed by an entry. Bounds the superset's drift
     /// after eviction; callers gate it on a watermark so it stays amortized.
     fn compact_users(&mut self) {
         self.users.clear();
-        let users: Vec<Arc<str>> = self
-            .map
-            .keys()
-            .map(|key| Arc::from(user_of_protocol_address(key)))
-            .collect();
-        self.users.extend(users);
+        // Fingerprints are `Copy`, so the rebuild reads straight off the live
+        // keys — no intermediate `Vec` and no `Arc<str>` per surviving user,
+        // which is what this used to allocate under the store's global mutex.
+        self.users.extend(
+            self.map
+                .keys()
+                .map(|key| user_fingerprint(user_of_protocol_address(key))),
+        );
     }
 
     fn users_len(&self) -> usize {
         self.users.len()
     }
 
-    /// Retained bytes of the bookkeeping beside the primary map: the user
-    /// index, plus the removal window, whose keys outlive the entries they
-    /// name and so are owned solely here. Keeps `memory_stats` from reporting
-    /// only the map.
+    /// Retained bytes of everything this cache allocates except the entry
+    /// payloads: the primary map's buckets, the user index, the removal ring,
+    /// and the removal window's keys — which outlive the entries they name and
+    /// so are owned solely here.
+    ///
+    /// Slots, not entries: a `HashMap` holding n entries owns more buckets than
+    /// n (see [`crate::stats::hash_table_bytes`]), and it is the buckets the
+    /// allocator is holding. `memory_stats` adds the keys and payloads on top.
     fn overhead_bytes(&self) -> usize {
-        self.users.iter().map(|user| user.len()).sum::<usize>()
+        crate::stats::hash_table_bytes(self.map.capacity(), size_of::<(Arc<str>, V)>())
+            + crate::stats::hash_table_bytes(self.users.capacity(), size_of::<u64>())
+            + self.recent_removals.capacity() * size_of::<(u64, Arc<str>)>()
             + self
                 .recent_removals
                 .iter()
-                .map(|(_, key)| key.len() + size_of::<u64>())
+                .map(|(_, key)| key.len())
                 .sum::<usize>()
     }
 
@@ -621,10 +657,18 @@ impl SenderKeyStoreState {
     }
 
     fn key_for(&self, address: &str) -> Arc<str> {
-        match self.cache.get_key_value(address) {
-            Some((existing, _)) => existing.clone(),
-            None => Arc::from(address),
+        if let Some((existing, _)) = self.cache.get_key_value(address) {
+            return existing.clone();
         }
+        // The other place this address may already own an `Arc`: a
+        // distribution is retained when its durability gate fails, which can
+        // happen before the record itself reaches the cache. Reusing that key
+        // keeps one allocation per address instead of two, and keeps
+        // `memory_stats` from charging a string the store holds twice.
+        if let Some((existing, _)) = self.pending_distributions.get_key_value(address) {
+            return existing.clone();
+        }
+        Arc::from(address)
     }
 
     fn put(&mut self, address: &str, mut record: SenderKeyRecord) {
@@ -1435,7 +1479,12 @@ impl SignalStoreCache {
             // the chain resume an iteration that has already been published.
             if state.incarnation == incarnation && !state.cache.removed_since(key, since) {
                 let record = decoded?;
-                state.cache.insert(Arc::from(key), record.clone());
+                // Through `key_for`, not `Arc::from`: a distribution retained
+                // for this address while the record was still cold already
+                // owns a key, and allocating a second one for the same string
+                // is what the canonicalization exists to avoid.
+                let addr = state.key_for(key);
+                state.cache.insert(addr, record.clone());
                 state.evict_if_needed(self.max_entries);
                 return Ok(record);
             }
@@ -1453,7 +1502,8 @@ impl SignalStoreCache {
             )?)),
             None => None,
         };
-        state.cache.insert(Arc::from(key), record.clone());
+        let addr = state.key_for(key);
+        state.cache.insert(addr, record.clone());
         state.evict_if_needed(self.max_entries);
         Ok(record)
     }
@@ -1852,6 +1902,26 @@ impl SignalStoreCache {
     /// Session entry counts include negative (`Absent`) and checked-out slots
     /// — they occupy the map. Byte totals include the key length for every
     /// slot, but the estimated record payload only for `Present` entries.
+    ///
+    /// Structural allocations are charged too, through
+    /// [`crate::stats::hash_table_bytes`]: each cache's own tables (see
+    /// `UserIndexedCache::overhead_bytes`) plus the dirty/deleted sets and the
+    /// pre-wire gates beside it. Those sets are charged for their slots only —
+    /// their addresses are the cache's `Arc<str>` keys, which eviction cannot
+    /// drop while an address is dirty, deleted or pending, so charging the
+    /// payloads again would double-count them.
+    ///
+    /// The sender-key figure additionally covers `pending_distributions`: its
+    /// table slots, its distribution payloads, and the key bytes of entries
+    /// the cache no longer holds (a pending entry whose record is in the cache
+    /// shares that key, which `key_for` canonicalizes, so it is charged once).
+    /// Its entry count includes those pending-only addresses.
+    ///
+    /// One residual overlap is accepted rather than tracked: an address
+    /// evicted while still pending is charged both as a pending-only key and
+    /// in the removal window that named it. That window holds 64 entries,
+    /// which bounds the overstatement to a handful of addresses — cheaper to
+    /// state than to reconcile on a report that is an estimate by contract.
     pub async fn memory_stats(
         &self,
     ) -> (
@@ -1880,7 +1950,10 @@ impl SignalStoreCache {
                     }
                 })
                 .collect();
-            keys_len += s.cache.overhead_bytes();
+            keys_len += s.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(s.dirty.capacity(), size_of::<Arc<str>>())
+                + crate::stats::hash_table_bytes(s.deleted.capacity(), size_of::<Arc<str>>())
+                + s.reservation_pending.table_bytes();
             (s.cache.len() as u64, keys_len, recs)
         };
         let session_bytes: usize = session_keys_len
@@ -1897,7 +1970,9 @@ impl SignalStoreCache {
                 .iter()
                 .map(|(k, v)| k.len() + v.as_ref().map_or(0, |b| b.len()))
                 .sum::<usize>()
-                + i.cache.overhead_bytes();
+                + i.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(i.dirty.capacity(), size_of::<Arc<str>>())
+                + crate::stats::hash_table_bytes(i.deleted.capacity(), size_of::<Arc<str>>());
             CollectionStats::new(i.cache.len() as u64, bytes as u64)
         };
 
@@ -1924,7 +1999,14 @@ impl SignalStoreCache {
                 .fold((0usize, 0usize), |(count, bytes), key| {
                     (count + 1, bytes + key.len())
                 });
-            keys_len += pending_only_key_bytes + sk.cache.overhead_bytes();
+            keys_len += pending_only_key_bytes
+                + sk.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(sk.dirty.capacity(), size_of::<Arc<str>>())
+                + sk.wire_gate_pending.table_bytes()
+                + crate::stats::hash_table_bytes(
+                    sk.pending_distributions.capacity(),
+                    size_of::<(Arc<str>, Arc<[u8]>)>(),
+                );
             (
                 (sk.cache.len() + pending_only_count) as u64,
                 keys_len,
@@ -2246,6 +2328,128 @@ mod sender_key_lock_tests {
             .sender_key_state()
             .expect("record must carry a state")
             .chain_id()
+    }
+
+    /// The report has to charge what the allocator is holding, not what the
+    /// entries measure: a `HashMap` of n identities owns more buckets than n,
+    /// and the dirty set, the user index and the pre-wire gate beside it are
+    /// allocations too. Before these were counted the identity store reported
+    /// only its keys and payloads — which is exactly the figure that stays
+    /// quiet while the tables are what is growing.
+    #[tokio::test]
+    async fn identity_report_charges_the_tables_not_just_the_entries() {
+        const IDENTITIES: usize = 200;
+
+        let cache = SignalStoreCache::new();
+        let mut entry_bytes = 0usize;
+        for i in 0..IDENTITIES {
+            let address = format!("1999555{i:04}:0");
+            entry_bytes += address.len() + 32;
+            cache
+                .put_identity(&ProtocolAddress::new(&address, 0.into()), &[7u8; 32])
+                .await;
+        }
+
+        let (_, identities, _) = cache.memory_stats().await;
+        assert_eq!(identities.entries, IDENTITIES as u64);
+        assert!(
+            identities.bytes > entry_bytes as u64,
+            "the report must exceed the {entry_bytes} B of keys and payloads it holds, \
+             got {}",
+            identities.bytes
+        );
+    }
+
+    /// A distribution is retained when its durability gate fails, which can
+    /// land before the record itself reaches the cache. Both orders must end
+    /// up sharing one `Arc<str>`: two allocations for one address is a real
+    /// (if small) waste, and it also makes `memory_stats` charge the string
+    /// once for storage it holds twice.
+    #[tokio::test]
+    async fn pending_distribution_and_cache_share_one_key() {
+        for pending_first in [true, false] {
+            let cache = SignalStoreCache::new();
+            let name =
+                SenderKeyName::from_parts("19995550001@g.us", "19995550002@s.whatsapp.net:0");
+
+            let retain = || async {
+                cache
+                    .cache_pending_sender_key_distribution(&name, Arc::from(&[1u8, 2, 3][..]))
+                    .await
+            };
+            let store = || async {
+                cache
+                    .put_sender_key(&name, sender_key_record_with_chain(3))
+                    .await
+            };
+
+            if pending_first {
+                retain().await;
+                store().await;
+            } else {
+                store().await;
+                retain().await;
+            }
+
+            let state = cache.sender_keys.lock().await;
+            let (cache_key, _) = state
+                .cache
+                .get_key_value(name.cache_key())
+                .expect("record cached");
+            let (pending_key, _) = state
+                .pending_distributions
+                .get_key_value(name.cache_key())
+                .expect("distribution retained");
+            assert!(
+                Arc::ptr_eq(cache_key, pending_key),
+                "pending_first={pending_first}: the two sides must share one allocation"
+            );
+        }
+    }
+
+    /// The third way a record reaches the cache: not a `put`, but a cold read
+    /// populating it from the backend. It has to canonicalize too, or a
+    /// distribution retained while the record was still cold leaves the store
+    /// holding two keys for one address.
+    #[tokio::test]
+    async fn a_cold_load_reuses_a_pending_distribution_key() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("19995550001@g.us", "19995550002@s.whatsapp.net:0");
+        backend
+            .put_sender_key(
+                name.cache_key(),
+                &sender_key_record_with_chain(5)
+                    .serialize()
+                    .expect("serialize record"),
+            )
+            .await
+            .expect("seed backend");
+
+        // Retained first, so the pending map owns the only key for this
+        // address when the cold load goes to insert its own.
+        cache
+            .cache_pending_sender_key_distribution(&name, Arc::from(&[9u8, 8][..]))
+            .await;
+        cache
+            .get_sender_key(&name, &backend)
+            .await
+            .expect("cold load")
+            .expect("record present");
+
+        let state = cache.sender_keys.lock().await;
+        let (cache_key, _) = state
+            .cache
+            .get_key_value(name.cache_key())
+            .expect("record cached");
+        let (pending_key, _) = state
+            .pending_distributions
+            .get_key_value(name.cache_key())
+            .expect("distribution retained");
+        assert!(
+            Arc::ptr_eq(cache_key, pending_key),
+            "the cold load must adopt the pending key, not allocate a second"
+        );
     }
 
     #[tokio::test]
