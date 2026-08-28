@@ -184,6 +184,185 @@ mod tests {
         );
     }
 
+    /// A client with an event collector already subscribed. Every test below
+    /// observes the dispatcher through the bus, so the wiring is shared rather
+    /// than repeated per test.
+    async fn client_with_collector() -> (Arc<Client>, Arc<TestEventCollector>) {
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+        (client, collector)
+    }
+
+    /// The account this client owns, as the `from` of a notification the
+    /// server sends about it.
+    const OWN_PN: &str = "12025550199@s.whatsapp.net";
+
+    /// `<notification type="account_sync" from=OWN_PN>` wrapping one
+    /// `<disappearing_mode>` child — the envelope both arms share, so only the
+    /// child differs between them.
+    fn account_sync_disappearing_mode(id: &str, disappearing_mode: Node) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", NotificationType::AccountSync.as_str())
+            .attr("from", OWN_PN)
+            .attr("id", id)
+            .attr("t", "1704067200")
+            .children([disappearing_mode])
+            .build()
+    }
+
+    // ── `w:gp2` / `<groups_dirty>` (WA Web
+    // `WASmaxInGroupsGroupsDirtyNotificationRequest`)
+    //
+    // The one `w:gp2` stanza whose `from` is the server rather than a group.
+    // We ran it through the ordinary group-notification parser, which named
+    // `s.whatsapp.net` as the group in the event it produced and left the
+    // groups the server had actually called stale still cached.
+
+    #[tokio::test]
+    async fn groups_dirty_invalidates_the_named_groups_and_names_no_group_update() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let (client, collector) = client_with_collector().await;
+
+        // Several dirty groups, so the bounded fan-out is exercised with more
+        // than one entry rather than degenerating to the single-item case.
+        let dirty: Vec<Jid> = [
+            "120363000000000001@g.us",
+            "120363000000000003@g.us",
+            "120363000000000004@g.us",
+        ]
+        .iter()
+        .map(|jid| jid.parse().unwrap())
+        .collect();
+        let untouched: Jid = "120363000000000002@g.us".parse().unwrap();
+        let cache = client.get_group_cache();
+        for jid in dirty.iter().chain([&untouched]) {
+            cache
+                .insert(
+                    jid.clone(),
+                    Arc::new(GroupInfo::new(
+                        vec!["12025550101@s.whatsapp.net".parse().unwrap()],
+                        AddressingMode::Pn,
+                    )),
+                )
+                .await;
+        }
+
+        let notif = NodeBuilder::new("notification")
+            .attr("type", NotificationType::WGp2.as_str())
+            .attr("from", "g.us")
+            .attr("id", "groups-dirty-1")
+            .attr("t", "1704067200")
+            .children([NodeBuilder::new("groups_dirty")
+                .children(
+                    dirty
+                        .iter()
+                        .map(|jid| NodeBuilder::new("group").attr("jid", jid).build()),
+                )
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        // The invalidation runs in the per-group lane, off the ack path, so it
+        // lands shortly after the handler returns rather than inside it.
+        // `poll_until` takes a sync predicate and this one is async, hence a
+        // bounded timeout around the poll rather than that helper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for jid in &dirty {
+                while cache.get(jid).await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        })
+        .await
+        .expect("every group the server called stale must lose its cached metadata");
+        assert!(
+            cache.get(&untouched).await.is_some(),
+            "a group the notification did not name must keep its cache"
+        );
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::GroupUpdate(_))),
+            "groups_dirty must not be reported as an update to a group named by `from`"
+        );
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::Notification(_))),
+            "the stanza must still reach the consumer raw"
+        );
+    }
+
+    // ── `account_sync` / `<disappearing_mode>` (WA Web's account_sync parser)
+    //
+    // Our own account's default disappearing-messages timer, changed from
+    // another device. We read only `pushname` and `<devices>` out of this
+    // notification, so the change was dropped without even the raw-event
+    // fallback, which the matched `account_sync` arm skips.
+    //
+    // WA Web's parser makes `action` and `duration`/`t` mutually exclusive
+    // (`h.hasAttr("action") ? … : (duration, t)`), so the two shapes are
+    // tested apart: only the second carries a timer to report.
+
+    #[tokio::test]
+    async fn account_sync_disappearing_mode_reaches_the_consumer() {
+        let (client, collector) = client_with_collector().await;
+
+        let notif = account_sync_disappearing_mode(
+            "acct-sync-dm-1",
+            NodeBuilder::new("disappearing_mode")
+                .attr("duration", "604800")
+                .attr("t", "1704067200")
+                .build(),
+        );
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        let changed = collector
+            .events()
+            .into_iter()
+            .find_map(|event| match event.as_ref() {
+                Event::DisappearingModeChanged(changed) => Some(changed.clone()),
+                _ => None,
+            })
+            .expect("an account_sync disappearing_mode must reach the consumer");
+        assert_eq!(changed.from, OWN_PN.parse::<Jid>().unwrap());
+        assert_eq!(changed.duration, 604_800);
+    }
+
+    /// The other arm. `action` present means the stanza carries no timer at
+    /// all — WA Web goes back to the server for it. Reporting a
+    /// `DisappearingModeChanged` here would be inventing a duration the
+    /// notification never stated, so nothing is dispatched.
+    #[tokio::test]
+    async fn account_sync_disappearing_mode_action_reports_no_duration() {
+        let (client, collector) = client_with_collector().await;
+
+        let notif = account_sync_disappearing_mode(
+            "acct-sync-dm-2",
+            NodeBuilder::new("disappearing_mode")
+                .attr("action", "modify")
+                .build(),
+        );
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::DisappearingModeChanged(_))),
+            "an action-only disappearing_mode states no duration, so none may be reported"
+        );
+    }
+
     /// A type a subsystem claims must not be shadowed by a core arm. The seam
     /// is consulted only in the fallthrough, so an arm added here later would
     /// take the stanza and the subsystem would silently stop seeing it. The

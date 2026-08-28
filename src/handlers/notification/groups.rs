@@ -122,6 +122,19 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
     tracing::instrument(name = "wa.notif.group", level = "debug", skip_all)
 )]
 pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+    // `<groups_dirty>` is the one `w:gp2` stanza the server sends about itself:
+    // `from` is `s.whatsapp.net`, not a group. Parsing it as an ordinary group
+    // notification would name the server as the group in every event it
+    // produced, so it is routed out before that can happen.
+    if let Some(groups) = wacore::stanza::groups::parse_groups_dirty(node.get()) {
+        handle_groups_dirty(client, groups);
+        client
+            .core
+            .event_bus
+            .dispatch(Event::Notification(Arc::clone(&node)));
+        return;
+    }
+
     let mut notification = match GroupNotification::try_from_node_ref(node.get()) {
         Some(n) => n,
         None => {
@@ -270,6 +283,85 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         .core
         .event_bus
         .dispatch(Event::Notification(Arc::clone(&node)));
+}
+
+/// The server named these groups' cached metadata stale.
+///
+/// Dropping the group's snapshot is what every other staleness signal in this
+/// file does (see the `Remove` / expired-cache arms above); the next send or
+/// `group_info` query re-fetches. Doing nothing would leave a group's
+/// participant list wrong for as long as the cache lives, which is a message
+/// encrypted to a device set the group no longer has.
+///
+/// Two properties are in tension here, and the lane wins.
+///
+/// It goes through `lock_group_metadata` rather than dropping the cache entry
+/// directly, because that lane *is* the invalidation protocol. A cold
+/// `query_info` holds the guard across its IQ precisely so an invalidation
+/// cannot be lost against it — with no cached `Arc` to compare, the lane is
+/// the only thing that distinguishes "still absent" from "a notification
+/// invalidated an already-absent snapshot", and it publishes its result
+/// unconditionally. An eviction taken outside the lane is invisible to that
+/// query, which then republishes membership it fetched before this
+/// notification. (The warm path is safe either way: it publishes only when
+/// `Arc::ptr_eq` says its snapshot is still current.)
+///
+/// It is spawned, because `Client::process_node` defers this stanza's
+/// transport `<ack>` until the router's dispatch returns, and one notification
+/// may name up to 10 000 groups — WA Web's parser bounds the `<group>`
+/// children at `1..1e4`. A lane acquisition and a storage round trip each,
+/// drained serially, is long enough for the server to retransmit and start the
+/// work over.
+///
+/// That leaves a window between this returning and the task running, in which
+/// a send can still read a stale snapshot. It is bounded by an uncontended
+/// lane acquisition and the fan-out below, and it is strictly narrower than the official client's:
+/// `handleGroupsDirtyNotificationJob` queues a persisted job and does not run
+/// it until `waitForOfflineDeliveryEnd()` and `waitForConnection()` have both
+/// resolved. Closing it entirely needs an invalidation generation the cache
+/// does not have — see the PR discussion.
+///
+/// Deliberately unguarded, unlike the dirty-bit resync in `handlers/ib.rs`.
+/// That one sends an IQ whose result belongs to the connection that asked for
+/// it, so it checks the connection generation and `is_shutting_down`. Dropping
+/// a snapshot is idempotent and correct on any generation, and
+/// `is_shutting_down` would be actively wrong: it is `expected_disconnect ||
+/// !is_running`, true between connections as well as at the end of one, so the
+/// work would throw itself away exactly when a reconnect is about to make the
+/// stale metadata reachable again.
+fn handle_groups_dirty(client: &Arc<Client>, groups: Vec<wacore_binary::Jid>) {
+    use futures::StreamExt;
+
+    // Each group's work sits behind its own per-JID lane, so entries never
+    // contend with one another; this bounds how many storage round trips — and,
+    // for a custom cache store, remote ones — are in flight at once. Draining
+    // serially would make a group's stale window the sum of every entry ahead
+    // of it, which with the parser's 10 000-group ceiling is a tail measured in
+    // whole round-trip multiples rather than one.
+    const GROUPS_DIRTY_INVALIDATE_CONCURRENCY: usize = 16;
+
+    let client = Arc::clone(client);
+    client
+        .clone()
+        .runtime
+        .spawn(Box::pin(async move {
+            futures::stream::iter(groups)
+                .map(|jid| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        debug!(
+                            target: "Client/Group",
+                            "groups_dirty: invalidating cached metadata for {}",
+                            jid.observe()
+                        );
+                        client.lock_group_metadata(&jid).await.invalidate().await;
+                    }
+                })
+                .buffer_unordered(GROUPS_DIRTY_INVALIDATE_CONCURRENCY)
+                .for_each(|()| std::future::ready(()))
+                .await;
+        }))
+        .detach();
 }
 
 /// Handle `<notification type="newsletter">` — live updates with reaction counts.

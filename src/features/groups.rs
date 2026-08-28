@@ -678,7 +678,15 @@ impl GroupMetadataGuard<'_> {
         self.cache(info).await;
     }
 
+    /// Drop this group's snapshot, in memory and on disk.
+    ///
+    /// The cache goes first. A lookup defaults to `Freshness::CachePreferred`
+    /// and a send does not take this lane, so for as long as the snapshot is
+    /// readable a concurrent send can encrypt to a participant set the group no
+    /// longer has — and the persisted delete is an `await` on storage, which is
+    /// exactly the pause that would let one through.
     pub(crate) async fn invalidate(&self) {
+        self.client.get_group_cache().invalidate(self.jid).await;
         if let Err(error) = self
             .client
             .persistence_manager
@@ -691,7 +699,6 @@ impl GroupMetadataGuard<'_> {
                 self.jid
             );
         }
-        self.client.get_group_cache().invalidate(self.jid).await;
     }
 }
 
