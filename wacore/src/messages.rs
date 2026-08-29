@@ -512,10 +512,11 @@ impl MessageUtils {
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
     ) -> Result<CompactString> {
+        use core::fmt::Write as _;
         // Format every device into one shared arena and sort range views over
         // it instead of a heap String per device (this runs over the full
         // device set of a send). Sorting the slices is the same lexicographic
-        // order as sorting the individual ad_strings, so the hashed
+        // order as sorting the individual display strings, so the hashed
         // concatenation is byte-identical.
         //
         // The ranges are `u32` pairs, so the sort moves half the bytes per
@@ -531,7 +532,9 @@ impl MessageUtils {
         let mut arena = String::with_capacity(hint * 36);
         for jid in devices {
             let start = arena.len();
-            jid.push_phash_form_to(&mut arena);
+            // Display form (omits `:0` for device 0) — matches Baileys/server phash;
+            // ad-form mismatches every device-0 fanout and thrashes the device cache.
+            let _ = write!(arena, "{jid}");
             ranges.push((start as u32, arena.len() as u32));
         }
         // The offsets above only ever grow, so one check on the finished arena
@@ -2191,9 +2194,12 @@ mod parse_message_info_tests {
         // `single` and `multi` carry a 62/63 byte, so they differ from the
         // old URL-safe output (`2:5s-YxCff` / `2:AAv_hwhn`); `control` has
         // neither, so it is unchanged across alphabets.
-        assert_eq!(h_single, "2:5s+YxCff");
-        assert_eq!(h_control, "2:RJWVxcMQ");
-        assert_eq!(h_multi, "2:AAv/hwhn");
+        // Fork differs: display form hash instead of ad-form
+        assert_eq!(h_single, "2:+59uAptD");
+        // Fork differs: display form hash instead of ad-form
+        assert_eq!(h_control, "2:ZH/yr1Rc");
+        // Fork differs: display form hash instead of ad-form
+        assert_eq!(h_multi, "2:PTnuBKEZ");
     }
 
     /// Locks the arena-sorted phash against the straightforward reference
@@ -2225,7 +2231,7 @@ mod parse_message_info_tests {
             dev("999", 0, 65535, wacore_binary::Server::Bot),
         ];
 
-        let mut reference: Vec<String> = devices.iter().map(|j| j.to_phash_form_string()).collect();
+        let mut reference: Vec<String> = devices.iter().map(|j| j.to_string()).collect();
         reference.sort_unstable();
         let mut hasher = Sha256::new();
         for jid in &reference {
@@ -2240,7 +2246,7 @@ mod parse_message_info_tests {
         assert_eq!(
             MessageUtils::participant_list_hash(&devices).unwrap(),
             expected
-        );
+        ); // Fork differs: display form hash
     }
 
     // #6 — validate_bcl_hash accepts the matching phashV2 and rejects a tampered
@@ -3158,6 +3164,35 @@ mod device_sent_tests {
             decode_padded(&MessageUtils::encode_and_pad_with_context(&plain, None)),
             decode_padded(&MessageUtils::encode_and_pad(&plain)),
             "encode_and_pad_with_context(None) must equal encode_and_pad"
+        );
+    }
+
+    #[test]
+    fn participant_list_hash_diverges_from_ad_string_form_for_device_zero() {
+        use std::str::FromStr;
+        use wacore_binary::Jid;
+
+        let device_zero = Jid::from_str("100000012345678@lid").unwrap();
+        let display_hash = MessageUtils::participant_list_hash(&[device_zero.clone()])
+            .expect("participant_list_hash should succeed");
+
+        // Recompute hash using ad-string form manually
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let ad_string = device_zero.to_phash_form_string();
+        let mut hasher = Sha256::new();
+        hasher.update(ad_string.as_bytes());
+        let digest = hasher.finalize();
+
+        let mut expected = String::with_capacity(10);
+        expected.push_str("2:");
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&digest[..6], &mut expected);
+
+        assert_ne!(
+            display_hash, expected,
+            "device-0 JID must hash differently in display vs ad-string form; a match \
+             means the function regressed to ad-string (Baileys/server would reject)"
         );
     }
 }
