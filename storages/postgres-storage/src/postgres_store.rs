@@ -1378,6 +1378,124 @@ impl ProtocolStore for PostgresStore {
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
         Ok(result.rows_affected() as u32)
     }
+
+    async fn store_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+        message: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pending_inbound_messages (chat_jid, sender_jid, message_id, payload, device_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (chat_jid, sender_jid, message_id, device_id)
+             DO UPDATE SET payload = EXCLUDED.payload",
+        )
+        .bind(chat)
+        .bind(sender)
+        .bind(id)
+        .bind(message)
+        .bind(self.device_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(())
+    }
+
+    async fn get_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let row = sqlx::query(
+            "SELECT payload FROM pending_inbound_messages
+             WHERE chat_jid = $1 AND sender_jid = $2 AND message_id = $3 AND device_id = $4",
+        )
+        .bind(chat)
+        .bind(sender)
+        .bind(id)
+        .bind(self.device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(row.map(|r| r.get("payload")))
+    }
+
+    async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM pending_inbound_messages
+             WHERE chat_jid = $1 AND sender_jid = $2 AND message_id = $3 AND device_id = $4",
+        )
+        .bind(chat)
+        .bind(sender)
+        .bind(id)
+        .bind(self.device_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(())
+    }
+
+    async fn store_pending_inbound_batch(&self, rows: &[PendingInboundRow<'_>]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO pending_inbound_messages (chat_jid, sender_jid, message_id, payload, device_id)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (chat_jid, sender_jid, message_id, device_id)
+                 DO UPDATE SET payload = EXCLUDED.payload",
+            )
+            .bind(row.chat)
+            .bind(row.sender)
+            .bind(row.id)
+            .bind(row.message)
+            .bind(self.device_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(())
+    }
+
+    async fn delete_pending_inbound_batch(&self, keys: &[PendingInboundKey<'_>]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        for key in keys {
+            sqlx::query(
+                "DELETE FROM pending_inbound_messages
+                 WHERE chat_jid = $1 AND sender_jid = $2 AND message_id = $3 AND device_id = $4",
+            )
+            .bind(key.chat)
+            .bind(key.sender)
+            .bind(key.id)
+            .bind(self.device_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(())
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2494,5 +2612,141 @@ mod tests {
         store.update_device_list(record).await.unwrap();
         let loaded = store.get_devices("raw_id_user").await.unwrap().unwrap();
         assert_eq!(loaded.raw_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_pending_inbound_store_and_read() {
+        let store = create_test_store().await;
+        let payload = b"hello pending";
+        store
+            .store_pending_inbound(
+                "chat1@s.whatsapp.net",
+                "sender1@s.whatsapp.net",
+                "msg001",
+                payload,
+            )
+            .await
+            .unwrap();
+        let loaded = store
+            .get_pending_inbound("chat1@s.whatsapp.net", "sender1@s.whatsapp.net", "msg001")
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(payload.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_pending_inbound_delete_removes() {
+        let store = create_test_store().await;
+        store
+            .store_pending_inbound(
+                "chat2@s.whatsapp.net",
+                "sender2@s.whatsapp.net",
+                "msg002",
+                b"data",
+            )
+            .await
+            .unwrap();
+        store
+            .delete_pending_inbound("chat2@s.whatsapp.net", "sender2@s.whatsapp.net", "msg002")
+            .await
+            .unwrap();
+        let loaded = store
+            .get_pending_inbound("chat2@s.whatsapp.net", "sender2@s.whatsapp.net", "msg002")
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pending_inbound_batch_store_matches_singles() {
+        let store = create_test_store().await;
+        let rows = [
+            PendingInboundRow {
+                chat: "chatB@g.us",
+                sender: "s1@s.whatsapp.net",
+                id: "m1",
+                message: b"p1",
+            },
+            PendingInboundRow {
+                chat: "chatB@g.us",
+                sender: "s2@s.whatsapp.net",
+                id: "m2",
+                message: b"p2",
+            },
+            PendingInboundRow {
+                chat: "chatB@g.us",
+                sender: "s3@s.whatsapp.net",
+                id: "m3",
+                message: b"p3",
+            },
+        ];
+        store.store_pending_inbound_batch(&rows).await.unwrap();
+        for row in &rows {
+            let loaded = store
+                .get_pending_inbound(row.chat, row.sender, row.id)
+                .await
+                .unwrap();
+            assert_eq!(loaded, Some(row.message.to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_inbound_batch_delete_leaves_remainder() {
+        let store = create_test_store().await;
+        let rows = [
+            PendingInboundRow {
+                chat: "chatC@g.us",
+                sender: "s1@s.whatsapp.net",
+                id: "m1",
+                message: b"p1",
+            },
+            PendingInboundRow {
+                chat: "chatC@g.us",
+                sender: "s2@s.whatsapp.net",
+                id: "m2",
+                message: b"p2",
+            },
+            PendingInboundRow {
+                chat: "chatC@g.us",
+                sender: "s3@s.whatsapp.net",
+                id: "m3",
+                message: b"p3",
+            },
+        ];
+        store.store_pending_inbound_batch(&rows).await.unwrap();
+        let keys = [
+            PendingInboundKey {
+                chat: "chatC@g.us",
+                sender: "s1@s.whatsapp.net",
+                id: "m1",
+            },
+            PendingInboundKey {
+                chat: "chatC@g.us",
+                sender: "s2@s.whatsapp.net",
+                id: "m2",
+            },
+        ];
+        store.delete_pending_inbound_batch(&keys).await.unwrap();
+        assert!(
+            store
+                .get_pending_inbound("chatC@g.us", "s1@s.whatsapp.net", "m1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_pending_inbound("chatC@g.us", "s2@s.whatsapp.net", "m2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound("chatC@g.us", "s3@s.whatsapp.net", "m3")
+                .await
+                .unwrap(),
+            Some(b"p3".to_vec()),
+        );
     }
 }
