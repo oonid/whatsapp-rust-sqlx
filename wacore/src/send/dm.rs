@@ -98,6 +98,28 @@ pub enum NoRecipientDeviceError {
     Unresolved,
 }
 
+/// The server named a device 0 as gone while the send was establishing
+/// sessions for it.
+///
+/// Kept apart from [`NoRecipientDeviceError`] because it can name our own
+/// primary as easily as the peer's, and the two ask for different things: this
+/// says one identity's device list is stale on a device that owns its chat, so
+/// the stanza is not built at all. Nothing was on the wire, and the useful
+/// retry is one that resolves devices again.
+#[derive(Debug, thiserror::Error)]
+#[error("the server rejected the primary device with code {code}")]
+#[non_exhaustive]
+pub struct PrimaryDeviceRejected {
+    /// The `<error code>` the server attached to it.
+    pub code: u16,
+}
+
+impl PrimaryDeviceRejected {
+    pub fn new(code: u16) -> Self {
+        Self { code }
+    }
+}
+
 impl NoRecipientDeviceError {
     fn encryption_failed(attempted: usize, source: Option<anyhow::Error>) -> Self {
         Self::EncryptionFailed {
@@ -110,10 +132,50 @@ impl NoRecipientDeviceError {
     }
 }
 
+/// What the recipient half of a DM fan-out managed to encrypt for.
+///
+/// A DM whose fan-out lost some but not all of the recipient's devices still
+/// builds a stanza, is acked, and returns a real message id, so this is the
+/// only place the loss is visible. `skipped_primary` is called out separately
+/// because a recipient's phone holds the chat whether or not they have a
+/// companion linked and open: a stanza that reached only companions is the one
+/// a recipient is most likely to never see.
+///
+/// Zero-valued for a self-chat, which has no recipient half at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct RecipientFanout {
+    /// Recipient devices the fan-out attempted.
+    pub addressed: usize,
+    /// Of those, how many produced a `<to><enc>` node.
+    pub encrypted: usize,
+    /// The recipient's device 0 was among the devices that encrypted for
+    /// nothing. Says nothing about how many others were skipped; `addressed`
+    /// against `encrypted` answers that.
+    pub skipped_primary: bool,
+    /// The server answered 406 (unregistered) for at least one of them.
+    pub had_unregistered_device: bool,
+}
+
+impl RecipientFanout {
+    /// Some recipient device was addressed and dropped. The total-loss case
+    /// never reaches a caller: it is [`NoRecipientDeviceError`].
+    pub fn is_partial(&self) -> bool {
+        self.encrypted < self.addressed
+    }
+}
+
 /// Result of `prepare_dm_stanza` — carries the stanza node and the
 /// locally computed phash for server ACK validation.
+///
+/// Sealed: it is a return type, and every field it has grown was a fact the
+/// send already knew and threw away. Sealing it means the next one costs
+/// nobody a compile error.
+#[non_exhaustive]
 pub struct PreparedDmStanza {
     pub node: Node,
+    /// What the recipient half of the fan-out reached. See [`RecipientFanout`].
+    pub recipient_fanout: RecipientFanout,
     /// Locally computed phash from the sent device set. Not sent on the
     /// wire (WA Web only sends phash for groups). Used by the caller to
     /// compare against the server's ACK phash for device-list drift detection.
@@ -232,6 +294,7 @@ pub async fn prepare_dm_stanza(
 
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;
+    let mut recipient_fanout = RecipientFanout::default();
 
     let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
 
@@ -258,6 +321,12 @@ pub async fn prepare_dm_stanza(
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
+        recipient_fanout = RecipientFanout {
+            addressed: recipient_devices.len(),
+            encrypted: summary.encrypted_devices,
+            skipped_primary: summary.skipped_primary,
+            had_unregistered_device: summary.had_unregistered_device,
+        };
         // The recipient half wrote into an empty buffer, so an emptiness test
         // here is a recipient-node count without walking anything. Bailing
         // before the own half also keeps a companion's sender chain from
@@ -350,6 +419,7 @@ pub async fn prepare_dm_stanza(
 
     Ok(PreparedDmStanza {
         node: stanza,
+        recipient_fanout,
         phash,
         message_secret: reporting_result.map(|r| r.message_secret),
     })
