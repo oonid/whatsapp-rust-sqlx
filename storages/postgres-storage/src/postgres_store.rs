@@ -14,177 +14,7 @@ use wacore::store::traits::*;
 
 /// Each element is a single DDL statement executed in order on first startup.
 /// Use IF NOT EXISTS so re-running is safe (idempotent).
-static SCHEMA_STMTS: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS _wa_migrations (
-        id INTEGER NOT NULL PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )",
-    "CREATE TABLE IF NOT EXISTS device (
-        id INTEGER NOT NULL PRIMARY KEY,
-        lid TEXT NOT NULL DEFAULT '',
-        pn TEXT NOT NULL DEFAULT '',
-        registration_id INTEGER NOT NULL DEFAULT 0,
-        noise_key BYTEA NOT NULL,
-        identity_key BYTEA NOT NULL,
-        signed_pre_key BYTEA NOT NULL,
-        signed_pre_key_id INTEGER NOT NULL DEFAULT 0,
-        signed_pre_key_signature BYTEA NOT NULL,
-        adv_secret_key BYTEA NOT NULL,
-        account BYTEA,
-        push_name TEXT NOT NULL DEFAULT '',
-        app_version_primary INTEGER NOT NULL DEFAULT 0,
-        app_version_secondary INTEGER NOT NULL DEFAULT 0,
-        app_version_tertiary BIGINT NOT NULL DEFAULT 0,
-        app_version_last_fetched_ms BIGINT NOT NULL DEFAULT 0,
-        edge_routing_info BYTEA,
-        props_hash TEXT,
-        next_pre_key_id INTEGER NOT NULL DEFAULT 0,
-        first_unupload_pre_key_id INTEGER NOT NULL DEFAULT 0,
-        nct_salt BYTEA,
-        server_has_prekeys BOOLEAN NOT NULL DEFAULT FALSE,
-        server_cert_chain BYTEA,
-        login_counter INTEGER NOT NULL DEFAULT 0
-    )",
-    "CREATE TABLE IF NOT EXISTS identities (
-        address TEXT NOT NULL,
-        key BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (address, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_identities_device_id ON identities (device_id)",
-    "CREATE TABLE IF NOT EXISTS sessions (
-        address TEXT NOT NULL,
-        record BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (address, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_device_id ON sessions (device_id)",
-    "CREATE TABLE IF NOT EXISTS prekeys (
-        id INTEGER NOT NULL,
-        key BYTEA NOT NULL,
-        uploaded BOOLEAN NOT NULL DEFAULT FALSE,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (id, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_prekeys_device_id ON prekeys (device_id)",
-    "CREATE TABLE IF NOT EXISTS sender_keys (
-        address TEXT NOT NULL,
-        record BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (address, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_sender_keys_device_id ON sender_keys (device_id)",
-    "CREATE TABLE IF NOT EXISTS signed_prekeys (
-        id INTEGER NOT NULL,
-        record BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (id, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_signed_prekeys_device_id ON signed_prekeys (device_id)",
-    "CREATE TABLE IF NOT EXISTS app_state_keys (
-        key_id BYTEA NOT NULL,
-        key_data BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        inserted_seq BIGSERIAL,
-        PRIMARY KEY (key_id, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_app_state_keys_device_id ON app_state_keys (device_id)",
-    "CREATE TABLE IF NOT EXISTS app_state_versions (
-        name TEXT NOT NULL,
-        state_data BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (name, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_app_state_versions_device_id ON app_state_versions (device_id)",
-    "CREATE TABLE IF NOT EXISTS app_state_mutation_macs (
-        name TEXT NOT NULL,
-        version BIGINT NOT NULL,
-        index_mac BYTEA NOT NULL,
-        value_mac BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (name, index_mac, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_app_state_mutation_macs_device_id ON app_state_mutation_macs (device_id)",
-    "CREATE TABLE IF NOT EXISTS lid_pn_mapping (
-        lid TEXT NOT NULL,
-        phone_number TEXT NOT NULL,
-        created_at BIGINT NOT NULL,
-        learning_source TEXT NOT NULL,
-        updated_at BIGINT NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (lid, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_lid_pn_mapping_phone ON lid_pn_mapping (phone_number, device_id)",
-    "CREATE TABLE IF NOT EXISTS base_keys (
-        address TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        base_key BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-        PRIMARY KEY (address, message_id, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_base_keys_device ON base_keys (device_id)",
-    "CREATE TABLE IF NOT EXISTS device_registry (
-        user_id TEXT NOT NULL,
-        devices_json TEXT NOT NULL,
-        timestamp BIGINT NOT NULL,
-        phash TEXT,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-        raw_id INTEGER,
-        PRIMARY KEY (user_id, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_device_registry_timestamp ON device_registry (timestamp)",
-    "CREATE INDEX IF NOT EXISTS idx_device_registry_device ON device_registry (device_id)",
-    "CREATE INDEX IF NOT EXISTS idx_device_registry_updated_at ON device_registry (updated_at)",
-    "CREATE TABLE IF NOT EXISTS sender_key_devices (
-        group_jid TEXT NOT NULL,
-        device_jid TEXT NOT NULL,
-        has_key BOOLEAN NOT NULL DEFAULT FALSE,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-        PRIMARY KEY (group_jid, device_jid, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_sender_key_devices_group ON sender_key_devices (group_jid, device_id)",
-    "CREATE TABLE IF NOT EXISTS tc_tokens (
-        jid TEXT NOT NULL,
-        token BYTEA NOT NULL,
-        token_timestamp BIGINT NOT NULL,
-        sender_timestamp BIGINT,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-        PRIMARY KEY (jid, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_tc_tokens_timestamp ON tc_tokens (token_timestamp, device_id)",
-    "CREATE TABLE IF NOT EXISTS sent_messages (
-        chat_jid TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        payload BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-        PRIMARY KEY (chat_jid, message_id, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_sent_messages_created ON sent_messages (created_at, device_id)",
-    // Record that schema v1 is applied
-    "INSERT INTO _wa_migrations (id) VALUES (1) ON CONFLICT DO NOTHING",
-    // --- v2: prekey upload watermark (#833) + message-secret store ---
-    // ALTER IF NOT EXISTS (beside the CREATE column above) so already-provisioned
-    // databases pick up the new column too.
-    "ALTER TABLE device ADD COLUMN IF NOT EXISTS first_unupload_pre_key_id INTEGER NOT NULL DEFAULT 0",
-    "CREATE TABLE IF NOT EXISTS msg_secrets (
-        chat TEXT NOT NULL,
-        sender TEXT NOT NULL,
-        msg_id TEXT NOT NULL,
-        secret BYTEA NOT NULL,
-        device_id INTEGER NOT NULL DEFAULT 1,
-        created_at BIGINT NOT NULL DEFAULT 0,
-        expires_at BIGINT NOT NULL DEFAULT 0,
-        message_ts BIGINT NOT NULL DEFAULT 0,
-        PRIMARY KEY (chat, sender, msg_id, device_id)
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_msg_secrets_expires ON msg_secrets (device_id, expires_at)",
-    "INSERT INTO _wa_migrations (id) VALUES (2) ON CONFLICT DO NOTHING",
-];
+use crate::schema::SCHEMA_STMTS;
 
 async fn run_migrations(pool: &PgPool) -> Result<()> {
     // Advisory lock serialises concurrent startup (e.g. multiple test threads).
@@ -369,7 +199,9 @@ impl PostgresStore {
             lid_migrated: row.get("lid_migrated"),
             last_signed_pre_key_rotation_ms: row.get::<i64, _>("last_signed_pre_key_rotation_ms"),
             read_receipts_disabled: row.get("read_receipts_disabled"),
-            server_client_expiration: row.get::<Option<String>, _>("server_client_expiration").and_then(|s| serde_json::from_str(&s).ok()),
+            server_client_expiration: row
+                .get::<Option<String>, _>("server_client_expiration")
+                .and_then(|s| serde_json::from_str(&s).ok()),
             nct_salt: row.get("nct_salt"),
             nct_salt_sync_seen: false,
             server_cert_chain,
@@ -412,7 +244,7 @@ impl PostgresStore {
                                   app_version_last_fetched_ms, edge_routing_info, props_hash,
                                   next_pre_key_id, server_has_prekeys, nct_salt,
                                   server_cert_chain, login_counter, first_unupload_pre_key_id, lid_migrated, last_signed_pre_key_rotation_ms, read_receipts_disabled, server_client_expiration)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24),$25,$26,$27,$28)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
              ON CONFLICT (id) DO UPDATE SET
                 lid = EXCLUDED.lid, pn = EXCLUDED.pn,
                 registration_id = EXCLUDED.registration_id,
@@ -431,7 +263,7 @@ impl PostgresStore {
                 next_pre_key_id = EXCLUDED.next_pre_key_id,
                 server_has_prekeys = EXCLUDED.server_has_prekeys,
                 nct_salt = EXCLUDED.nct_salt, server_cert_chain = EXCLUDED.server_cert_chain,
-                login_counter, lid_migrated, last_signed_pre_key_rotation_ms, read_receipts_disabled, server_client_expiration = EXCLUDED.login_counter,
+                login_counter = EXCLUDED.login_counter,
                 first_unupload_pre_key_id = EXCLUDED.first_unupload_pre_key_id, lid_migrated = EXCLUDED.lid_migrated, last_signed_pre_key_rotation_ms = EXCLUDED.last_signed_pre_key_rotation_ms, read_receipts_disabled = EXCLUDED.read_receipts_disabled, server_client_expiration = EXCLUDED.server_client_expiration",
         )
         .bind(device_id)
@@ -681,7 +513,8 @@ impl PostgresStore {
             None => Ok(HashState::default()),
             Some(r) => {
                 let data: Vec<u8> = r.get("state_data");
-                let state = crate::wire::decode_hash_state(&data).map_err(|e| StoreError::Serialization(Box::new(e)))?;
+                let state = crate::wire::decode_hash_state(&data)
+                    .map_err(|e| StoreError::Serialization(Box::new(e)))?;
                 Ok(state)
             }
         }
@@ -1481,7 +1314,11 @@ impl ProtocolStore for PostgresStore {
         Ok(rows.into_iter().map(|r| r.get("jid")).collect())
     }
 
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64, _sender_cutoff: i64) -> Result<u32> {
+    async fn delete_expired_tc_tokens(
+        &self,
+        cutoff_timestamp: i64,
+        _sender_cutoff: i64,
+    ) -> Result<u32> {
         let result =
             sqlx::query("DELETE FROM tc_tokens WHERE token_timestamp < $1 AND device_id = $2")
                 .bind(cutoff_timestamp)
@@ -1915,25 +1752,20 @@ mod tests {
         let record = DeviceListRecord {
             user: "1234567890".to_string().into(),
             devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    // key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 1,
-                    // key_index: Some(42),
-                },
-            ],
+                wacore::store::traits::DeviceInfo::new(0, None),
+                wacore::store::traits::DeviceInfo::new(1, None),
+            ]
+            .into(),
             timestamp: 1234567890,
             phash: Some("2:abcdef".to_string().into()),
             raw_id: None,
         };
         store.update_device_list(record).await.unwrap();
         let loaded = store.get_devices("1234567890").await.unwrap().unwrap();
-        assert_eq!(loaded.user, "1234567890");
+        assert_eq!(loaded.user, "1234567890".into());
         assert_eq!(loaded.devices.len(), 2);
         // assert_eq!(loaded.devices[1].key_index, Some(42));
-        assert_eq!(loaded.phash, Some("2:abcdef".to_string()));
+        assert_eq!(loaded.phash, Some("2:abcdef".into()));
     }
 
     #[tokio::test]
@@ -1950,15 +1782,10 @@ mod tests {
         let record2 = DeviceListRecord {
             user: "9876543210".to_string().into(),
             devices: vec![
-                DeviceInfo {
-                    device_id: 0,
-                    // key_index: None,
-                },
-                DeviceInfo {
-                    device_id: 2,
-                    // key_index: None,
-                },
-            ],
+                wacore::store::traits::DeviceInfo::new(0, None),
+                wacore::store::traits::DeviceInfo::new(2, None),
+            ]
+            .into(),
             timestamp: 2000,
             phash: Some("2:new".to_string().into()),
             raw_id: None,
