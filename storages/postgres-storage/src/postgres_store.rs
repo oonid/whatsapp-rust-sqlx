@@ -1541,13 +1541,72 @@ mod tests {
 
     static DEVICE_COUNTER: AtomicI32 = AtomicI32::new(1000);
 
-    fn test_db_url() -> String {
+    /// Name of the database these tests provision into. Deliberately NOT the
+    /// maintenance `postgres` database: that one carries the sapa-rs platform
+    /// schema, whose own `sessions` table has no `device_id`. Our
+    /// `CREATE TABLE IF NOT EXISTS sessions` would skip it and the following
+    /// `CREATE INDEX ... (device_id)` would fail with `column does not exist` —
+    /// a collision that looks like a schema bug and is not one.
+    const TEST_DB: &str = "wa_pgstore_test";
+
+    /// Admin connection URL — the database the suite connects to in order to
+    /// create [`TEST_DB`]. Override with `TEST_DATABASE_URL` or `DATABASE_URL`.
+    fn admin_db_url() -> String {
         std::env::var("TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://wa:wa@localhost:5433/whatsapp".to_string())
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5434/postgres".to_string())
     }
 
+    /// Same URL with the path swapped for [`TEST_DB`].
+    fn test_db_url() -> String {
+        let admin = admin_db_url();
+        match admin.rfind('/') {
+            Some(i) => format!("{}/{TEST_DB}", &admin[..i]),
+            None => admin,
+        }
+    }
+
+    /// Create [`TEST_DB`] if it is not there yet. Postgres has no
+    /// `CREATE DATABASE IF NOT EXISTS`, and the suite runs its tests in
+    /// parallel, so a lost race shows up as SQLSTATE 42P04 (duplicate_database)
+    /// and is simply the other thread having won.
+    async fn ensure_test_db() {
+        let admin = match PgPool::connect(&admin_db_url()).await {
+            Ok(pool) => pool,
+            Err(e) => panic!(
+                "Failed to reach Postgres at {} — is the sapa-rs-postgres container up on 5434?: {e}",
+                admin_db_url()
+            ),
+        };
+        if let Err(e) = sqlx::query(&format!("CREATE DATABASE {TEST_DB}"))
+            .execute(&admin)
+            .await
+            && e.as_database_error().and_then(|d| d.code()).as_deref() != Some("42P04")
+        {
+            panic!("Failed to create test database {TEST_DB}: {e}");
+        }
+        admin.close().await;
+    }
+
+    /// One-time provisioning gate.
+    ///
+    /// Every `PostgresStore::new` runs `SCHEMA_STMTS`, and the suite runs its
+    /// tests in parallel. On a cold start that means ~50 tasks racing to create
+    /// the database and then the same tables, which fails reproducibly (13 of 50
+    /// on an empty server) and then "passes" on the next run because the objects
+    /// now exist. Provision exactly once, before anything else opens a store, so
+    /// a fresh machine behaves like a warm one.
+    static SETUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     async fn create_test_store() -> PostgresStore {
+        SETUP
+            .get_or_init(|| async {
+                ensure_test_db().await;
+                PostgresStore::new_for_device(&test_db_url(), 1)
+                    .await
+                    .expect("Failed to provision the test schema");
+            })
+            .await;
         let device_id = DEVICE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let store = PostgresStore::new_for_device(&test_db_url(), device_id)
             .await
@@ -1751,11 +1810,7 @@ mod tests {
         let store = create_test_store().await;
         let record = DeviceListRecord {
             user: "1234567890".to_string().into(),
-            devices: vec![
-                wacore::store::traits::DeviceInfo::new(0, None),
-                wacore::store::traits::DeviceInfo::new(1, None),
-            ]
-            .into(),
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(1, None)].into(),
             timestamp: 1234567890,
             phash: Some("2:abcdef".to_string().into()),
             raw_id: None,
@@ -1773,7 +1828,7 @@ mod tests {
         let store = create_test_store().await;
         let record1 = DeviceListRecord {
             user: "9876543210".to_string().into(),
-            devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into(),
+            devices: vec![DeviceInfo::new(0, None)].into(),
             timestamp: 1000,
             phash: Some("2:old".to_string().into()),
             raw_id: None,
@@ -1781,11 +1836,7 @@ mod tests {
         store.update_device_list(record1).await.unwrap();
         let record2 = DeviceListRecord {
             user: "9876543210".to_string().into(),
-            devices: vec![
-                wacore::store::traits::DeviceInfo::new(0, None),
-                wacore::store::traits::DeviceInfo::new(2, None),
-            ]
-            .into(),
+            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(2, None)].into(),
             timestamp: 2000,
             phash: Some("2:new".to_string().into()),
             raw_id: None,
@@ -2104,9 +2155,11 @@ mod tests {
         assert_eq!(initial.version, 0);
         assert_eq!(initial.hash, [0u8; 128]);
 
-        let mut state = HashState::default();
-        state.version = 42;
-        state.hash = [0xAB; 128];
+        let state = HashState {
+            version: 42,
+            hash: [0xAB; 128],
+            ..Default::default()
+        };
         store
             .set_version("critical_unblock_to_sync", state.clone())
             .await
@@ -2128,12 +2181,16 @@ mod tests {
     #[tokio::test]
     async fn test_app_state_version_upsert() {
         let store = create_test_store().await;
-        let mut s1 = HashState::default();
-        s1.version = 1;
+        let s1 = HashState {
+            version: 1,
+            ..Default::default()
+        };
         store.set_version("notify_privacy_info", s1).await.unwrap();
 
-        let mut s2 = HashState::default();
-        s2.version = 2;
+        let s2 = HashState {
+            version: 2,
+            ..Default::default()
+        };
         store.set_version("notify_privacy_info", s2).await.unwrap();
 
         let loaded = store.get_version("notify_privacy_info").await.unwrap();
@@ -2288,14 +2345,14 @@ mod tests {
         let records = vec![
             DeviceListRecord {
                 user: "batch_user1".to_string().into(),
-                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into(),
+                devices: vec![DeviceInfo::new(0, None)].into(),
                 timestamp: 100,
                 phash: None,
                 raw_id: None,
             },
             DeviceListRecord {
                 user: "batch_user2".to_string().into(),
-                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into(),
+                devices: vec![DeviceInfo::new(0, None)].into(),
                 timestamp: 200,
                 phash: Some("2:xyz".to_string().into()),
                 raw_id: Some(7),
@@ -2315,7 +2372,7 @@ mod tests {
         let store = create_test_store().await;
         let record = DeviceListRecord {
             user: "to_delete".to_string().into(),
-            devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into(),
+            devices: vec![DeviceInfo::new(0, None)].into(),
             timestamp: 1,
             phash: None,
             raw_id: None,
@@ -2429,7 +2486,7 @@ mod tests {
         let store = create_test_store().await;
         let record = DeviceListRecord {
             user: "raw_id_user".to_string().into(),
-            devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into(),
+            devices: vec![DeviceInfo::new(0, None)].into(),
             timestamp: 999,
             phash: None,
             raw_id: Some(42),
