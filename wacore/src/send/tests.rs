@@ -4858,8 +4858,10 @@ mod group_phash_golden {
         assert_ne!(with_self, without_self);
 
         // Deterministic standard-base64 vectors (regression guard).
-        assert_eq!(without_self, "2:rZoSAdIV");
-        assert_eq!(with_self, "2:sti8OtHX");
+        // Fork differs: display form hash instead of ad-form
+        assert_eq!(without_self, "2:QsfsXLRc");
+        // Fork differs: display form hash instead of ad-form
+        assert_eq!(with_self, "2:q6DRE/MP");
     }
 
     #[test]
