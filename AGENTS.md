@@ -66,3 +66,74 @@ Read the one that covers what you are touching:
 | `agent_docs/binary_size_ci.md` | A size gate failed, or a change adds dependencies or generic instantiations |
 | `agent_docs/build_flags.md` | Recommending codegen flags, or asked why a `target-feature` is not a default |
 | `agent_docs/debugging.md` | Decoding raw binary-protocol bytes by hand |
+
+## Fork-specific — oonid/whatsapp-rust-sqlx
+
+This repo is a **fork of `oxidezap/whatsapp-rust`** carrying one feature upstream
+does not have — a **PostgreSQL storage backend** — plus two send-path bug fixes.
+It is vendored into the `sapa-rs` superproject at `vendor/whatsapp-rust-sqlx` and
+consumed by the `wa` crate there.
+
+### Branches and remotes
+
+| Ref | Meaning |
+|---|---|
+| `postgres-storage` | **our branch.** Local commits rebased on top of an upstream commit |
+| `main` | a mirror of upstream, kept for reference only — never develop here |
+| `origin` | `git@github.com:oonid/whatsapp-rust-sqlx` (SSH) |
+| `upstream` | `https://github.com/oxidezap/whatsapp-rust` |
+
+**All `push` / `fetch` / `clone` belong to the user.** Agents do local git only —
+commit, branch, worktree, rebase, merge. Present remote commands for the user to run.
+
+### The three local commits
+
+```
+fix(send): TC token issuance causing perpetual 463 MissingTcToken
+fix(send): hash participant list in display format (Baileys-compat)
+feat: add PostgreSQL storage backend via sqlx (postgres-storage feature)
+<upstream base>
+```
+
+**The two `fix(send)` patches re-conflict on every upstream rebase** — upstream keeps
+rewriting those exact files. Re-apply them by intent, not by blindly taking a side:
+
+- **phash** (`wacore/src/messages.rs`) — `participant_list_hash` must hash JIDs in
+  **Display** form (`write!(arena, "{jid}")`), not upstream's ad-format `:0`. WhatsApp
+  Business clients reject the ad-format hash; Baileys uses Display form.
+- **TC token** (`src/send/tctoken_lifecycle.rs`) — drop the `is_self` guard and treat a
+  **cold A/B-prop cache as enabled**. Upstream's typed registry defaults the flag to
+  `false`, which starves token issuance and yields a perpetual `463 MissingTcToken`.
+
+### The postgres backend
+
+- **The schema is the `SCHEMA_STMTS: &[&str]` const** in
+  `storages/postgres-storage/src/postgres_store.rs`, run idempotently at every startup
+  and version-tracked in a `_wa_migrations` table. **A `migrations/*.sql` directory is
+  never read** — adding files there is a silent no-op that fails at runtime.
+  Add columns and tables with `CREATE ... IF NOT EXISTS` plus
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, because live databases (`wa_state`) are
+  already provisioned. Bump the `_wa_migrations` version when you do.
+- **Mirror `storages/sqlite-storage/`.** It is upstream's reference implementation and
+  stays current; when the store traits change, read it first and follow its structure.
+- **The postgres backend has no unit tests of its own.** It is validated through the
+  `wa` crate's suite in the sapa-rs superproject.
+
+### Build and test
+
+```bash
+cargo check -p whatsapp-rust --features postgres-storage
+
+# from the sapa-rs superproject — the real gate for this backend
+DATABASE_URL=postgres://postgres:postgres@localhost:5434/postgres cargo test -p wa
+```
+
+Postgres runs in the `sapa-rs-postgres` container on **5434** (not 5432). If host
+connections start failing after long uptime (`ConnectionReset` / `PoolTimedOut`),
+`docker restart sapa-rs-postgres` — the data persists.
+
+Never kill services with `pkill -f <path>`; it matches the launching shell too. Use
+`pkill -x <exact-binary-name>`.
+
+### Conventions (Fork)
+- Commit messages carry a detailed body explaining the motivation. **No `Co-Authored-By` trailer.**
