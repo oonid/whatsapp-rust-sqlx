@@ -103,10 +103,21 @@ impl Client {
                 _ => None,
             };
 
-        let tc_send_enabled = self
+        // Fork diverges here: treat a cold cache (absent prop) as enabled.
+        // Upstream's registry defaults to false, which starves token issuance
+        // on a fresh start before the server pushes props, causing 463 MissingTcToken.
+        let tc_send_enabled = match self
             .ab_props
-            .is_enabled(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES)
-            .await;
+            .get(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES)
+            .await
+        {
+            Some(value) => {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("enabled")
+            }
+            None => true,
+        };
         let nct_send_enabled = self
             .ab_props
             .is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED)
@@ -599,6 +610,70 @@ mod tests {
         assert!(
             !client.should_issue_tc_token(&own).await,
             "a self-call must never issue a tc token for our own account"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc_token_treats_cold_ab_prop_cache_as_enabled() {
+        use wacore::iq::abprops::web;
+        use wacore::store::traits::TcTokenEntry;
+
+        let client = create_test_client().await;
+        let peer = Jid::new("770000005", Server::Lid);
+
+        // Store a valid tc token so one is available to attach
+        client
+            .persistence_manager
+            .backend()
+            .put_tc_token(
+                "770000005",
+                &TcTokenEntry {
+                    token: vec![1, 2, 3],
+                    token_timestamp: wacore::time::now_secs(),
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 1. Cold cache (prop absent). Should be treated as enabled and attach the token.
+        let mut nodes = Vec::new();
+        client
+            .maybe_include_tc_token(&peer, &mut nodes, crate::send::SendInstant::now())
+            .await;
+
+        assert_eq!(
+            nodes.len(),
+            1,
+            "token must be attached when prop cache is cold"
+        );
+        assert_eq!(nodes[0].tag, "tctoken");
+
+        // 2. Explicitly false. Should not attach the token.
+        client
+            .ab_props
+            .watch(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES)
+            .await;
+        client
+            .ab_props
+            .apply_props(
+                false,
+                vec![(
+                    web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES.code,
+                    "0".into(),
+                )]
+                .into_iter(),
+            )
+            .await;
+
+        let mut nodes2 = Vec::new();
+        client
+            .maybe_include_tc_token(&peer, &mut nodes2, crate::send::SendInstant::now())
+            .await;
+
+        assert!(
+            nodes2.is_empty(),
+            "token must not be attached when prop is explicitly false"
         );
     }
 }
