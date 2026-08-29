@@ -1,0 +1,34 @@
+[package]
+name = "whatsapp-rust-postgres-storage"
+version = "0.7.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
+description = "PostgreSQL storage backend for whatsapp-rust"
+
+[dependencies]
+async-trait = { workspace = true }
+buffa = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+] }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+wacore = { workspace = true }
+
+[build-dependencies]
+buffa-build = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+portable-atomic = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true
