@@ -1496,7 +1496,47 @@ pub struct ClientOutdated {
 /// believing never opened.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
-pub struct Connected {}
+pub struct Connected {
+    /// Present when version resolution could not reach its source and the
+    /// session connected on the version the device already held. Absent on
+    /// every normal connect, so `Some` is the whole signal: a consumer that
+    /// cares can warn, refuse, or pin a version of its own.
+    pub app_version_fallback: Option<AppVersionFallback>,
+}
+
+/// Why, and with what, a session connected without a freshly resolved version.
+///
+/// Only the browser version source falls back this way; see the source
+/// constants in the client crate's `version` module for the reason.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct AppVersionFallback {
+    /// The version the session actually connected with.
+    pub version: (u32, u32, u32),
+    /// True when that version is the one compiled into this library, so its
+    /// staleness is the release's age. False when the device already carried a
+    /// different one, whose provenance this does not claim to know: it may have
+    /// been resolved earlier or supplied by the caller.
+    pub compiled_default: bool,
+    /// What stopped the resolution. Worth distinguishing, because one is
+    /// routine and the other is news.
+    pub reason: AppVersionFallbackReason,
+}
+
+/// Why a version could not be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum AppVersionFallbackReason {
+    /// The source could not be reached, or answered with an error status. The
+    /// routine case: the browser source is on the common tracker blocklists, so
+    /// this is what a content blocker or a DNS sinkhole looks like, and it says
+    /// nothing about the source itself.
+    SourceUnreachable,
+    /// The source answered, but the version was not where it should be. This is
+    /// the source having changed shape, which is worth acting on rather than
+    /// waiting out: it will not fix itself on the next connect.
+    SourceUnparsable,
+}
 
 /// Localized text the server wants shown when it forces a logout, from
 /// `logout_message_header` / `logout_message_subtext` on `<failure>`.
