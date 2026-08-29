@@ -895,6 +895,44 @@ impl AppSyncStore for PostgresStore {
             .await
     }
 
+    /// One round-trip instead of the trait default's one query per index MAC
+    /// (`traits.rs:715`). App-state resync asks for a whole mutation batch at once, so
+    /// the default's N+1 shape is N network round-trips here — the cost that separates a
+    /// networked backend from the embedded one the default was written against.
+    ///
+    /// A returned `index_mac` that is not 32 bytes cannot be a key the caller asked for,
+    /// so it is skipped rather than truncated into a wrong one.
+    async fn get_mutation_macs(
+        &self,
+        name: &str,
+        index_macs: &[[u8; 32]],
+    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>> {
+        if index_macs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let keys: Vec<Vec<u8>> = index_macs.iter().map(|m| m.to_vec()).collect();
+        let rows = sqlx::query(
+            "SELECT index_mac, value_mac FROM app_state_mutation_macs
+             WHERE name = $1 AND index_mac = ANY($2) AND device_id = $3",
+        )
+        .bind(name)
+        .bind(&keys)
+        .bind(self.device_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?;
+
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let index_mac: Vec<u8> = row.get("index_mac");
+            let Ok(key) = <[u8; 32]>::try_from(index_mac.as_slice()) else {
+                continue;
+            };
+            out.insert(key, row.get("value_mac"));
+        }
+        Ok(out)
+    }
+
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()> {
         self.delete_app_state_mutation_macs_for_device(name, index_macs, self.device_id)
             .await
@@ -1379,6 +1417,52 @@ impl ProtocolStore for PostgresStore {
         Ok(result.rows_affected() as u32)
     }
 
+    // --- Group metadata cache (P3b) ---
+    //
+    // Without these three the trait defaults apply — Ok(None) and two no-ops — so the
+    // cache never populates and the participant-phash re-query skip never engages:
+    // every group send re-queries metadata in full. That costs more in this fork than
+    // upstream, because our phash already diverges from upstream's form, so a re-query
+    // is the only thing keeping the two in agreement.
+
+    async fn get_group_metadata(&self, group_jid: &str) -> Result<Option<Vec<u8>>> {
+        let row =
+            sqlx::query("SELECT info FROM group_metadata WHERE group_jid = $1 AND device_id = $2")
+                .bind(group_jid)
+                .bind(self.device_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(row.map(|r| r.get("info")))
+    }
+
+    async fn put_group_metadata(&self, group_jid: &str, blob: &[u8]) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO group_metadata (group_jid, info, device_id, updated_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (group_jid, device_id)
+             DO UPDATE SET info = EXCLUDED.info, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(group_jid)
+        .bind(blob)
+        .bind(self.device_id)
+        .bind(wacore::time::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(())
+    }
+
+    async fn delete_group_metadata(&self, group_jid: &str) -> Result<()> {
+        sqlx::query("DELETE FROM group_metadata WHERE group_jid = $1 AND device_id = $2")
+            .bind(group_jid)
+            .bind(self.device_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(())
+    }
+
     async fn store_pending_inbound(
         &self,
         chat: &str,
@@ -1387,16 +1471,19 @@ impl ProtocolStore for PostgresStore {
         message: &[u8],
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pending_inbound_messages (chat_jid, sender_jid, message_id, payload, device_id)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (chat_jid, sender_jid, message_id, device_id)
-             DO UPDATE SET payload = EXCLUDED.payload",
+            // inserted_at is left alone on conflict: it is the drain order, and a
+            // retransmitted payload should not send a message to the back of the queue.
+            "INSERT INTO pending_inbound_messages (chat, sender, id, message, device_id, inserted_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (chat, sender, id, device_id)
+             DO UPDATE SET message = EXCLUDED.message",
         )
         .bind(chat)
         .bind(sender)
         .bind(id)
         .bind(message)
         .bind(self.device_id)
+        .bind(wacore::time::now_secs())
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?;
@@ -1410,8 +1497,8 @@ impl ProtocolStore for PostgresStore {
         id: &str,
     ) -> Result<Option<Vec<u8>>> {
         let row = sqlx::query(
-            "SELECT payload FROM pending_inbound_messages
-             WHERE chat_jid = $1 AND sender_jid = $2 AND message_id = $3 AND device_id = $4",
+            "SELECT message FROM pending_inbound_messages
+             WHERE chat = $1 AND sender = $2 AND id = $3 AND device_id = $4",
         )
         .bind(chat)
         .bind(sender)
@@ -1420,13 +1507,13 @@ impl ProtocolStore for PostgresStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?;
-        Ok(row.map(|r| r.get("payload")))
+        Ok(row.map(|r| r.get("message")))
     }
 
     async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
         sqlx::query(
             "DELETE FROM pending_inbound_messages
-             WHERE chat_jid = $1 AND sender_jid = $2 AND message_id = $3 AND device_id = $4",
+             WHERE chat = $1 AND sender = $2 AND id = $3 AND device_id = $4",
         )
         .bind(chat)
         .bind(sender)
@@ -1442,6 +1529,10 @@ impl ProtocolStore for PostgresStore {
         if rows.is_empty() {
             return Ok(());
         }
+        // Per-row statements inside ONE transaction, mirroring
+        // sqlite_store.rs:3648. One timestamp for the whole batch: they arrived
+        // together, so a per-row clock read would imply an ordering that is not real.
+        let now = wacore::time::now_secs();
         let mut tx = self
             .pool
             .begin()
@@ -1449,16 +1540,17 @@ impl ProtocolStore for PostgresStore {
             .map_err(|e| StoreError::Connection(Box::new(e)))?;
         for row in rows {
             sqlx::query(
-                "INSERT INTO pending_inbound_messages (chat_jid, sender_jid, message_id, payload, device_id)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (chat_jid, sender_jid, message_id, device_id)
-                 DO UPDATE SET payload = EXCLUDED.payload",
+                "INSERT INTO pending_inbound_messages (chat, sender, id, message, device_id, inserted_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (chat, sender, id, device_id)
+                 DO UPDATE SET message = EXCLUDED.message",
             )
             .bind(row.chat)
             .bind(row.sender)
             .bind(row.id)
             .bind(row.message)
             .bind(self.device_id)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(Box::new(e)))?;
@@ -1481,7 +1573,7 @@ impl ProtocolStore for PostgresStore {
         for key in keys {
             sqlx::query(
                 "DELETE FROM pending_inbound_messages
-                 WHERE chat_jid = $1 AND sender_jid = $2 AND message_id = $3 AND device_id = $4",
+                 WHERE chat = $1 AND sender = $2 AND id = $3 AND device_id = $4",
             )
             .bind(key.chat)
             .bind(key.sender)
@@ -1605,6 +1697,23 @@ impl MsgSecretStore for PostgresStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl DeviceStore for PostgresStore {
+    /// Overridden rather than left to the trait default, because the default is
+    /// `StorageResourceReport::default()` — every field `None`, meaning *unknown*.
+    /// For this backend the answer is known: the data lives in another process, and
+    /// `stats.rs:537-540` specifies `Some(0)` for exactly that case. `None` and
+    /// `Some(0)` differ to anything summing footprints across backends.
+    ///
+    /// The remaining fields stay `None` on purpose. `pages` is a SQLite page count;
+    /// the Postgres analogue is server-side, not the process-local figure this field
+    /// means. sqlx exposes no per-session I/O counters, so claiming zero there would
+    /// assert something we have not measured.
+    async fn resource_report(&self) -> wacore::stats::StorageResourceReport {
+        wacore::stats::StorageResourceReport {
+            memory_bytes: Some(0),
+            ..Default::default()
+        }
+    }
+
     async fn save(&self, device: &CoreDevice) -> Result<()> {
         self.save_device_data_for_device(self.device_id, device)
             .await
@@ -2612,6 +2721,126 @@ mod tests {
         store.update_device_list(record).await.unwrap();
         let loaded = store.get_devices("raw_id_user").await.unwrap().unwrap();
         assert_eq!(loaded.raw_id, Some(42));
+    }
+
+    /// `None` would mean "unknown"; this backend knows the answer is zero, because
+    /// the data is in another process. Guards against a future edit dropping the
+    /// override back to the trait default.
+    #[tokio::test]
+    async fn test_resource_report_claims_zero_process_local_bytes() {
+        let store = create_test_store().await;
+        let report = store.resource_report().await;
+        assert_eq!(report.memory_bytes, Some(0));
+        assert_eq!(report.total_bytes(), 0);
+        assert_eq!(
+            report.pages, None,
+            "a SQLite page count has no Postgres analogue"
+        );
+        assert_eq!(report.io_read_bytes, None);
+        assert_eq!(report.io_write_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn test_group_metadata_put_get_roundtrip() {
+        let store = create_test_store().await;
+        store
+            .put_group_metadata("g1@g.us", b"snapshot-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_group_metadata("g1@g.us")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"snapshot-1"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_metadata_put_upserts() {
+        let store = create_test_store().await;
+        store.put_group_metadata("g2@g.us", b"old").await.unwrap();
+        store.put_group_metadata("g2@g.us", b"new").await.unwrap();
+        assert_eq!(
+            store
+                .get_group_metadata("g2@g.us")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"new"[..]),
+            "second put must replace the snapshot, not fail or duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_metadata_delete_removes() {
+        let store = create_test_store().await;
+        store
+            .put_group_metadata("g3@g.us", b"doomed")
+            .await
+            .unwrap();
+        store.delete_group_metadata("g3@g.us").await.unwrap();
+        assert!(store.get_group_metadata("g3@g.us").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_group_metadata_unknown_jid_is_none_not_error() {
+        let store = create_test_store().await;
+        assert!(
+            store
+                .get_group_metadata("never-seen@g.us")
+                .await
+                .unwrap()
+                .is_none(),
+            "an absent group is a cache miss, not a failure"
+        );
+    }
+
+    /// The batched form must agree with the single-row form it replaces — that is the
+    /// only thing making the override safe to prefer over the trait default.
+    #[tokio::test]
+    async fn test_get_mutation_macs_batch_matches_singles() {
+        let store = create_test_store().await;
+        let name = "critical_unblock_low";
+        let keys: Vec<[u8; 32]> = (1u8..=3).map(|i| [i; 32]).collect();
+        let macs: Vec<AppStateMutationMAC> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| AppStateMutationMAC {
+                index_mac: key.to_vec(),
+                value_mac: vec![0xF0 + i as u8; 32],
+            })
+            .collect();
+        store.put_mutation_macs(name, 1, &macs).await.unwrap();
+        let absent = [0xEEu8; 32];
+
+        let mut asked = keys.clone();
+        asked.push(absent);
+        let batched = store.get_mutation_macs(name, &asked).await.unwrap();
+
+        assert_eq!(batched.len(), 3, "the absent key must not appear");
+        assert!(!batched.contains_key(&absent));
+        for key in &keys {
+            let single = store
+                .get_mutation_mac(name, key.as_slice())
+                .await
+                .unwrap()
+                .expect("single-row lookup should find it");
+            assert_eq!(batched.get(key), Some(&single));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_mutation_macs_empty_input_is_empty_map() {
+        let store = create_test_store().await;
+        assert!(
+            store
+                .get_mutation_macs("any", &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

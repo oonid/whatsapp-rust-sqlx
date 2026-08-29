@@ -33,19 +33,28 @@ pub static SCHEMA_STMTS: &[&str] = &[
         read_receipts_disabled BOOLEAN NOT NULL DEFAULT FALSE,
         server_client_expiration TEXT
     )",
+    // Column names mirror storages/sqlite-storage/src/schema.rs deliberately: the two
+    // backends are diffed against each other on every upstream sync, and a rename is a
+    // gratuitous difference to re-read each time. `updated_at` is what makes the cache
+    // ageable — without it a stale group snapshot is indistinguishable from a fresh one.
     "CREATE TABLE IF NOT EXISTS group_metadata (
-        jid TEXT NOT NULL,
-        data BYTEA NOT NULL,
+        group_jid TEXT NOT NULL,
+        info BYTEA NOT NULL,
         device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (jid, device_id)
+        updated_at BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (group_jid, device_id)
     )",
+    // Same mirroring rule as group_metadata above. `inserted_at` is the drain order:
+    // the offline queue is replayed oldest-first, and without a stored arrival time the
+    // rows come back in whatever order Postgres finds them.
     "CREATE TABLE IF NOT EXISTS pending_inbound_messages (
-        chat_jid TEXT NOT NULL,
-        sender_jid TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        payload BYTEA NOT NULL,
+        chat TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        id TEXT NOT NULL,
+        message BYTEA NOT NULL,
         device_id INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (chat_jid, sender_jid, message_id, device_id)
+        inserted_at BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat, sender, id, device_id)
     )",
     "CREATE TABLE IF NOT EXISTS identities (
         address TEXT NOT NULL,
