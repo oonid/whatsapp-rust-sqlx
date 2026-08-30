@@ -49,9 +49,14 @@ type DefaultHttpState = Provided;
 #[cfg(not(feature = "ureq-client"))]
 type DefaultHttpState = MissingHttpClient;
 
-#[cfg(feature = "tokio-runtime")]
+// The target as well as the feature, because `default_runtime` below answers on both: `TokioRuntime`
+// spawns through `tokio::spawn`, which wasm32 does not have, so a builder that read `Provided` from
+// the feature alone would offer `build()` on a page and then reach `build_graph`'s
+// `unreachable!("typestate guarantees...")` at run time. A page supplies its own runtime, and the
+// type system is where it should be told to.
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 type DefaultRuntimeState = Provided;
-#[cfg(not(feature = "tokio-runtime"))]
+#[cfg(not(all(feature = "tokio-runtime", not(target_arch = "wasm32"))))]
 type DefaultRuntimeState = MissingRuntime;
 
 #[cfg(feature = "tokio-transport")]
@@ -74,11 +79,14 @@ fn default_http_client() -> Option<Arc<dyn crate::http::HttpClient>> {
     None
 }
 
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 fn default_runtime() -> Option<Arc<dyn Runtime>> {
     Some(Arc::new(crate::runtime_impl::TokioRuntime))
 }
-#[cfg(not(feature = "tokio-runtime"))]
+/// No default anywhere `TokioRuntime` is absent -- which on wasm32 is the whole point: the page
+/// supplies its own single-threaded runtime, and a default that panicked on first spawn would be
+/// found out one call into a session rather than at assembly.
+#[cfg(not(all(feature = "tokio-runtime", not(target_arch = "wasm32"))))]
 fn default_runtime() -> Option<Arc<dyn Runtime>> {
     None
 }
@@ -894,8 +902,13 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Runtime-agnostic: the hook wraps whatever runtime the client uses, so
     /// every task spawned through the `Runtime` trait is covered, and
     /// [`Bot::run`] meters the main run loop itself — the read loop reports
-    /// on either launch path (`voip` media tasks spawn directly on Tokio and
-    /// are not covered). Pass a
+    /// on either launch path. The VoIP **call driver** is covered too, and so is
+    /// the native relay transport's own socket and timer work
+    /// (`voip-relay-native`): `RelayMediaChannelFactory` is constructed with the
+    /// client's `Arc<dyn Runtime>` and spawns its driver through it. So do not
+    /// attribute either separately, or the work is counted twice. A platform
+    /// that installs its own `RelayTransportProvider` decides that side for
+    /// itself. Pass a
     /// [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
     /// (keep a clone to read snapshots), or a custom hook to scope
     /// allocator-attribution or platform samplers to this client's work.

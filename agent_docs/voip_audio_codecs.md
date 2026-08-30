@@ -137,8 +137,9 @@ loop:
 They are deliberately distinct: one is a codec problem and the other is transport, and conflating
 them is how #1105 was mis-triaged for months. `voip::tap::PacketTap` is public: decorating a
 `RelayTransportFactory` with `TappedFactory` puts every relay datagram in both directions through
-your sink. The runtime does not yet expose a factory injection point for a live call, so that is
-reachable from a shell building its own transport rather than from a `CallHandle`.
+your sink. `Client::set_relay_transport_provider` is the injection point for a live call, so a tap
+-- or any other decorated factory -- now reaches one placed through `CallHandle` rather than only a
+shell that builds its own transport.
 
 A build with no decoder for the negotiated codec does not pretend. It reports `AudioSilent` with
 `NoDecoderForNegotiatedCodec`, which is the one silence reason a consumer can act on.
@@ -147,14 +148,62 @@ A build with no decoder for the negotiated codec does not pretend. It reports `A
 
 | Feature | Contents |
 | --- | --- |
-| `voip-encoded` | Native relay/runtime and encoded I/O; no audio codec |
+| `voip-runtime` | Signaling, the facade and `CallHandle`; no transport, no codec |
+| `voip-relay-native` | The UDP/DTLS/SCTP relay dialer. Native only |
+| `voip-encoded` | Runtime and encoded I/O; no audio codec |
 | `voip-mlow` | Runtime plus the pure-Rust PCM/MLOW adapter |
 | `voip-libopus` | Encoded runtime plus the optional libopus adapter |
-| `voip` | Compatibility aggregate: MLOW + libopus |
+| `voip` | Compatibility aggregate: MLOW + libopus + the native relay |
 | `wacore/voip` | Runtime-agnostic media engine and encoded I/O |
 | `wacore/voip-mlow` | Core media engine plus MLOW |
 
-An application that already produces raw Opus packets needs only `voip-encoded`.
+An application that already produces raw Opus packets needs `voip-encoded` for
+the codec side and, on a native target, `voip-relay-native` for the transport --
+`voip-encoded` expands to `voip-runtime`, which carries no dialer, so on its own
+every call fails at setup with "no relay media transport". The alternative to
+that feature is installing a `RelayTransportProvider`, which is what a target
+with no UDP socket does instead.
+
+## Calls off the native stack
+
+`voip-relay-native` is the only VoIP feature that owns a socket: one UDP endpoint per call, with
+DTLS, SCTP and a pre-negotiated DataChannel over it. It is native-only for that reason, and it is
+not the only native-only one -- `voip-libopus` is too, because libopus is C (see below). What
+separates them is that a portable target has an answer for the codec and needs one supplied for the
+transport. Everything above it -- the offer, the answer, the engine, `CallHandle` -- is
+portable, drives `wacore`'s sans-IO engine over the client's own `Arc<dyn Runtime>`, and reads no
+clock of its own.
+
+So a target without a UDP socket does not lose calls; it supplies the way onto the wire:
+
+```rust
+client.set_relay_transport_provider(Arc::new(MyProvider));
+```
+
+A `RelayTransportProvider` is asked for a `RelayTransportFactory` per relay endpoint, because the
+relay is named by the server per call. What it is handed is a `RelayEndpointParams`: the address,
+plus the `ice-ufrag` and `ice-pwd` that a synthetic SDP answer has to carry.
+
+Which credential is which matters, and the two are easy to swap. `ice-ufrag` is the selected
+endpoint's `<auth_token>`, indexed by its `auth_token_id`; `ice-pwd` is the relay `<key>` in the
+ASCII base64 form it arrived in. The `<token>` beside them -- indexed by `token_id` -- is the STUN
+allocation credential and goes on the wire as `RELAY-TOKEN`, never as a ufrag. A ufrag built from
+the wrong one is refused at the browser's first connectivity check, which surfaces as a call that
+will not connect rather than as a bad credential. The address alone is enough for a stack
+that dials UDP itself; it is not enough for a browser, where ICE is not optional and the relay
+validates the credentials.
+
+A browser's implementation is an `RTCPeerConnection` with that synthetic SDP answer and the same
+pre-negotiated `id=0` DataChannel (`ordered=false`, `maxRetransmits=0`) the native stack assembles
+by hand -- which is what WhatsApp Web itself does, and the reason the native transport's own doc
+comment describes the stack as "the synthetic-SDP / wrtc dance".
+
+The codec is not a blocker there either: MLOW is pure Rust (`wacore/voip-mlow`) and builds
+everywhere. libopus is the C one, so `voip-libopus` stays native; a browser that wants Opus supplies
+it through `ForeignAudioCodecFactory` (WebCodecs `AudioEncoder`/`AudioDecoder`).
+
+A build with neither a native dialer nor an installed provider fails a call at setup with a sentence
+saying so, rather than refusing to compile.
 
 ## Encoded API
 

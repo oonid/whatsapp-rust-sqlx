@@ -38,7 +38,6 @@ use rtc_sctp::{
 };
 
 use wacore::runtime::{AbortHandle, Runtime};
-use wacore::voip::engine::TxIdSource;
 use wacore::voip::relay_parse::WEB_CLIENT_RELAY_PORT;
 use wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
@@ -62,9 +61,7 @@ const MEDIA_CHANNEL_TYPE: ChannelType = ChannelType::PartialReliableRexmitUnorde
 /// The retransmit count [`MEDIA_CHANNEL_TYPE`] carries: never retransmit, abandon instead.
 const MEDIA_MAX_RETRANSMITS: u32 = 0;
 
-// First-byte relay-packet demux moved to the portable core; re-exported so the existing
-// `whatsapp_rust::voip::transport::{classify_relay_packet, RelayPacketKind}` paths stay stable.
-pub use wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
+use wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
 
 /// Why the media stack stopped. The driver branches on the variant: a peer close ends the call the
 /// way hanging up does, anything else is a transport failure the call surfaces as a read error.
@@ -577,17 +574,6 @@ pub async fn connect_relay_media(
         Err(_) => Err(anyhow!(
             "relay media driver stopped before the channel opened"
         )),
-    }
-}
-
-/// OS-RNG-backed STUN transaction ids for production calls. The core's `SequentialTxIds` is
-/// deterministic (test-only); real calls need unpredictable ids for consent freshness.
-#[derive(Default)]
-pub struct RandTxIds;
-
-impl TxIdSource for RandTxIds {
-    fn next_tx_id(&mut self) -> [u8; 12] {
-        rand::random()
     }
 }
 
@@ -1764,6 +1750,7 @@ mod udp_relay_e2e {
             ssrc: SSRC,
             audio: wacore::voip::AudioConfig::MLOW_PCM,
             relay_token: vec![0xAB; 16],
+            auth_token: vec![0xCD; 8],
             relay_ip: relay_addr.ip().to_string(),
             relay_port: relay_addr.port(),
             integrity_key: b"relay-key".to_vec(),

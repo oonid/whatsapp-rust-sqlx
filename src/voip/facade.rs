@@ -37,7 +37,7 @@ use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
     CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
     VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoUpgradeToken,
-    video_control_channel,
+    run_call, video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -47,8 +47,7 @@ use crate::client::{CallError, Client, ResponseWaiter};
 use crate::voip::audio::{
     AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
 };
-use crate::voip::driver::{RandTxIds, run_call_tokio};
-use crate::voip::transport::RelayMediaChannelFactory;
+use crate::voip::driver::RandTxIds;
 use crate::voip::video::{VideoSink, VideoSource};
 
 enum AudioEndpoints {
@@ -357,7 +356,7 @@ impl<'a> AcceptCall<'a> {
             &preaccept_id,
             &accept_id,
         )?;
-        let (mut engine, built_call_id, addr) = send_preaccept_then_prepare(
+        let (mut engine, built_call_id, relay_endpoint) = send_preaccept_then_prepare(
             self.client,
             &registration,
             &mut teardown,
@@ -384,7 +383,7 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
@@ -393,7 +392,7 @@ impl<'a> AcceptCall<'a> {
             &mut registration,
             teardown,
             engine,
-            &factory,
+            &*factory,
             audio,
             video,
         )
@@ -424,7 +423,7 @@ impl<'a> AcceptCall<'a> {
         enable_video: bool,
         audio: AudioConfig,
         group: Option<GroupCallUpdate>,
-    ) -> Result<(CallEngine, String, SocketAddr), CallError> {
+    ) -> Result<(CallEngine, String, wacore::voip::RelayEndpointParams), CallError> {
         let CallAction::Offer {
             call_id,
             call_creator,
@@ -454,7 +453,7 @@ impl<'a> AcceptCall<'a> {
             .map_err(|error| CallError::Setup(error.to_string()))?;
             config.audio = audio;
             config.enable_video = enable_video;
-            let addr = socket_addr_from_config(&config)?;
+            let relay_endpoint = relay_endpoint_from_config(&config)?;
             let mut engine = CallEngine::new(config, Box::new(RandTxIds))
                 .map(with_platform_audio_codec)
                 .map_err(|error| CallError::Setup(error.to_string()))?;
@@ -466,7 +465,7 @@ impl<'a> AcceptCall<'a> {
                     direct_peer: None,
                 })
                 .map_err(|error| CallError::Setup(error.to_string()))?;
-            return Ok((engine, call_id.clone(), addr));
+            return Ok((engine, call_id.clone(), relay_endpoint));
         }
 
         let media = self
@@ -509,11 +508,11 @@ impl<'a> AcceptCall<'a> {
         config.audio = audio;
         config.enable_video = enable_video;
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
-        let addr = socket_addr_from_config(&config)?;
+        let relay_endpoint = relay_endpoint_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok((engine, call_id.clone(), addr))
+        Ok((engine, call_id.clone(), relay_endpoint))
     }
 }
 
@@ -933,7 +932,7 @@ impl<'a> OutgoingGroupCall<'a> {
         .map_err(|error| CallError::Setup(error.to_string()))?;
         config.audio = audio.config();
         config.enable_video = video.is_some();
-        let addr = socket_addr_from_config(&config)?;
+        let relay_endpoint = relay_endpoint_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
@@ -964,9 +963,9 @@ impl<'a> OutgoingGroupCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
         registration.disarm();
         teardown.disarm();
@@ -1143,7 +1142,7 @@ impl<'a> CallLinkCall<'a> {
         .map_err(|error| CallError::Setup(error.to_string()))?;
         config.audio = audio.config();
         config.enable_video = video.is_some();
-        let addr = socket_addr_from_config(&config)?;
+        let relay_endpoint = relay_endpoint_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
@@ -1159,9 +1158,9 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
         registration.disarm();
         teardown.disarm();
@@ -2079,6 +2078,14 @@ const GROUP_CONTROL_CHANNEL_CAPACITY: usize = 64;
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
 const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setup";
 
+/// How long *any* relay factory has to hand back a connected transport.
+///
+/// Above the native dialer's own `RELAY_CONNECT_TIMEOUT`, deliberately: that one is more specific
+/// and names the endpoints it tried, so it should be the error a native call gets. This is the
+/// backstop for a factory an installed provider returned, which carries whatever bound its author
+/// gave it and, in a browser whose ICE never settles, may carry none.
+const RELAY_DIAL_CEILING: Duration = Duration::from_secs(20);
+
 /// Spawn the task that turns the offer's `<ack>` into a connected media engine: await the ack-waiter
 /// (bounded), and on a node carrying a `<relay>` attach the engine via [`attach_outgoing_relay`]
 /// (reusing its for_outgoing + generation handling). On timeout / no relay / closed channel the call
@@ -2098,33 +2105,51 @@ fn spawn_outgoing_relay_waiter(
     runtime
         .clone()
         .spawn(Box::pin(async move {
+            // Three outcomes and not two. They used to collapse into one `None`, which was fine
+            // while the only consumer was a log line saying "(timeout or absent)" -- and is not,
+            // now that the reason reaches the caller: an ack that arrived carrying no relay and an
+            // ack that never arrived are different faults, and telling somebody the server's reply
+            // lacked something when there was no reply sends them looking in the wrong place.
             let relay =
                 match wacore::runtime::timeout(&*runtime, OFFER_ACK_RELAY_TIMEOUT, ack_rx).await {
                     // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
                     // path the incoming offer uses). handle_ack_response already removed our waiter entry.
                     Ok(Ok(ack)) => wacore::stanza::call::find_relay(ack.get())
-                        .and_then(wacore::voip::relay_parse::parse_relay_data),
+                        .and_then(wacore::voip::relay_parse::parse_relay_data)
+                        .ok_or("the server acked the offer but carried no relay"),
                     // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
                     // here or send_keepalive suppresses pings for the life of the connection.
-                    Ok(Err(_)) | Err(_) => {
+                    Ok(Err(_)) => {
                         client.response_waiters_guard().remove(&offer_stanza_id);
-                        None
+                        Err("the connection dropped before the server acked the offer")
+                    }
+                    Err(_) => {
+                        client.response_waiters_guard().remove(&offer_stanza_id);
+                        Err("the server did not ack the offer in time")
                     }
                 };
 
             match relay {
-                Some(relay) => {
+                Ok(relay) => {
                     if let Err(e) = attach_outgoing_relay(&client, &call_id, &relay).await {
                         warn!("voip: failed to attach outgoing relay for {call_id}: {e}");
-                        fail_pending_outgoing(&client, &call_id, generation);
+                        fail_pending_outgoing_with(
+                            &client,
+                            &call_id,
+                            generation,
+                            Some(e.to_string()),
+                        );
                     }
                 }
-                None => {
-                    warn!(
-                        "voip: no relay in offer ack for {call_id} (timeout or absent); call failed"
+                Err(reason) => {
+                    warn!("voip: {reason} for {call_id}; call failed");
+                    fail_pending_outgoing_with(
+                        &client,
+                        &call_id,
+                        generation,
+                        Some(reason.to_string()),
                     );
-                    fail_pending_outgoing(&client, &call_id, generation);
                 }
             }
         }))
@@ -2169,7 +2194,114 @@ fn take_pending_if_current(
     }
 }
 
+/// Put the reason a call never started onto its handle's stream.
+///
+/// `force_send` rather than `try_send`, which is what every other publish onto this queue uses and
+/// is wrong for this one: a full queue would drop the one event that explains the teardown, and it
+/// is the *last* event either way -- so if something has to go, the oldest diagnostic is a better
+/// loss than the reason the call failed. Never blocks; a teardown cannot wait on a consumer.
+///
+/// The queue is empty in every case reachable today, since a dormant outgoing call has no driver
+/// publishing to it -- which is exactly why this is `force_send` rather than that assumption
+/// written down as a comment.
+fn publish_setup_failure(events: &async_channel::Sender<CallEvent>, reason: String) {
+    let _ = events.force_send(CallEvent::MediaSetupFailed(reason));
+}
+
+/// Why a setup path stopped, which is not the same question as what went wrong.
+///
+/// [`CallEvent::MediaSetupFailed`] means the media never came up *and nobody asked for that*, so
+/// it may not be published for a call that was hung up while its media was still being built:
+/// there the person who pressed the button would be told the setup they cancelled had failed, and
+/// a front end drawing the event has nothing to tell the two apart with. The distinction is only
+/// in what is published -- every stop here is still an `Err` to whoever is awaiting it, because a
+/// cancelled setup did not produce a call either.
+enum SetupStop {
+    /// Nothing came up: no relay in the ack, an engine that would not build, a provider that
+    /// refused or never answered. Published, because this is the whole reason the event exists.
+    Failed(CallError),
+    /// The call ended underneath the setup -- a local hangup, a peer `<terminate>`, a disconnect.
+    /// Not published: whoever ended it already knows, and the ordinary end is not a failure.
+    Cancelled(CallError),
+}
+
+impl SetupStop {
+    /// The error to propagate, having published the reason if there was one to publish.
+    ///
+    /// Takes the sender rather than being called beside `publish_setup_failure` so the choice is
+    /// made once, at the one exit both kinds leave through.
+    fn into_error(self, events: &async_channel::Sender<CallEvent>) -> CallError {
+        match self {
+            Self::Failed(e) => {
+                publish_setup_failure(events, e.to_string());
+                e
+            }
+            Self::Cancelled(e) => e,
+        }
+    }
+}
+
+/// The provider await, *cancelled* by the call ending rather than merely bounded by
+/// `RELAY_PROVIDER_TIMEOUT`.
+///
+/// The timeout is the floor and not the answer. A peer `<terminate>`, a decline from another
+/// device, or a connection cleanup removes the registration and fires `ended` while an installed
+/// provider is still building its factory — and these three callers are *awaited* by whoever
+/// called `accept()` or `start()`, so a wait that watched only the timeout would be their wait
+/// too: up to `RELAY_PROVIDER_TIMEOUT` holding the engine, the audio endpoints and the call key
+/// for a call that is already over.
+///
+/// `attach_outgoing_relay` already races this same flag on the dormant 1:1 path, and
+/// `attach_engine` races it around the dial. This is that rule for the paths a `RegisteredCall`
+/// owns, which were the three that still only had the ceiling.
+///
+/// Cancellation, not failure: the error says the call ended, and the caller drops its endpoints
+/// on the way out rather than publishing a media setup failure for an ordinary ending.
+async fn relay_factory_or_ended(
+    client: &Client,
+    registration: &RegisteredCall,
+    endpoint: &wacore::voip::RelayEndpointParams,
+) -> Result<Arc<dyn RelayTransportFactory>, CallError> {
+    match futures::future::select(
+        std::pin::pin!(client.relay_transport_factory(endpoint)),
+        std::pin::pin!(registration.ended.wait()),
+    )
+    .await
+    {
+        futures::future::Either::Left((built, _)) => built,
+        futures::future::Either::Right(((), _)) => Err(CallError::Connect(
+            "the call ended while the relay transport was being built".into(),
+        )),
+    }
+}
+
 fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
+    fail_pending_outgoing_with(client, call_id, generation, None);
+}
+
+/// The same teardown, with the reason the media path never came up.
+///
+/// `wait_ended()` resolving is all a caller used to get from this, which says a call is over and
+/// not that it never started -- so a setup failure was indistinguishable from an ordinary remote
+/// hangup, and the reason lived only in a log line. That was survivable while the failures here
+/// were a missing `<relay>` or an engine that would not build, both rare; it is not once a
+/// platform's transport provider is one of them, because a browser with no WebRTC fails *every*
+/// outgoing call this way and the person placing it deserves to be told which.
+///
+/// [`CallEvent::MediaSetupFailed`] and not `RelayAllocateFailed`, which carries a STUN error code:
+/// there is no relay answering here, and dressing "the browser has no WebRTC" as a STUN class
+/// would be a worse lie than saying nothing. Sent before `ended` is notified, because a caller
+/// racing the two would otherwise see the call end and then the explanation -- the same ordering
+/// rule the terminal events in the drive loop follow.
+///
+/// A terminal stanza (`<reject>`, `<terminate>`) passes `None`: that is a call the peer ended, not
+/// a relay that failed, and dressing it as one would be a worse lie than saying nothing.
+fn fail_pending_outgoing_with(
+    client: &Client,
+    call_id: &str,
+    generation: u64,
+    reason: Option<String>,
+) {
     let pending = take_pending_if_current(
         &client.voip_state().pending_outgoing_calls,
         call_id,
@@ -2179,6 +2311,9 @@ fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
         .call_registry()
         .remove_if_current(call_id, generation);
     if let Some(pending) = pending {
+        if let Some(reason) = reason {
+            publish_setup_failure(&pending.ev_tx, reason);
+        }
         pending.ended.notify();
     }
 }
@@ -2235,6 +2370,34 @@ fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError>
         .map_err(|_| CallError::Media("relay address is not a valid socket addr"))
 }
 
+/// Everything the platform's transport needs to reach this call's relay.
+///
+/// The two ICE fields are read off the config rather than looked up again, because the config is
+/// what the relay walk already resolved: `auth_token` is the selected endpoint's `<auth_token>`,
+/// and `integrity_key` is the relay `<key>` in the ASCII base64 form it arrived in, which is both
+/// the STUN MESSAGE-INTEGRITY key and the `a=ice-pwd` a synthetic SDP answer carries. A native
+/// dialer ignores both; a browser cannot build an `RTCPeerConnection` without them, and looking
+/// them up from the transport would mean handing every transport the call's whole `RelayData`.
+///
+/// `auth_token` and **not** `relay_token`, which is the neighbouring field and the wrong one: they
+/// are two indexed sets, selected by `auth_token_id` and `token_id` respectively, and where those
+/// differ a ufrag built from the allocate token is one the relay refuses the browser's very first
+/// connectivity check over. `token_to_ice_ufrag`'s own doc has always named its input the auth
+/// token.
+fn relay_endpoint_from_config(
+    config: &CallConfig,
+) -> Result<wacore::voip::RelayEndpointParams, CallError> {
+    Ok(wacore::voip::RelayEndpointParams {
+        addr: socket_addr_from_config(config)?,
+        ice_ufrag: wacore::voip::relay_parse::token_to_ice_ufrag(&config.auth_token),
+        // Lossy rather than fallible: the relay key is base64 text in every offer that has one, and
+        // a call is not worth failing over a byte that is not. A relay that then refuses the
+        // credential says so in the ICE check, which is a far more legible failure than "the
+        // integrity key was not UTF-8".
+        ice_pwd: String::from_utf8_lossy(&config.integrity_key).into_owned(),
+    })
+}
+
 /// Build the engine from a relay that arrived for a pending OUTGOING call and start the driver,
 /// reusing the dormant handle's shared state. Returns `Ok(false)` when no pending outgoing call
 /// matches `call_id` (so the caller can fall through to normal handling).
@@ -2273,7 +2436,7 @@ pub(crate) async fn attach_outgoing_relay(
     // call would otherwise leak its registry generation and a parked wait_ended() would hang forever
     // (no pending entry left for a later hangup to drain). Build everything in a fallible block and, on
     // any early-return error in this window, reap the generation and notify `ended` before propagating.
-    let build = (|| {
+    let build = async {
         let mut config = CallConfig::for_outgoing(
             call_id,
             &pending.self_lid,
@@ -2281,25 +2444,64 @@ pub(crate) async fn attach_outgoing_relay(
             pending.call_key.clone(),
             relay,
         )
-        .map_err(|e| CallError::Setup(e.to_string()))?;
+        .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
         config.audio = pending.audio.config();
         config.enable_video = pending.video.is_some();
-        // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
-        let addr = socket_addr_from_config(&config)?;
+        // Read the dial endpoint off the config before CallEngine::new consumes it (no second relay
+        // walk).
+        let relay_endpoint = relay_endpoint_from_config(&config).map_err(SetupStop::Failed)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok::<_, CallError>((
-            engine,
-            RelayMediaChannelFactory::new(addr, client.runtime.clone()),
-        ))
-    })();
+            .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
+        // Raced against the call's own ending, not merely bounded by
+        // `RELAY_PROVIDER_TIMEOUT`. The timeout is the floor -- it stops a provider that never
+        // answers from parking any setup path -- but this one path can be *cancelled* rather than
+        // waited out, and it is the path that most needs to be: this function took the pending
+        // entry out of the map on its way in, so a hangup arriving now finds no call to end and
+        // the task would sit on the provider for the rest of the timeout holding the audio, the
+        // video and the call key. `attach_engine` already races its own dial against this same
+        // flag, three functions along; the provider await was the one step in front of it that
+        // did not.
+        let factory = match futures::future::select(
+            std::pin::pin!(client.relay_transport_factory(&relay_endpoint)),
+            std::pin::pin!(pending.ended.wait()),
+        )
+        .await
+        {
+            futures::future::Either::Left((built, _)) => built.map_err(SetupStop::Failed)?,
+            // Cancelled, not failed: the call ended underneath us. Still an `Err`, because no
+            // engine attached -- but `MediaSetupFailed` here would tell whoever hung up that the
+            // setup they had just stopped was broken.
+            futures::future::Either::Right(((), _)) => {
+                return Err(SetupStop::Cancelled(CallError::Connect(
+                    "the call ended while the relay transport was being built".into(),
+                )));
+            }
+        };
+        Ok::<_, SetupStop>((engine, factory))
+    }
+    .await;
     let (engine, factory) = match build {
         Ok(pair) => pair,
-        Err(e) => {
+        Err(stop) => {
             client
                 .call_registry()
                 .remove_if_current(call_id, pending.generation);
+            // Said here rather than left to the waiter's `fail_pending_outgoing_with`, which is
+            // where it looks like it belongs and is where it cannot happen: this function took the
+            // pending entry out of the map on its way in, so by the time the waiter tries to
+            // publish, `take_pending_if_current` finds nothing and the reason is dropped with the
+            // sender it needed. This is the last place that still holds `ev_tx` -- and it is the
+            // path a browser with no WebRTC takes on every outgoing call, which is precisely the
+            // one the event exists for.
+            //
+            // Whether there is anything to say is `SetupStop`'s to answer: a call hung up while
+            // its transport was being built stops here too, and is not a setup failure.
+            //
+            // Before `ended`, for the reason it is ordered that way there: a caller racing
+            // `wait_ended()` against the stream would otherwise see the call end and then the
+            // explanation.
+            let e = stop.into_error(&pending.ev_tx);
             pending.ended.notify();
             return Err(e);
         }
@@ -2311,7 +2513,7 @@ pub(crate) async fn attach_outgoing_relay(
         pending.generation,
         FailureCleanup::Here,
         engine,
-        &factory,
+        &*factory,
         pending.audio,
         pending.video,
         pending.video_shared,
@@ -2839,10 +3041,19 @@ async fn attach_engine(
                 .call_registry()
                 .remove_if_current(call_id, generation);
         }
-        ended.notify();
-        return Err(CallError::Setup(
+        // Every exit below that *fails* says why through `ev_tx`, and the one that is merely
+        // cancelled does not. It has to be said here: for an outgoing call
+        // `attach_outgoing_relay` removed the `PendingOutgoing` before calling this, so the
+        // relay waiter's `fail_pending_outgoing_with` finds nothing and drops the reason with
+        // the sender it needed -- this function is the last owner of it. A caller that awaits
+        // the `Err` directly gets the reason twice and pays one queued event for it; a dormant
+        // outgoing handle gets it once instead of never.
+        let e = CallError::Setup(
             "group relay WARP tag length changed during media attachment".to_string(),
-        ));
+        );
+        publish_setup_failure(&ev_tx, e.to_string());
+        ended.notify();
+        return Err(e);
     }
     let group_ctl = Some(group_rx);
     // The registry entry already exists. Re-check is_connected NOW (after insert, before connect) so a
@@ -2856,8 +3067,10 @@ async fn attach_engine(
                 .call_registry()
                 .remove_if_current(call_id, generation);
         }
+        let e = CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into());
+        publish_setup_failure(&ev_tx, e.to_string());
         ended.notify();
-        return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
+        return Err(e);
     }
 
     // Connect failure leaves the call already visible (registry entry inserted before connect; for an
@@ -2868,30 +3081,74 @@ async fn attach_engine(
     // Race the dial against the call ending. A hangup, a peer <terminate>, or a disconnect landing in
     // this window all remove our registry entry, and its `on_terminal` hook notifies `ended` even
     // though no media task exists yet -- so selecting on `ended` drops the in-flight connect future to
-    // abort the unwanted DTLS/SCTP dial instead of letting it run to success or the 12s timeout while
-    // wait_ended() stays parked.
-    let dial = factory.connect();
-    let (transport, relay_events) =
-        match futures::future::select(dial, std::pin::pin!(ended.wait())).await {
-            futures::future::Either::Left((Ok(pair), _)) => pair,
-            futures::future::Either::Left((Err(e), _)) => {
+    // abort the unwanted DTLS/SCTP dial instead of letting it run to success while wait_ended() stays
+    // parked.
+    //
+    // And bounded, which the race alone is not. The native factory carries its own
+    // `RELAY_CONNECT_TIMEOUT` and so needed nothing here; a factory an installed provider returned
+    // carries whatever its author gave it, and a browser whose ICE never settles gives it nothing.
+    // Ending is not a floor either -- an incoming `accept()` or a group `start()` is *awaited* by
+    // its caller, so with no peer terminate there is nothing to notify `ended` and the call would
+    // hang rather than fail. This ceiling sits above the native one, so a native dial still fails
+    // with its own more specific message and only a stalled provider reaches this.
+    // Scoped, because the pinned `ended.wait()` borrows a flag this function later moves into the
+    // driver task's guard: what leaves the block is the dial's own answer, or nothing.
+    let dialed = {
+        let dial = factory.connect();
+        let ending = ended.wait();
+        futures::pin_mut!(ending);
+        match wacore::runtime::timeout(
+            &*client.runtime,
+            RELAY_DIAL_CEILING,
+            futures::future::select(dial, ending),
+        )
+        .await
+        {
+            Ok(futures::future::Either::Left((result, _))) => Some(result),
+            // Ended mid-dial: the loser `dial` future drops here, aborting the connect.
+            Ok(futures::future::Either::Right(((), _dial))) => None,
+            Err(_) => {
                 if failure_cleanup == FailureCleanup::Here {
                     client
                         .call_registry()
                         .remove_if_current(call_id, generation);
                 }
+                let e = CallError::Connect(format!(
+                    "the relay transport did not connect within {RELAY_DIAL_CEILING:?}"
+                ));
+                publish_setup_failure(&ev_tx, e.to_string());
                 ended.notify();
-                return Err(CallError::Connect(e.to_string()));
+                return Err(e);
             }
-            // Ended mid-dial: the loser `dial` future drops here, aborting the connect. The generation
-            // was already reaped by whoever ended us; reap defensively and stop.
-            futures::future::Either::Right(((), _dial)) => {
+        }
+    };
+    let (transport, relay_events) = match dialed {
+        Some(Ok(pair)) => pair,
+        Some(Err(dial_err)) => {
+            if failure_cleanup == FailureCleanup::Here {
                 client
                     .call_registry()
                     .remove_if_current(call_id, generation);
-                return Err(CallError::Connect("call ended during relay connect".into()));
             }
-        };
+            let e = CallError::Connect(dial_err.to_string());
+            publish_setup_failure(&ev_tx, e.to_string());
+            ended.notify();
+            return Err(e);
+        }
+        // The generation was already reaped by whoever ended us; reap defensively and stop.
+        //
+        // No `MediaSetupFailed` on this one arm, and it is the reason the two are told apart at
+        // all: reaching here means `ended` won the race above, so the call was hung up,
+        // terminated by the peer, or disconnected while the dial was in flight. That is an
+        // ordinary ending, and publishing a terminal setup failure for it would tell whoever
+        // ended the call that its media had broken.
+        None => {
+            client
+                .call_registry()
+                .remove_if_current(call_id, generation);
+            return Err(CallError::Connect("call ended during relay connect".into()));
+        }
+    };
 
     // Only the selected I/O pair stays open. Closed inactive channels make their driver select arms
     // retire immediately without per-frame branching or idle tasks.
@@ -2976,13 +3233,18 @@ async fn attach_engine(
     let ended_guard = scopeguard::guard(ended, |e| {
         e.notify();
     });
+    // The driver's runtime is the client's own, not a hardcoded Tokio one. `run_call` has always
+    // been portable and taken the runtime as an argument; naming Tokio here was what put the one
+    // remaining executor assumption in the call path, and it is exactly the assumption a page
+    // cannot satisfy.
+    let driver_runtime = client.runtime.clone();
     let task = client.runtime.spawn(Box::pin(async move {
         // All are captured (moved in), so any teardown -- even an abort before the first poll --
         // drops them: the feeds are aborted and `ended` is notified.
         let _ended_guard = ended_guard;
         let _audio_feed = audio_feed;
         let _video_out_feed = video_out_feed;
-        run_call_tokio(transport, relay_events, channels, engine).await;
+        run_call(driver_runtime, transport, relay_events, channels, engine).await;
         // A locally-ended call gets no <terminate>; drop our own entry so the registry doesn't grow.
         // The call's `ring_devices` live on the session, so this also drops the sibling-dismiss
         // tracking -- no separate map to clean up.
@@ -5961,6 +6223,475 @@ mod tests {
                 rx,
             ))
         }
+    }
+
+    /// A provider that hands out a [`MockFactory`] and records the relay it was asked about.
+    struct RecordingProvider {
+        asked: Arc<Mutex<Vec<(SocketAddr, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl wacore::voip::RelayTransportProvider for RecordingProvider {
+        async fn factory(
+            &self,
+            relay: &wacore::voip::RelayEndpointParams,
+        ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            self.asked.lock().unwrap().push((
+                relay.addr,
+                relay.ice_ufrag.clone(),
+                relay.ice_pwd.clone(),
+            ));
+            let (_tx, rx) = async_channel::unbounded();
+            Ok(Arc::new(MockFactory {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                relay_rx: Mutex::new(Some(rx)),
+                connects: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    /// An installed provider is what dials, and it is told which relay to dial.
+    ///
+    /// This is the seam a page reaches a call through: with no provider a native build falls back
+    /// to its own UDP dialer, and a build without one -- wasm32, where there is no UDP socket to
+    /// open -- has nothing to fall back to. Guarding it here rather than only in the wasm CI build
+    /// is what makes "the browser transport is used" a fact this test suite can hold, since the
+    /// browser half itself cannot run in this test suite at all.
+    #[tokio::test]
+    async fn an_installed_relay_transport_provider_is_what_dials() {
+        let client = make_client().await;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        client.set_relay_transport_provider(Arc::new(RecordingProvider {
+            asked: asked.clone(),
+        }));
+
+        let addr: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr,
+            ice_ufrag: "UFRAG".to_string(),
+            ice_pwd: "PWD".to_string(),
+        };
+        client
+            .relay_transport_factory(&endpoint)
+            .await
+            .expect("the installed provider answers");
+
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            &[(addr, "UFRAG".to_string(), "PWD".to_string())],
+            "the provider is asked about the relay the call named, with the ICE credentials a \
+             synthetic SDP answer needs -- an address alone cannot build an RTCPeerConnection"
+        );
+    }
+
+    /// The ICE credentials a browser signs its connectivity checks with are the call's own, read
+    /// off the config the relay walk already resolved. Getting either wrong is a call that dials
+    /// the right host and is refused by it, which looks like a network fault and is not one.
+    #[test]
+    fn a_relay_endpoint_carries_the_call_ice_credentials() {
+        let mut config = CallConfig::for_outgoing(
+            "CID-ICE",
+            "111:0@lid",
+            "222:0@lid",
+            vec![7u8; 32],
+            &sample_relay(),
+        )
+        .expect("config");
+        config.relay_ip = "198.51.100.9".to_string();
+        config.relay_port = 3480;
+        // Deliberately different, because the two are separate indexed sets and building the
+        // ufrag from the allocate token is a call the relay refuses at the first ICE check.
+        config.relay_token = vec![0x11, 0x22, 0x33];
+        config.auth_token = vec![0xaa, 0xbb, 0xcc];
+        config.integrity_key = b"EBESExQVFhcYGRobHB0eHw==".to_vec();
+
+        let endpoint = relay_endpoint_from_config(&config).expect("endpoint");
+        assert_eq!(endpoint.addr.to_string(), "198.51.100.9:3480");
+        assert_eq!(
+            endpoint.ice_ufrag,
+            wacore::voip::relay_parse::token_to_ice_ufrag(&[0xaa, 0xbb, 0xcc]),
+            "ice-ufrag is the endpoint's auth token, base64 -- not the allocate token beside it"
+        );
+        assert_ne!(
+            endpoint.ice_ufrag,
+            wacore::voip::relay_parse::token_to_ice_ufrag(&[0x11, 0x22, 0x33]),
+            "and never the relay token"
+        );
+        assert_eq!(
+            endpoint.ice_pwd, "EBESExQVFhcYGRobHB0eHw==",
+            "ice-pwd is the relay <key> in the ASCII form it arrived in"
+        );
+    }
+
+    /// The redaction is the point of the manual Debug: a transport implementation reaching for a
+    /// `{:?}` must not put the relay key in a log.
+    #[test]
+    fn a_relay_endpoint_does_not_print_its_password() {
+        let printed = format!(
+            "{:?}",
+            wacore::voip::RelayEndpointParams {
+                addr: "203.0.113.7:3480".parse().expect("addr"),
+                ice_ufrag: "UFRAG".to_string(),
+                ice_pwd: "SECRET-RELAY-KEY".to_string(),
+            }
+        );
+        assert!(!printed.contains("SECRET-RELAY-KEY"), "got: {printed}");
+        assert!(printed.contains("UFRAG"), "got: {printed}");
+    }
+
+    /// A factory whose `connect()` never resolves fails the call rather than hanging it.
+    ///
+    /// The native dialer carries its own `RELAY_CONNECT_TIMEOUT`, so nothing here needed a ceiling
+    /// before a provider could supply a factory. One that an installed provider returns carries
+    /// whatever bound its author gave it -- a browser whose ICE never settles gives it none -- and
+    /// racing `ended` is not a floor on this path: an `accept()` is *awaited* by its caller, so
+    /// with no peer terminate there is nothing to notify `ended` and the await would never return.
+    #[tokio::test(start_paused = true)]
+    async fn a_factory_that_never_connects_fails_the_call() {
+        struct NeverConnects;
+        #[async_trait]
+        impl RelayTransportFactory for NeverConnects {
+            async fn connect(
+                &self,
+            ) -> anyhow::Result<(
+                Arc<dyn RelayTransport>,
+                async_channel::Receiver<RelayTransportEvent>,
+            )> {
+                std::future::pending().await
+            }
+        }
+        // Through `spawn_call` rather than the outgoing relay waiter, deliberately: that path also
+        // carries `OFFER_ACK_RELAY_TIMEOUT`, which under a paused clock fires first and ends the
+        // call before this ceiling can. Real, and a different mechanism -- what is under test here
+        // is the one that has to hold when nothing else ends the call, which is exactly an
+        // `accept()` awaiting its own setup.
+        let client = make_client().await;
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let error = match spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &NeverConnects,
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a factory that never connects must not succeed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did not connect within"),
+            "the ceiling has to say what it gave up on, got: {error}"
+        );
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "and the generation it registered must not be left behind"
+        );
+    }
+
+    /// A hangup during relay setup cancels the provider rather than waiting it out.
+    ///
+    /// The timeout beside this is the floor and not the answer: `attach_outgoing_relay` takes the
+    /// pending entry out of the map on its way in, so a hangup arriving while the provider is
+    /// still building finds no call to end -- and without the race the task would hold the audio,
+    /// the video and the call key for the rest of `RELAY_PROVIDER_TIMEOUT`.
+    #[tokio::test]
+    async fn a_hangup_during_relay_setup_stops_waiting_for_the_provider() {
+        /// Answers only when told to, so the test owns the ordering.
+        struct Gated {
+            release: async_channel::Receiver<()>,
+        }
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Gated {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                let _ = self.release.recv().await;
+                anyhow::bail!("released")
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        let (_release_tx, release) = async_channel::bounded::<()>(1);
+        client.set_relay_transport_provider(Arc::new(Gated { release }));
+
+        // The attach parks in the provider; the hangup is what has to end it.
+        let attaching = {
+            let client = client.clone();
+            let call_id = call_id.clone();
+            tokio::spawn(
+                async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        handle.hangup_local().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), attaching)
+            .await
+            .expect("the hangup must end the attach, not leave it on the provider")
+            .expect("task");
+        assert!(
+            matches!(result, Err(CallError::Connect(_))),
+            "a call that ended during setup is a Connect error, got {result:?}"
+        );
+    }
+
+    /// A hangup while the transport is being built is not a media setup failure.
+    ///
+    /// The two stop the same way -- no engine attaches and the caller gets a `Connect` error --
+    /// and they are not the same event. `MediaSetupFailed` is terminal and means the media never
+    /// came up *and nobody asked for that*, so publishing it for a call somebody just hung up
+    /// tells the person who pressed the button that the setup they cancelled had broken, with
+    /// nothing on the stream to tell them apart. `SetupStop` is that distinction; this is the arm
+    /// that must stay silent.
+    #[tokio::test]
+    async fn a_hangup_during_relay_setup_is_not_a_setup_failure() {
+        /// Never answers, so the hangup is what ends the setup.
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+
+        let attaching = {
+            let client = client.clone();
+            let call_id = call_id.clone();
+            tokio::spawn(
+                async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        handle.hangup_local().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), attaching)
+            .await
+            .expect("the hangup must end the attach")
+            .expect("task");
+        assert!(
+            matches!(result, Err(CallError::Connect(_))),
+            "a call that ended during setup is still a Connect error, got {result:?}"
+        );
+
+        // Whatever the stream carries, none of it may claim the media setup failed.
+        while let Ok(event) = handle.events().try_recv() {
+            assert!(
+                !matches!(event, CallEvent::MediaSetupFailed(_)),
+                "a hangup published a setup failure: {event:?}"
+            );
+        }
+    }
+
+    /// A dial that fails reaches a dormant outgoing handle, rather than only its caller.
+    ///
+    /// `attach_outgoing_relay` removes the `PendingOutgoing` on its way in, so by the time
+    /// `attach_engine` gives up on the dial there is no pending entry left for the relay waiter's
+    /// `fail_pending_outgoing_with` to publish through -- it finds nothing and drops the reason
+    /// with the sender it needed. `attach_engine` is the last owner of `ev_tx`, so the reason is
+    /// said there or nowhere, and every exit of it that *fails* says one.
+    ///
+    /// Through a `connect()` that refuses rather than one that stalls, deliberately. The stalling
+    /// version tests `RELAY_DIAL_CEILING` and cannot be written here: under a paused clock this
+    /// path carries a shorter timer of its own, which fires first, ends the call, and sends the
+    /// dial into its *cancelled* arm -- so the test would pass or fail on a mechanism it is not
+    /// about. The ceiling has its own test through `spawn_call`
+    /// (`a_factory_that_never_connects_fails_the_call`); what is under test here is the
+    /// publication, and a refusing dial reaches the same exit with no clock involved.
+    #[tokio::test]
+    async fn a_failed_dial_reaches_a_dormant_handle() {
+        struct RefusesToConnect;
+        #[async_trait]
+        impl RelayTransportFactory for RefusesToConnect {
+            async fn connect(
+                &self,
+            ) -> anyhow::Result<(
+                Arc<dyn RelayTransport>,
+                async_channel::Receiver<RelayTransportEvent>,
+            )> {
+                anyhow::bail!("ICE gathering produced no candidates")
+            }
+        }
+        /// Hands back a factory promptly; it is the dial behind it that refuses.
+        struct Hands;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Hands {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                Ok(Arc::new(RefusesToConnect))
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(Hands));
+
+        let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
+        assert!(
+            matches!(res, Err(CallError::Connect(_))),
+            "a dial that refuses must fail the attach, got {res:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+            .await
+            .expect("the dial's reason must reach the handle, not only its caller")
+            .expect("the event stream must carry it before it closes");
+        match event {
+            CallEvent::MediaSetupFailed(reason) => assert!(
+                reason.contains("ICE gathering produced no candidates"),
+                "the dial's own reason has to survive to the caller, got: {reason}"
+            ),
+            other => panic!("expected MediaSetupFailed, got {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("and the call must still end rather than hang");
+    }
+
+    /// A peer `<terminate>` cancels the provider await on a call that is already registered.
+    ///
+    /// `RELAY_PROVIDER_TIMEOUT` is the floor and not the answer here. `accept()` and the group
+    /// starts are *awaited* by their callers, so a wait that watched only the ceiling would be
+    /// the caller's wait too — up to fifteen seconds holding the engine, the audio endpoints and
+    /// the call key for a call the peer has already hung up. The dormant 1:1 path got this race
+    /// when the provider seam landed; the three paths a `RegisteredCall` owns did not, which is
+    /// the hole this closes.
+    ///
+    /// On a real clock deliberately: under `start_paused` the fifteen-second ceiling
+    /// auto-advances and fires, so the test would pass without the race and prove nothing. Two
+    /// seconds is far inside it, so only the cancellation can satisfy this.
+    #[tokio::test]
+    async fn a_peer_terminate_cancels_a_registered_call_s_provider_await() {
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let (client, _sent) = make_sending_client().await;
+        let incoming = incoming_offer(false);
+        let registration = register_answer(&client, &incoming).await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr: "203.0.113.9:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+
+        let awaiting = relay_factory_or_ended(&client, &registration, &endpoint);
+        let end_peer = async {
+            tokio::task::yield_now().await;
+            terminate_call(&client, incoming.action.call_id());
+        };
+
+        let (result, ()) = tokio::time::timeout(
+            Duration::from_secs(2),
+            futures::future::join(awaiting, end_peer),
+        )
+        .await
+        .expect("the peer's terminate must end the await, not leave it on the provider");
+
+        let error = match result {
+            Ok(_) => panic!("a provider that never answers must not resolve"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("the call ended"),
+            "the reason has to name the ending rather than the ceiling, got: {error}"
+        );
+    }
+
+    /// A provider that never answers fails the call rather than parking its setup forever.
+    ///
+    /// The await this bounds is new: the native dialer it replaced was a synchronous constructor,
+    /// so nothing on the setup path could stall here. An installed provider is somebody else's I/O,
+    /// and on the outgoing path the pending entry has already been taken out of the map by the time
+    /// it is awaited -- so a hangup can no longer find the call to end it, and `wait_ended()` would
+    /// wait on the provider rather than on the call.
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_that_never_answers_does_not_park_the_call() {
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let client = make_client().await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr: "203.0.113.7:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+
+        let error = match client.relay_transport_factory(&endpoint).await {
+            Ok(_) => panic!("a provider that never answers must not resolve"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did not answer"),
+            "the timeout has to say what it gave up on, got: {error}"
+        );
+    }
+
+    /// A provider that refuses fails the call with its reason, rather than falling back to a dialer
+    /// the platform may not have. A browser with no `RTCPeerConnection` is exactly this case, and
+    /// the reason is the only thing a person ever sees of it.
+    #[tokio::test]
+    async fn a_refusing_provider_fails_the_call_with_its_reason() {
+        struct Refuses;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Refuses {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                anyhow::bail!("this browser has no WebRTC")
+            }
+        }
+
+        let client = make_client().await;
+        client.set_relay_transport_provider(Arc::new(Refuses));
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr: "203.0.113.7:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+        // `expect_err` wants the Ok side to be Debug, and `dyn RelayTransportFactory` is not.
+        let error = match client.relay_transport_factory(&endpoint).await {
+            Ok(_) => panic!("a refusing provider must not fall through to the native dialer"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("this browser has no WebRTC"),
+            "the provider's own reason has to survive to the caller, got: {error}"
+        );
     }
 
     // spawn_call: connects via the injected factory, registers the call, emits the STUN allocate,
@@ -9437,6 +10168,57 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("a setup error must resolve the handle's wait_ended, not hang it");
+    }
+
+    /// A refusing transport provider reaches the handle, not only the log.
+    ///
+    /// The regression this pins is subtle and was live: publishing the reason from
+    /// `fail_pending_outgoing_with` looks right and cannot work, because `attach_outgoing_relay`
+    /// takes the pending entry out of the map on its way in -- so by the time the relay waiter
+    /// tries, the `ev_tx` it needs has already been dropped with the entry. The event has to be
+    /// sent from inside `attach_outgoing_relay`, which is the last place that still holds it.
+    ///
+    /// It matters most on the path this whole feature exists for: a browser with no
+    /// `RTCPeerConnection` refuses here on *every* outgoing call, and without the event a caller
+    /// cannot tell that from the peer hanging up.
+    #[tokio::test]
+    async fn a_refused_transport_provider_reaches_the_handle() {
+        struct Refuses;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Refuses {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                anyhow::bail!("this browser has no WebRTC")
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(Refuses));
+
+        let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
+        assert!(
+            matches!(res, Err(CallError::Setup(_))),
+            "a refusing provider must surface as a Setup error, got {res:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+            .await
+            .expect("the reason must reach the handle rather than only the log")
+            .expect("the event stream must carry it before it closes");
+        match event {
+            CallEvent::MediaSetupFailed(reason) => assert!(
+                reason.contains("this browser has no WebRTC"),
+                "the provider's own reason has to survive to the caller, got: {reason}"
+            ),
+            other => panic!("expected MediaSetupFailed, got {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("and the call must still end rather than hang");
     }
 
     // Finding M: if hangup() races the relay ack -- removing the registry entry while

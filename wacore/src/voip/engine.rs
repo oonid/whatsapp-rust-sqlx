@@ -187,6 +187,24 @@ pub struct CallConfig {
     pub audio: AudioConfig,
     /// Relay endpoint allocate inputs.
     pub relay_token: Vec<u8>,
+    /// The selected endpoint's `<auth_token>`, which is a different indexed set from
+    /// [`Self::relay_token`] and is indexed by `auth_token_id` rather than `token_id`.
+    ///
+    /// Not used by the allocate -- that is `relay_token`, the STUN `RELAY-TOKEN` attribute. This is
+    /// what a synthetic SDP answer's `a=ice-ufrag` is built from
+    /// ([`relay_parse::token_to_ice_ufrag`](crate::voip::relay_parse::token_to_ice_ufrag)), which a
+    /// platform whose transport is an `RTCPeerConnection` needs and the native dialer does not.
+    ///
+    /// `auth_token_id` is an ordinary index, exactly as `token_id` is: both default to 0 when the
+    /// attribute is absent, and slot 0 is a real slot. It is *not* a sentinel -- treating it as one
+    /// would blank the ufrag for every offer that omits the attribute, which is the common shape.
+    /// What `is_outbound_relay_candidate` does with `auth_token_id != 0` is pick relaylatency
+    /// probes, and that is a different question from which credential signs an ICE check.
+    ///
+    /// Empty when the offer genuinely carries no matching token, because such a call must still
+    /// connect for media (`get_media_relay_endpoint` says so). Best-effort, therefore, and the
+    /// transport that cannot do without it is the one that says so.
+    pub auth_token: Vec<u8>,
     pub relay_ip: String,
     pub relay_port: u16,
     /// The relay `<key>` (ASCII) used as the STUN MESSAGE-INTEGRITY key.
@@ -205,7 +223,24 @@ pub struct CallConfig {
     pub enable_sframe: bool,
 }
 
-/// Group-media inputs layered onto a regular engine before it starts.
+/// The endpoint's `<auth_token>`, or empty when the relay carries no matching one.
+///
+/// Shared by the 1:1 and group paths, which index two different token sets the same way and used
+/// to disagree about whether the group one existed at all.
+///
+/// No special case for id 0: it is an ordinary index that both `token_id` and `auth_token_id`
+/// default to when the attribute is absent, so skipping it would blank the credential for the most
+/// common shape of offer. An empty or absent slot answers empty, which is the honest "there is no
+/// token here" and is what a transport needing one checks.
+fn select_auth_token(auth_tokens: &[Vec<u8>], auth_token_id: u32) -> Vec<u8> {
+    auth_tokens
+        .get(auth_token_id as usize)
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Group-media inputs layered onto a regular engine before it starts./// Group-media inputs layered onto a regular engine before it starts.
 pub struct GroupEngineConfig {
     pub call_creator: Jid,
     pub self_jid: Jid,
@@ -236,6 +271,7 @@ impl core::fmt::Debug for CallConfig {
             .field("ssrc", &self.ssrc)
             .field("audio", &self.audio)
             .field("relay_token", &"[redacted]")
+            .field("auth_token", &"[redacted]")
             .field("relay_ip", &self.relay_ip)
             .field("relay_port", &self.relay_port)
             .field("integrity_key", &"[redacted]")
@@ -311,6 +347,11 @@ impl CallConfig {
             .filter(|t| !t.is_empty())
             .cloned()
             .ok_or(SetupError::NoRelayToken(ep.token_id))?;
+        // Best-effort, unlike the token above: an offer that carries no matching auth token must
+        // still connect for media, so a missing one is empty here rather than an error. Only a
+        // transport that builds a synthetic SDP reads it, and that is the layer with something to
+        // say about an empty one. Slot 0 is indexed like any other -- see the field's own note.
+        let auth_token = select_auth_token(&relay.auth_tokens, ep.auth_token_id);
         // The relay <key> is the STUN MESSAGE-INTEGRITY key; without it the allocate/binding-success
         // we sign can't authenticate, so fail here rather than dial with an empty key. Sign with the
         // base64 TEXT of <key> (relay_key_ascii), NOT its decoded bytes (relay.relay_key): the relay
@@ -346,6 +387,7 @@ impl CallConfig {
             ssrc: our_ssrc,
             audio: AudioConfig::MLOW_PCM,
             relay_token,
+            auth_token,
             relay_ip,
             relay_port,
             integrity_key,
@@ -435,6 +477,11 @@ impl CallConfig {
             ),
             audio: AudioConfig::MLOW_PCM,
             relay_token,
+            // A `GroupCallRelay` carries its own `<auth_token>` set, indexed by the selected
+            // endpoint's `auth_token_id` exactly as the 1:1 offer's is. This said the opposite and
+            // was wrong: a browser joining a group call would have built its synthetic SDP with an
+            // empty `ice-ufrag`, which the relay refuses.
+            auth_token: select_auth_token(&relay.auth_tokens, endpoint.auth_token_id),
             relay_ip,
             relay_port,
             integrity_key: relay.key.clone(),
@@ -537,6 +584,17 @@ pub enum CallEvent {
     RelayAllocateFailed(u16),
     /// The relay never acked the allocate within the deadline (wedged relay). Terminal.
     RelayAllocateTimedOut,
+    /// The media path was never built, and this is why. Terminal.
+    ///
+    /// Distinct from the two above, which are the relay *answering* badly. This one is everything
+    /// before there is a relay to answer: no `<relay>` in the offer ack, an engine that would not
+    /// build, or a platform whose transport provider refused -- the last of which is a browser
+    /// with no `RTCPeerConnection`, where it is not an edge case but every outgoing call.
+    ///
+    /// It exists because `wait_ended()` resolving says a call is *over*, not that it never
+    /// started, so without this a setup failure was indistinguishable from an ordinary remote
+    /// hangup and its reason lived only in a log line.
+    MediaSetupFailed(String),
     /// Replacing a migrated relay transport did not finish within the reconnect deadline.
     RelayReconnectTimedOut,
     /// The peer's `<video state=N>` signaling arrived (upgrade requested/accepted, stopped, ...).
@@ -716,6 +774,7 @@ impl CallEvent {
                         .map(|item| item.fci.capacity())
                         .sum::<usize>()
             }
+            Self::MediaSetupFailed(reason) => reason.capacity(),
             Self::RelayAllocated
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut
@@ -3915,6 +3974,7 @@ mod encoded_tests {
             ssrc: 0x5741_0001,
             audio: AudioConfig::encoded(AudioFormat::OPUS_16KHZ_60MS),
             relay_token: vec![0xAB; 16],
+            auth_token: vec![0xCD; 8],
             relay_ip: "203.0.113.7".into(),
             relay_port: 3478,
             integrity_key: b"relay-key".to_vec(),
@@ -6166,6 +6226,7 @@ mod tests {
             ssrc: SSRC,
             audio: AudioConfig::MLOW_PCM,
             relay_token: vec![0xAB; 16],
+            auth_token: vec![0xCD; 8],
             relay_ip: "203.0.113.7".into(),
             relay_port: 3478,
             integrity_key: b"relay-key".to_vec(),
@@ -6194,11 +6255,16 @@ mod tests {
             dbg.contains("relay_token: \"[redacted]\""),
             "relay_token not redacted"
         );
-        // The 0..32 callKey bytes, the b"relay-key" integrity key, and the 0xAB relay-token bytes
-        // must not appear.
+        assert!(
+            dbg.contains("auth_token: \"[redacted]\""),
+            "auth_token not redacted"
+        );
+        // The 0..32 callKey bytes, the b"relay-key" integrity key, the 0xAB relay-token bytes and
+        // the 0xCD auth-token bytes must not appear.
         assert!(!dbg.contains("[0, 1, 2, 3"), "callKey bytes leaked");
         assert!(!dbg.contains("114, 101, 108"), "integrity_key bytes leaked");
         assert!(!dbg.contains("[171, 171"), "relay_token bytes leaked");
+        assert!(!dbg.contains("[205, 205"), "auth_token bytes leaked");
         // Non-secret fields stay visible for diagnostics.
         assert!(dbg.contains("call_id: \"CID\""));
     }

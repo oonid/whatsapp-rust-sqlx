@@ -294,8 +294,21 @@ Scope caveats: the hook covers tasks spawned *by the client* through the
 future (`Bot::spawn` reaches it via `Runtime::spawn`), so the read loop is
 covered on either launch path. Work executed on the caller's own task (e.g.
 awaiting `send_message`) belongs to the caller — instrument that side
-yourself if you need it. The `voip` feature's media tasks (call driver,
-relay I/O) currently spawn directly on Tokio and are not instrumented.
+yourself if you need it.
+
+VoIP media tasks: the **call driver** is covered. It runs on the client's own
+`Arc<dyn Runtime>` — it has to, since that is the only executor a browser build
+has — so an installed instrument meters it like any other client task. Do not
+add separate attribution for it, or the work is counted twice.
+
+The native relay transport's own I/O is covered too, which this section used to
+deny: `voip-relay-native`'s UDP read task and DTLS/SCTP retransmit timers run
+under `relay_driver`, and `connect_relay_media` spawns it through the runtime
+`RelayMediaChannelFactory` was built with — the client's own, both before and
+after the transport-provider split. So an installed instrument already meters
+the relay, and attributing it separately double-counts it. The only VoIP work
+outside the hook is a transport an installed `RelayTransportProvider` supplies,
+which spawns wherever its author chose.
 
 ## `Client::resource_report()` — out-of-client resource attribution (on demand)
 

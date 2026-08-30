@@ -46,6 +46,14 @@ use super::{Client, ClientError};
 
 #[cfg(feature = "voip-runtime")]
 const CALL_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an installed [`RelayTransportProvider`](wacore::voip::RelayTransportProvider) has to
+/// hand back a factory before the call gives up on it.
+///
+/// Generous, because building one may involve a real device or a permission prompt, and short
+/// enough that a provider which never answers fails the call instead of parking its setup task
+/// forever.
+#[cfg(feature = "voip-runtime")]
+const RELAY_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(feature = "voip-runtime")]
 const WAITING_ROOM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(feature = "voip-runtime")]
@@ -401,6 +409,93 @@ impl Client {
     #[cfg(feature = "voip-runtime")]
     pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
         self.voip_state().call_registry.clone()
+    }
+
+    /// Install the platform's way onto the media wire.
+    ///
+    /// A relay endpoint is a `SocketAddr` the server names per call, and what dials it is the
+    /// platform's business: on a `voip-relay-native` build the default is this crate's own
+    /// UDP/DTLS/SCTP/DataChannel dialer, and nothing else needs to say so. Everywhere else -- a
+    /// browser above all, where there is no UDP socket to open and an `RTCPeerConnection` reaches
+    /// the same relay over the same pre-negotiated DataChannel -- this is how the transport gets
+    /// in.
+    ///
+    /// Call it before placing or answering a call; a call already running keeps the transport it
+    /// dialled with. Installing one on a native build replaces the default rather than racing it,
+    /// which is also how a packet tap or an in-memory transport gets used against a real client.
+    #[cfg(feature = "voip-runtime")]
+    pub fn set_relay_transport_provider(
+        &self,
+        provider: Arc<dyn wacore::voip::RelayTransportProvider>,
+    ) {
+        *self
+            .voip_state()
+            .relay_transport_provider
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
+    }
+
+    /// The factory that dials `relay`, from the installed provider or this build's default.
+    ///
+    /// The error is `CallError::Setup` rather than a panic or a `compile_error!`, because "this
+    /// build has no way onto the media wire" is a fact about a deployment: a page that has not
+    /// installed a provider yet is in exactly the state a page with no `RTCPeerConnection` is in
+    /// permanently, and both deserve a sentence rather than a crash.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn relay_transport_factory(
+        &self,
+        relay: &wacore::voip::RelayEndpointParams,
+    ) -> Result<Arc<dyn wacore::voip::RelayTransportFactory>, CallError> {
+        let addr = relay.addr;
+        let installed = self
+            .voip_state()
+            .relay_transport_provider
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(provider) = installed {
+            // Bounded, because this await is new and a stalled one is worse than it looks. The
+            // native dialer this replaced was a synchronous constructor, so nothing on the call
+            // setup path could park here; an installed provider is somebody else's code doing
+            // somebody else's I/O -- a browser building an `RTCPeerConnection` is a call into JS --
+            // and one that never resolves leaves the outgoing relay waiter holding a pending call
+            // it has already removed from the map, where a hangup can no longer find it to end it.
+            //
+            // A timeout rather than a race against the call's own `ended`: this is the one place
+            // every path goes through, so bounding it here covers the answer, the group join and
+            // the call-link join as well as the outgoing waiter that made it visible. It also
+            // mirrors what the native factory already does one layer down with
+            // `RELAY_CONNECT_TIMEOUT`, rather than inventing a second shape for the same problem.
+            return match wacore::runtime::timeout(
+                &*self.runtime,
+                RELAY_PROVIDER_TIMEOUT,
+                provider.factory(relay),
+            )
+            .await
+            {
+                Ok(built) => {
+                    built.map_err(|e| CallError::Setup(format!("relay transport for {addr}: {e}")))
+                }
+                Err(_) => Err(CallError::Setup(format!(
+                    "the installed relay transport provider did not answer for {addr} within \
+                     {RELAY_PROVIDER_TIMEOUT:?}"
+                ))),
+            };
+        }
+        #[cfg(feature = "voip-relay-native")]
+        {
+            Ok(Arc::new(
+                crate::voip::transport::RelayMediaChannelFactory::new(addr, self.runtime.clone()),
+            ))
+        }
+        #[cfg(not(feature = "voip-relay-native"))]
+        {
+            Err(CallError::Setup(format!(
+                "no relay media transport for {addr}: this build has no native relay dialler \
+                 (`voip-relay-native`), so it needs one installed with \
+                 `Client::set_relay_transport_provider`"
+            )))
+        }
     }
 
     #[cfg(feature = "voip-runtime")]
