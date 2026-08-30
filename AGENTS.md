@@ -101,9 +101,19 @@ rewriting those exact files. Re-apply them by intent, not by blindly taking a si
 - **phash** (`wacore/src/messages.rs`) — `participant_list_hash` must hash JIDs in
   **Display** form (`write!(arena, "{jid}")`), not upstream's ad-format `:0`. WhatsApp
   Business clients reject the ad-format hash; Baileys uses Display form.
-- **TC token** (`src/send/tctoken_lifecycle.rs`) — drop the `is_self` guard and treat a
-  **cold A/B-prop cache as enabled**. Upstream's typed registry defaults the flag to
-  `false`, which starves token issuance and yields a perpetual `463 MissingTcToken`.
+- **TC token** (`src/send/tctoken_lifecycle.rs`) — treat a **cold A/B-prop cache as
+  enabled**. `PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES` carries
+  `default: AbDefault::Bool(false)`, `is_enabled` falls back to that default until the
+  server pushes the prop, and the cstoken fallback does not rescue it because
+  `WA_NCT_TOKEN_SEND_ENABLED` defaults `false` too — so a fresh start attaches no token
+  at all and earns a perpetual `463 MissingTcToken`. Read the prop with `.get(..)` and
+  default to `true` when absent; an explicit server `"0"` must still disable it.
+
+  This patch **used to have a second half** — dropping an `is_self` guard that fired when
+  the bot's LID collided with the admin's chat LID. **Upstream fixed that**: `is_own_identity`
+  now compares namespaces via `is_same_chat_as` rather than `is_same_user_as`. Do not
+  re-apply that half on a future rebase; check whether the guard is still user-equality
+  before assuming it needs touching.
 
 ### The postgres backend
 
