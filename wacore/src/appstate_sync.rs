@@ -248,7 +248,11 @@ impl AppStateProcessor {
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         // Skip collections with errors — caller handles them via pl.error
         if pl.error.is_some() {
-            let state = self.backend.get_version(pl.name.as_str()).await?;
+            let state = self
+                .backend
+                .get_version(pl.name.as_str())
+                .await?
+                .unwrap_or_default();
             return Ok((Vec::new(), state, pl));
         }
 
@@ -261,7 +265,11 @@ impl AppStateProcessor {
                 code: 0,
                 text: e.to_string(),
             });
-            let state = self.backend.get_version(pl.name.as_str()).await?;
+            let state = self
+                .backend
+                .get_version(pl.name.as_str())
+                .await?
+                .unwrap_or_default();
             return Ok((Vec::new(), state, pl));
         }
 
@@ -277,7 +285,9 @@ impl AppStateProcessor {
         // Pre-fetch all keys we'll need
         self.prefetch_keys(&pl).await?;
 
-        let mut state = self.backend.get_version(pl.name.as_str()).await?;
+        let stored = self.backend.get_version(pl.name.as_str()).await?;
+        let had_baseline = stored.as_ref().is_some_and(|s| s.has_baseline());
+        let mut state = stored.unwrap_or_default();
         let mut new_mutations: Vec<Mutation> = Vec::new();
         let collection_name = pl.name.as_str();
 
@@ -351,6 +361,7 @@ impl AppStateProcessor {
                     )
                     .await?;
             }
+            state.bootstrapped |= !pl.has_more_patches;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
@@ -448,6 +459,7 @@ impl AppStateProcessor {
             new_mutations.extend(result.mutations);
 
             // Persist state and MACs
+            state.bootstrapped |= !pl.has_more_patches;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
@@ -466,6 +478,29 @@ impl AppStateProcessor {
 
         // Handle case where we only have a snapshot and no patches
         if pl.patches.is_empty() && pl.snapshot.is_some() {
+            state.bootstrapped |= !pl.has_more_patches;
+            self.backend
+                .set_version(collection_name, state.clone())
+                .await?;
+        } else if pl.patches.is_empty()
+            && !pl.has_more_patches
+            && pl.snapshot_ref.is_none()
+            && !had_baseline
+            && pl.error.is_none()
+        {
+            // A bootstrap the server answered with nothing to apply, and nothing
+            // still to come. WA Web records it -- `if (isBootstrap(v))
+            // updateCollectionVersionAndLtHash(0, EMPTY_LT_HASH)` on its "sync X
+            // but there are no updates" branch -- and the record is what stops
+            // the next sync asking for the snapshot again. Without it an account
+            // whose collection is legitimately empty re-requests one forever.
+            //
+            // `has_more_patches` and an undownloaded `snapshot_ref` both mean this
+            // is a page rather than the whole answer. Recording zero for either
+            // would end the bootstrap early: the collection would never ask for a
+            // snapshot again, and a non-genesis patch over its empty ltHash is
+            // refused for good.
+            state.bootstrapped |= !pl.has_more_patches;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
@@ -503,7 +538,11 @@ impl AppStateProcessor {
         let keys = self.get_app_state_key(&key_id).await?;
 
         // Get current hash state — save base version for the caller
-        let mut state = self.backend.get_version(collection_name).await?;
+        let mut state = self
+            .backend
+            .get_version(collection_name)
+            .await?
+            .unwrap_or_default();
         let base_version = state.version;
 
         // Pre-fetch previous value MACs in one backend round-trip, mirroring

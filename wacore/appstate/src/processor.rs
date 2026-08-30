@@ -8,7 +8,7 @@ use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
 use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,34 +100,71 @@ where
     // Validate snapshot MAC if requested. A snapshot that omits `mac`/`key_id` is
     // treated as a validation FAILURE, not skipped: WA Web's anti-tampering
     // compares against the (possibly undefined) mac and fires the recovery path on
-    // mismatch, so a missing mac must not silently accept unverified records.
+    // mismatch, so a missing mac must not silently accept unverified records. It
+    // answers its own variant, though: the two failures need different fixes and
+    // reaching the log as one string cost a production investigation.
     if validate_macs {
         let (Some(mac_expected), Some(key_id)) = (
             snapshot.mac.as_ref(),
             snapshot.key_id.as_option().and_then(|k| k.id.as_deref()),
         ) else {
-            return Err(AppStateError::SnapshotMACMismatch);
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} carries no {}; refusing it rather than accepting unverified records",
+                collection_name,
+                version,
+                if snapshot.mac.is_none() { "MAC" } else { "key id" }
+            );
+            return Err(AppStateError::SnapshotMACMissing);
         };
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-        trace!(
-            target: "AppState",
-            "Snapshot {} v{} MAC validation: computed={}, expected={}",
-            collection_name,
-            version,
-            hex::encode(&computed),
-            hex::encode(mac_expected)
-        );
         if computed != *mac_expected {
+            // The identifying line stays at warn, because a collection that
+            // strands itself has to be visible without turning logging up. The
+            // MACs and the ltHash do not: a snapshot MAC is HMAC output under
+            // the account's app-state key and the ltHash is an aggregate of the
+            // collection's contents, and this failure repeats deterministically
+            // -- at warn it would be a loop pouring key-derived material into a
+            // log people paste into issues.
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch over {} records",
+                collection_name,
+                version,
+                snapshot.records.len()
+            );
+            debug!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}",
+                collection_name,
+                version,
+                hex::encode(&computed),
+                hex::encode(mac_expected),
+                hex::encode(&initial_state.hash[120..])
+            );
             return Err(AppStateError::SnapshotMACMismatch);
         }
+        trace!(
+            target: "AppState",
+            "Snapshot {} v{} MAC validated",
+            collection_name,
+            version
+        );
     }
 
-    // Decode all records and collect MACs in a single pass
-    let mut mutations = Vec::with_capacity(snapshot.records.len());
-    let mut mutation_macs = Vec::with_capacity(snapshot.records.len());
+    // Decode the records and collect MACs in a single pass, over the same keyed
+    // set the ltHash folded. A snapshot that repeats an index has one winner --
+    // the last record for it -- and decoding the losers too would dispatch a
+    // stale mutation beside the winning one. Event delivery is concurrent by
+    // default, so the consumer can apply them in either order and end up with a
+    // contact, mute or label that the snapshot we just authenticated does not
+    // describe.
+    let winners = last_record_per_index(&snapshot.records);
+    let mut mutations = Vec::with_capacity(winners.len());
+    let mut mutation_macs = Vec::with_capacity(winners.len());
 
-    for rec in &snapshot.records {
+    for rec in winners {
         let key_id = rec.key_id.id.as_ref().ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
@@ -483,6 +520,32 @@ pub fn validate_patch_macs(
     Ok(PatchMacVerdict::default())
 }
 
+/// The records a keyed snapshot actually describes: one per index, the last of
+/// any run, plus every record that carries no index and so cannot collide.
+///
+/// Mirrors the `Map` WA Web builds in `WAWebSyncdAntiTampering`, and must stay in
+/// step with [`HashState::update_hash_from_records`] -- the ltHash is folded over
+/// this same set, and a snapshot whose MAC we accepted has to be the snapshot we
+/// then decode.
+fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
+    let mut winners: Vec<&wa::SyncdRecord> = Vec::with_capacity(records.len());
+    let mut seen: Vec<&[u8]> = Vec::new();
+    // Backwards, so the first hit for an index is its last record.
+    for rec in records.iter().rev() {
+        match rec.index.as_option().and_then(|idx| idx.blob.as_deref()) {
+            Some(index_mac) => {
+                if !seen.contains(&index_mac) {
+                    seen.push(index_mac);
+                    winners.push(rec);
+                }
+            }
+            None => winners.push(rec),
+        }
+    }
+    winners.reverse();
+    winners
+}
+
 /// Validate a snapshot MAC.
 ///
 /// This is a pure function that validates the snapshot MAC without any I/O.
@@ -495,7 +558,7 @@ pub fn validate_snapshot_mac(
     // A missing snapshot mac is a validation failure, not a skip (matches WA Web
     // and process_snapshot's enforced gate).
     let Some(mac_expected) = snapshot.mac.as_ref() else {
-        return Err(AppStateError::SnapshotMACMismatch);
+        return Err(AppStateError::SnapshotMACMissing);
     };
     let computed = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
     if computed != *mac_expected {
@@ -656,7 +719,10 @@ mod tests {
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot mac must fail when validating");
-        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+        assert!(
+            matches!(err, AppStateError::SnapshotMACMissing),
+            "a snapshot with no MAC must be distinguishable from one whose MAC differs, got {err:?}"
+        );
     }
 
     #[test]
@@ -682,7 +748,10 @@ mod tests {
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot key_id must fail when validating");
-        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+        assert!(
+            matches!(err, AppStateError::SnapshotMACMissing),
+            "no key id means nothing to compare against, not a differing MAC, got {err:?}"
+        );
     }
 
     /// Deterministic reproduction of the fresh-pairing race that PR #972 works
@@ -855,6 +924,7 @@ mod tests {
             hash: [hash; 128],
             index_value_map: HashMap::new(),
             mac_mismatch_fatal: false,
+            bootstrapped: false,
         }
     }
 

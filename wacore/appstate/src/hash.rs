@@ -28,6 +28,24 @@ pub struct HashState {
     /// to be trusted again.
     #[serde(default)]
     pub mac_mismatch_fatal: bool,
+    /// Whether a bootstrap reached its terminal page.
+    ///
+    /// Set only when the run that persisted this state was not still paging, so
+    /// a partial bootstrap -- page five of sixty, then a deferral -- leaves it
+    /// false even though the version has moved. That is what makes it safe to
+    /// ask before building an outgoing patch, where a cursor behind the head
+    /// earns a 409 that the send has to unwind.
+    ///
+    /// Presence of a record cannot answer that on its own: a collection that has
+    /// never synced and one that synced and is legitimately empty are both
+    /// version 0 with an all-zero ltHash, byte for byte. WA Web distinguishes
+    /// them by whether a record exists at all, because it writes one on the
+    /// "no updates" branch; we carry the fact explicitly so a row written by an
+    /// older build -- which wrote version 0 for an interrupted bootstrap too --
+    /// decodes to false and bootstraps once more rather than asking for patches
+    /// its empty ltHash can never accept.
+    #[serde(default)]
+    pub bootstrapped: bool,
 }
 
 impl Default for HashState {
@@ -37,7 +55,28 @@ impl Default for HashState {
             hash: [0; 128],
             index_value_map: HashMap::new(),
             mac_mismatch_fatal: false,
+            bootstrapped: false,
         }
+    }
+}
+
+impl HashState {
+    /// Whether there is a real ltHash here to apply patches on top of.
+    ///
+    /// This is the question `return_snapshot` answers: a version past zero proves
+    /// a baseline was established, since patches only apply over one. Only
+    /// version zero is ambiguous -- never synced and synced-but-empty are
+    /// byte-identical there -- and that is the case [`HashState::bootstrapped`]
+    /// decides. Asking for the flag alone would make every account re-download a
+    /// snapshot per collection on upgrade, for something the version already
+    /// answers.
+    ///
+    /// It is deliberately *not* the question to ask before building an outgoing
+    /// patch. A run that persisted page five of sixty and then stopped has a
+    /// baseline and is still behind the head; [`HashState::bootstrapped`] is what
+    /// says a bootstrap actually finished.
+    pub fn has_baseline(&self) -> bool {
+        self.bootstrapped || self.version > 0
     }
 }
 
@@ -50,6 +89,15 @@ pub struct HashUpdateResult {
     /// it must not make MAC validation failures non-fatal.
     pub has_missing_remove: bool,
 }
+
+/// Count of *records carrying an index* at or below which
+/// [`HashState::update_hash_from_records`] dedups with a linear scan instead of
+/// a sort; above it the sort wins despite ordering every entry. Note this counts
+/// records, not distinct indices: a snapshot of 200 records over 100 indices
+/// takes the sorted branch. Mirrors `MAC_DEDUP_SCAN_LIMIT` in `wacore`'s
+/// appstate sync, which measured the same trade-off over the same kind of key
+/// (#856).
+const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 impl HashState {
     pub fn update_hash<F>(
@@ -152,23 +200,76 @@ impl HashState {
         (result, Ok(()))
     }
 
-    /// Update hash state from snapshot records directly (avoids cloning into SyncdMutation).
+    /// Fold a snapshot's records into the ltHash.
     ///
-    /// This is an optimized version for snapshots where all operations are SET
-    /// and there are no previous values to look up.
+    /// Takes the records directly rather than cloning into `SyncdMutation`:
+    /// a snapshot is all SETs with no previous values to look up.
+    ///
+    /// A snapshot is keyed by index, not a list: WA Web builds
+    /// `new Map(records.map(r => [hex(r.index.blob), valueMac(r.value.blob)]))`
+    /// and folds `[...map.values()]` (`WAWebSyncdAntiTampering`), so when a
+    /// snapshot carries the same index twice only the last record counts.
+    /// Folding both instead leaves the ltHash one value MAC heavier than the one
+    /// the server signed, and the snapshotMac can then never match — the
+    /// collection is unsyncable for good, every recovery path answering
+    /// `snapshot MAC mismatch`. The store already keys the same way
+    /// (`put_mutation_macs`, `on_conflict((name, index_mac, device_id))`), so
+    /// before this the ltHash and the store disagreed about the same snapshot.
+    ///
+    /// One deliberate difference from that Map: a record whose value blob is
+    /// shorter than a MAC is dropped before the dedup, so the winner is the last
+    /// *usable* record for an index rather than the last one. WA Web slices with
+    /// a negative index there and folds the truncated buffer instead. Both are
+    /// answers to a record the server should never send; ours refuses to fold
+    /// something that is not a MAC.
     pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) {
-        // Collect slices directly — no Vec<u8> allocation per MAC.
-        let added: Vec<&[u8]> = records
-            .iter()
-            .filter_map(|record| {
-                record
-                    .value
-                    .blob
-                    .as_ref()
-                    .filter(|blob| blob.len() >= 32)
-                    .map(|blob| &blob[blob.len() - 32..])
-            })
-            .collect();
+        // Borrow the MAC tails; no Vec<u8> allocation per MAC.
+        let mut added: Vec<&[u8]> = Vec::with_capacity(records.len());
+        let mut indexed: Vec<(&[u8], &[u8])> = Vec::with_capacity(records.len());
+
+        for record in records {
+            let Some(value_mac) = record
+                .value
+                .blob
+                .as_ref()
+                .filter(|blob| blob.len() >= 32)
+                .map(|blob| &blob[blob.len() - 32..])
+            else {
+                continue;
+            };
+
+            match record.index.as_option().and_then(|idx| idx.blob.as_deref()) {
+                // Keyed: the last record for this index is the one that counts.
+                Some(index_mac) => indexed.push((index_mac, value_mac)),
+                // Unkeyed records cannot collide, so they always fold.
+                None => added.push(value_mac),
+            }
+        }
+
+        if indexed.len() <= MAC_DEDUP_SCAN_LIMIT {
+            // Index MACs are HMAC outputs (uniformly random), so at these sizes a
+            // linear scan beats a SipHash set — the same trade-off as
+            // collect_unique_index_macs (#856). Walking backwards makes the first
+            // hit the last record, which is the one WA Web's Map keeps.
+            let mut seen: Vec<&[u8]> = Vec::with_capacity(indexed.len());
+            for (index_mac, value_mac) in indexed.iter().rev() {
+                if !seen.contains(index_mac) {
+                    seen.push(index_mac);
+                    added.push(value_mac);
+                }
+            }
+        } else {
+            // Above the scan limit the sort wins despite ordering every entry.
+            // `sort_by` is stable, so within one index the encounter order — and
+            // therefore which record is last — survives.
+            indexed.sort_by(|a, b| a.0.cmp(b.0));
+            let mut rest = indexed.as_slice();
+            while let Some((index_mac, _)) = rest.first() {
+                let run = rest.partition_point(|(candidate, _)| candidate == index_mac);
+                added.push(rest[run - 1].1);
+                rest = &rest[run..];
+            }
+        }
 
         WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
     }
@@ -537,5 +638,222 @@ mod tests {
             actual, expected,
             "generate_patch_mac output must match manual HMAC-SHA256 computation"
         );
+    }
+
+    fn record_with(index_mac: &[u8], value_mac: &[u8]) -> wa::SyncdRecord {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(value_mac);
+        wa::SyncdRecord {
+            index: buffa::MessageField::some(wa::SyncdIndex {
+                blob: Some(index_mac.to_vec()),
+            }),
+            value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(b"test_key_id".to_vec()),
+            }),
+        }
+    }
+
+    /// Production symptom: `regular_low` never syncs again, every recovery path
+    /// answering `snapshot MAC mismatch`, because a snapshot carrying the same
+    /// index twice folds both value MACs into the ltHash.
+    ///
+    /// WA Web keys the records by index before folding
+    /// (`WAWebSyncdAntiTampering`: `new Map(records.map(r => [hex(r.index.blob),
+    /// valueMac(r.value.blob)]))`, then `add(EMPTY_LT_HASH, [...d.values()])`),
+    /// so the last record for an index is the only one that counts.
+    #[test]
+    fn a_repeated_index_in_a_snapshot_folds_only_its_last_value() {
+        const INDEX_A: &[u8] = &[1u8; 32];
+        const INDEX_B: &[u8] = &[2u8; 32];
+        const STALE: &[u8] = &[0xAAu8; 32];
+        const WINNER: &[u8] = &[0xBBu8; 32];
+        const OTHER: &[u8] = &[0xCCu8; 32];
+
+        let records = vec![
+            record_with(INDEX_A, STALE),
+            record_with(INDEX_A, WINNER),
+            record_with(INDEX_B, OTHER),
+        ];
+
+        let mut state = HashState::default();
+        state.update_hash_from_records(&records);
+
+        let mut expected = [0u8; 128];
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(
+            &mut expected,
+            &[] as &[&[u8]],
+            &[WINNER, OTHER],
+        );
+
+        assert_eq!(
+            state.hash, expected,
+            "a repeated index must contribute only its last value MAC, as WA Web's Map does"
+        );
+    }
+
+    /// Review of #1365: a bootstrap that persisted page five of sixty and then
+    /// stopped has a baseline and is still behind the head. Reading a positive
+    /// version as a finished bootstrap let the send guard skip its preflight and
+    /// build the user's patch on that cursor.
+    #[test]
+    fn a_partial_bootstrap_has_a_baseline_but_has_not_bootstrapped() {
+        let partial = HashState {
+            version: 5,
+            ..Default::default()
+        };
+        assert!(
+            partial.has_baseline(),
+            "page five established a baseline, so patches apply over it"
+        );
+        assert!(
+            !partial.bootstrapped,
+            "but the run never reached its terminal page"
+        );
+    }
+
+    /// The upgrade case the baseline question exists for: a row written before
+    /// the flag existed, sitting on real data.
+    #[test]
+    fn a_legacy_row_past_zero_still_counts_as_having_a_baseline() {
+        let legacy = HashState {
+            version: 7,
+            ..Default::default()
+        };
+        assert!(
+            legacy.has_baseline(),
+            "asking such a row for a snapshot would re-download one per collection \
+             on upgrade, for something the version already answers"
+        );
+    }
+
+    /// Version zero is the ambiguous case, and the only one the flag decides.
+    #[test]
+    fn at_version_zero_only_the_flag_separates_never_synced_from_empty() {
+        let never = HashState::default();
+        let empty_but_synced = HashState {
+            bootstrapped: true,
+            ..Default::default()
+        };
+        assert_eq!(never.version, empty_but_synced.version);
+        assert_eq!(never.hash, empty_but_synced.hash);
+        assert!(!never.has_baseline());
+        assert!(empty_but_synced.has_baseline());
+    }
+
+    /// The branch production actually takes. `MAC_DEDUP_SCAN_LIMIT` counts
+    /// records carrying an index, not distinct indices, so any real snapshot --
+    /// `regular_low` on an active account is hundreds of records -- sorts rather
+    /// than scans. The linear branch the other tests exercise is the one a real
+    /// account almost never reaches.
+    #[test]
+    fn a_repeated_index_is_deduped_above_the_scan_limit_too() {
+        const DUPLICATED: &[u8] = &[0xEEu8; 32];
+        const STALE: &[u8] = &[0x11u8; 32];
+        const WINNER: &[u8] = &[0x22u8; 32];
+
+        // Comfortably past the limit, so this takes the sorted branch.
+        let filler = MAC_DEDUP_SCAN_LIMIT * 2;
+        let mut records = Vec::with_capacity(filler + 2);
+        let mut expected_macs: Vec<[u8; 32]> = Vec::with_capacity(filler + 1);
+
+        // The stale copy first, and the winner last, with the whole filler set
+        // between them: the sort has to keep encounter order within the index.
+        records.push(record_with(DUPLICATED, STALE));
+        for i in 0..filler {
+            let mut index_mac = [0u8; 32];
+            index_mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let mac = [(i % 251) as u8; 32];
+            records.push(record_with(&index_mac, &mac));
+            expected_macs.push(mac);
+        }
+        records.push(record_with(DUPLICATED, WINNER));
+        expected_macs.push(*<&[u8; 32]>::try_from(WINNER).unwrap());
+
+        let mut state = HashState::default();
+        state.update_hash_from_records(&records);
+
+        let added: Vec<&[u8]> = expected_macs.iter().map(|m| m.as_slice()).collect();
+        let mut expected = [0u8; 128];
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut expected, &[] as &[&[u8]], &added);
+
+        assert_eq!(
+            state.hash, expected,
+            "above the scan limit the sort must still keep the last record for a \
+             repeated index, and only that one"
+        );
+    }
+
+    /// Three records under one index, the winner in last place. Guards
+    /// `rest[run - 1]` against picking the middle of a run.
+    #[test]
+    fn the_last_of_a_run_of_three_is_the_one_that_folds() {
+        const INDEX: &[u8] = &[7u8; 32];
+        const FIRST: &[u8] = &[0xA1u8; 32];
+        const MIDDLE: &[u8] = &[0xA2u8; 32];
+        const LAST: &[u8] = &[0xA3u8; 32];
+
+        let records = vec![
+            record_with(INDEX, FIRST),
+            record_with(INDEX, MIDDLE),
+            record_with(INDEX, LAST),
+        ];
+
+        let mut state = HashState::default();
+        state.update_hash_from_records(&records);
+
+        let mut expected = [0u8; 128];
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut expected, &[] as &[&[u8]], &[LAST]);
+
+        assert_eq!(
+            state.hash, expected,
+            "a run of three must fold its last record, not its first or middle"
+        );
+    }
+
+    /// The ordinary snapshot: every index distinct. Guards the dedup from
+    /// changing what it must not change.
+    #[test]
+    fn distinct_indices_in_a_snapshot_all_fold() {
+        const MAC_1: &[u8] = &[0x11u8; 32];
+        const MAC_2: &[u8] = &[0x22u8; 32];
+
+        let records = vec![
+            record_with(&[1u8; 32], MAC_1),
+            record_with(&[2u8; 32], MAC_2),
+        ];
+
+        let mut state = HashState::default();
+        state.update_hash_from_records(&records);
+
+        let mut expected = [0u8; 128];
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(
+            &mut expected,
+            &[] as &[&[u8]],
+            &[MAC_1, MAC_2],
+        );
+
+        assert_eq!(state.hash, expected);
+    }
+
+    /// A record with no index cannot be keyed, so it folds unconditionally —
+    /// the arm the dedup must leave alone.
+    #[test]
+    fn a_record_without_an_index_still_folds() {
+        const MAC: &[u8] = &[0x44u8; 32];
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(MAC);
+        let record = wa::SyncdRecord {
+            value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+            ..Default::default()
+        };
+
+        let mut state = HashState::default();
+        state.update_hash_from_records(&[record]);
+
+        let mut expected = [0u8; 128];
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut expected, &[] as &[&[u8]], &[MAC]);
+
+        assert_eq!(state.hash, expected);
     }
 }
