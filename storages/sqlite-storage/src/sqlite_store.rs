@@ -4094,6 +4094,208 @@ mod tests {
             .expect("Failed to create test store")
     }
 
+    /// The legacy-spelling normalisation, run against the migration file itself
+    /// so the SQL under test cannot drift from the SQL that ships.
+    ///
+    /// Two halves matter equally: the JID-rendered keys move, and the Signal
+    /// address columns do not. `@c.us` is the correct, current spelling of a
+    /// Signal address (it is what WA Web uses, and `mapped_server` still writes
+    /// it), so rewriting one would orphan every established session -- the
+    /// opposite of what this migration is for.
+    #[tokio::test]
+    async fn the_normalisation_migration_moves_jids_and_leaves_signal_addresses() {
+        use diesel::connection::SimpleConnection;
+
+        const NORMALISE: &str =
+            include_str!("../migrations/2026-08-31-000000_normalize_legacy_user_server/up.sql");
+
+        let store = create_test_store().await;
+        let pool = store.pool.clone();
+        let mut conn = pool.get().expect("a connection");
+
+        conn.batch_execute(
+            "INSERT INTO tc_tokens (jid, token, token_timestamp, device_id, updated_at)
+                  VALUES ('15550000001@c.us', x'01', 0, 1, 0),
+                         ('15550000002@s.whatsapp.net', x'02', 0, 1, 0),
+                         ('120363000000000000@g.us', x'03', 0, 1, 0);
+             INSERT INTO sent_messages (chat_jid, message_id, payload, device_id, created_at)
+                  VALUES ('15550000001@c.us', 'M1', x'01', 1, 0);
+             INSERT INTO device_registry (user_id, devices_json, timestamp, device_id, updated_at)
+                  VALUES ('15550000001@c.us', '[]', 0, 1, 0);
+             INSERT INTO sessions (address, record, device_id)
+                  VALUES ('15550000001@c.us.0', x'01', 1);
+             INSERT INTO sender_keys (address, record, device_id)
+                  VALUES ('120363000000000000@g.us:15550000001@c.us.0', x'01', 1);",
+        )
+        .expect("seed rows");
+
+        conn.batch_execute(NORMALISE).expect("the migration runs");
+
+        let scalar = |conn: &mut _, sql: &str| -> String {
+            diesel::dsl::sql::<diesel::sql_types::Text>(sql)
+                .get_result::<String>(conn)
+                .expect("one row")
+        };
+
+        assert_eq!(
+            scalar(&mut *conn, "SELECT jid FROM tc_tokens WHERE token = x'01'"),
+            "15550000001@s.whatsapp.net"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT chat_jid FROM sent_messages"),
+            "15550000001@s.whatsapp.net"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT user_id FROM device_registry"),
+            "15550000001@s.whatsapp.net"
+        );
+        // Untouched: a group is not in this namespace, and one already spelled
+        // the modern way must not be double-rewritten.
+        assert_eq!(
+            scalar(&mut *conn, "SELECT jid FROM tc_tokens WHERE token = x'02'"),
+            "15550000002@s.whatsapp.net"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT jid FROM tc_tokens WHERE token = x'03'"),
+            "120363000000000000@g.us"
+        );
+        // The Signal addresses, both the plain one and the one that carries an
+        // address in the middle of a longer key.
+        assert_eq!(
+            scalar(&mut *conn, "SELECT address FROM sessions"),
+            "15550000001@c.us.0"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT address FROM sender_keys"),
+            "120363000000000000@g.us:15550000001@c.us.0"
+        );
+    }
+
+    /// Both spellings of one key collide when the legacy one is rewritten, and
+    /// which row survives decides what the client believes. The rule is that a
+    /// legacy row never displaces a canonical one: the legacy row is dropped,
+    /// the canonical row is left untouched, and only an uncontested legacy row
+    /// is rewritten. The collision must also never abort the migration, which
+    /// would leave the database unopenable.
+    ///
+    /// `UPDATE OR REPLACE` alone gets this backwards -- it keeps the row being
+    /// rewritten, which is the legacy one -- and that is the case with a real
+    /// consequence: a stale device list replacing a current one, which
+    /// `get_devices` would then serve until the next refresh.
+    #[tokio::test]
+    async fn the_normalisation_migration_never_lets_a_legacy_row_displace_a_canonical_one() {
+        use diesel::connection::SimpleConnection;
+
+        const NORMALISE: &str =
+            include_str!("../migrations/2026-08-31-000000_normalize_legacy_user_server/up.sql");
+
+        let store = create_test_store().await;
+        let mut conn = store.pool.get().expect("a connection");
+
+        // Peer 1: both spellings, so the canonical row survives whole.
+        // Peer 2: legacy only, so it is rewritten.
+        // The device_registry pair is the one that matters in practice.
+        // sender_key_devices: the same device under both spellings in group A,
+        // and legacy-only in group B -- the second must survive, because
+        // `group_jid` is part of the key and a counterpart in another group is
+        // not a counterpart at all.
+        conn.batch_execute(
+            r#"INSERT INTO tc_tokens (jid, token, token_timestamp, device_id, updated_at)
+                    VALUES ('15550000001@c.us',           x'01', 0, 1, 99),
+                           ('15550000001@s.whatsapp.net', x'02', 0, 1, 1),
+                           ('15550000002@c.us',           x'03', 0, 1, 5);
+               INSERT INTO device_registry (user_id, devices_json, timestamp, device_id, updated_at)
+                    VALUES ('15550000001@c.us',           '["stale"]', 0, 1, 99),
+                           ('15550000001@s.whatsapp.net', '["live"]',  0, 1, 1);
+               INSERT INTO sender_key_devices (group_jid, device_jid, has_key, device_id, updated_at)
+                    VALUES ('120363000000000001@g.us', '15550000001@c.us',           1, 1, 0),
+                           ('120363000000000001@g.us', '15550000001@s.whatsapp.net', 0, 1, 0),
+                           ('120363000000000002@g.us', '15550000001@c.us',           1, 1, 0);"#,
+        )
+        .expect("seed both spellings of the same keys");
+
+        conn.batch_execute(NORMALISE)
+            .expect("a collision must not abort the migration");
+
+        let scalar = |conn: &mut _, sql: &str| -> String {
+            diesel::dsl::sql::<diesel::sql_types::Text>(sql)
+                .get_result::<String>(conn)
+                .expect("one row")
+        };
+        let count = |conn: &mut _, sql: &str| -> i64 {
+            diesel::dsl::sql::<diesel::sql_types::BigInt>(sql)
+                .get_result::<i64>(conn)
+                .expect("one row")
+        };
+
+        assert_eq!(
+            count(&mut *conn, "SELECT count(*) FROM tc_tokens"),
+            2,
+            "one row per peer"
+        );
+        assert_eq!(
+            count(
+                &mut *conn,
+                "SELECT count(*) FROM tc_tokens WHERE jid LIKE '%@c.us'"
+            ),
+            0,
+            "and none of them spelled the old way"
+        );
+        assert_eq!(
+            scalar(
+                &mut *conn,
+                "SELECT hex(token) FROM tc_tokens WHERE jid = '15550000001@s.whatsapp.net'"
+            ),
+            "02",
+            "the canonical row survives even though the legacy one is newer"
+        );
+        assert_eq!(
+            scalar(
+                &mut *conn,
+                "SELECT hex(token) FROM tc_tokens WHERE jid = '15550000002@s.whatsapp.net'"
+            ),
+            "03",
+            "an uncontested legacy row is just rewritten"
+        );
+
+        // The case with a real consequence: a stale device list must not
+        // displace the current one.
+        assert_eq!(count(&mut *conn, "SELECT count(*) FROM device_registry"), 1);
+        assert_eq!(
+            scalar(
+                &mut *conn,
+                "SELECT devices_json FROM device_registry WHERE user_id = '15550000001@s.whatsapp.net'"
+            ),
+            r#"["live"]"#,
+            "the canonical device list must win"
+        );
+
+        // Both groups keep a row, and both are canonical. The colliding group
+        // keeps its canonical `has_key = 0`, so a forget mark is not undone by
+        // a stale `1`; the other group's legacy-only row is simply rewritten.
+        assert_eq!(
+            count(&mut *conn, "SELECT count(*) FROM sender_key_devices"),
+            2,
+            "a counterpart in another group is not a counterpart"
+        );
+        assert_eq!(
+            count(
+                &mut *conn,
+                "SELECT count(*) FROM sender_key_devices WHERE device_jid = '15550000001@s.whatsapp.net'"
+            ),
+            2,
+            "and both reference the canonical device"
+        );
+        assert_eq!(
+            count(
+                &mut *conn,
+                "SELECT has_key FROM sender_key_devices WHERE group_jid = '120363000000000001@g.us'"
+            ),
+            0,
+            "the canonical forget mark survives the collision"
+        );
+    }
+
     /// `delete_version` is how a rebuild is expressed, so what it does to a row
     /// that is not there, and to another device's row, is load-bearing.
     #[tokio::test]
