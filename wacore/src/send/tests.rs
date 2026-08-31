@@ -2653,6 +2653,57 @@ mod stanza_type {
     }
 
     #[test]
+    fn rich_response_is_text() {
+        let m = wa::Message {
+            rich_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), None);
+        assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn bot_forwarded_classifies_by_inner() {
+        let rich = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                rich_response_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&rich), stanza::MSG_TYPE_TEXT);
+        assert_eq!(media_type_from_message(&rich), None);
+
+        let img = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                image_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
+        assert_eq!(media_type_from_message(&img), Some("image"));
+
+        let vazio = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&vazio), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn lottie_behind_bot_forwarded_stays_sticker() {
+        let m = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                lottie_sticker_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), Some("sticker"));
+    }
+
+    #[test]
     fn backfilled_wrappers_classify_by_inner() {
         let spoiler = wa::Message {
             spoiler_message: buffa::MessageField::some(fpm(text_inner())),
