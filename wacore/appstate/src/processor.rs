@@ -8,7 +8,7 @@ use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
 use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
-use log::{debug, trace, warn};
+use log::{Level, debug, log_enabled, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,7 +86,7 @@ where
     initial_state.version = version;
 
     // Update hash state directly from records (no cloning needed)
-    initial_state.update_hash_from_records(&snapshot.records);
+    let folded = initial_state.update_hash_from_records(&snapshot.records);
 
     debug!(
         target: "AppState",
@@ -120,6 +120,56 @@ where
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
         if computed != *mac_expected {
+            // Two things can produce this, and they need opposite fixes: the key
+            // we derived is wrong, or the ltHash we folded is. They are
+            // indistinguishable from the MACs alone, and the MAC is checked
+            // before any record is decoded -- so nothing downstream ever gets to
+            // disagree. Decoding one record answers it: the value MAC inside it
+            // is derived from the same expanded key, so a record that decodes
+            // proves the key is right and points at the fold.
+            // Only when someone is reading: decoding a record costs an AES pass, a
+            // MAC and a protobuf parse, and this arm is reached on every page of
+            // a collection that is failing.
+            // Only when someone is reading: decoding a record costs an AES pass, a
+            // MAC and a protobuf parse, and this arm is reached on every page of
+            // a collection that is failing.
+            let key_probe = if log_enabled!(target: "AppState", Level::Debug) {
+                // The question is whether *this* key is right, and `computed` was
+                // made with the snapshot's. A record keyed with some other id
+                // answers about that other key: decoding it proves nothing here,
+                // and failing to decode it accuses a key the snapshot never
+                // claimed. Across an app-state key rotation a snapshot may carry
+                // both, so the record has to be chosen, not taken.
+                match snapshot
+                    .records
+                    .iter()
+                    .find(|rec| rec.key_id.id.as_deref() == Some(key_id))
+                {
+                    None => "inconclusive: no record is keyed with the snapshot's own key id"
+                        .to_string(),
+                    Some(rec) => match decode_record(
+                        wa::syncd_mutation::SyncdOperation::SET,
+                        rec,
+                        &keys,
+                        key_id,
+                        true,
+                    ) {
+                        // Says what it proved and no more. The key validating one
+                        // record does not make the fold the culprit: a stale or
+                        // truncated expected MAC produces this same mismatch with
+                        // a fold that is perfectly correct.
+                        Ok(_) => "the snapshot's key decodes its own record".to_string(),
+                        // The class, not just the fact: `decode_record` refuses
+                        // for a bad content MAC, a failed decryption, a malformed
+                        // value and a missing index MAC, and only some of those
+                        // are about the key.
+                        Err(e) => format!("the snapshot's key failed on its own record: {e}"),
+                    },
+                }
+            } else {
+                "not probed".to_string()
+            };
+
             // The identifying line stays at warn, because a collection that
             // strands itself has to be visible without turning logging up. The
             // MACs and the ltHash do not: a snapshot MAC is HMAC output under
@@ -136,12 +186,16 @@ where
             );
             debug!(
                 target: "AppState",
-                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}",
+                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}, \
+                 the fold folded {} of {} records, key probe says {}",
                 collection_name,
                 version,
                 hex::encode(&computed),
                 hex::encode(mac_expected),
-                hex::encode(&initial_state.hash[120..])
+                hex::encode(&initial_state.hash[120..]),
+                folded,
+                snapshot.records.len(),
+                key_probe
             );
             return Err(AppStateError::SnapshotMACMismatch);
         }
