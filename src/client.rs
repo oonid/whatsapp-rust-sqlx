@@ -1535,10 +1535,29 @@ pub struct Client {
     /// Flips only AFTER the drain-tail commit, so the tail's acks still join
     /// the aggregate offline-receipt drain.
     pub(crate) offline_sync_completed: Arc<AtomicBool>,
-    /// Once-guard for the drain finisher (the semaphore swap is not
-    /// idempotent). Separate from `offline_sync_completed` because the finish
-    /// runs off the read loop and the flag must flip only after its commit.
-    pub(crate) offline_sync_finish_started: Arc<AtomicBool>,
+    /// Highest connection generation whose drain finisher has started, held as
+    /// `generation + 1` so zero reads as "none yet". Separate from
+    /// `offline_sync_completed` because the finish runs off the read loop and
+    /// that flag must flip only after its commit.
+    ///
+    /// A once-guard because the semaphore swap is not idempotent, and stamped
+    /// with the generation for the same reason the terminal report is: a
+    /// completion descheduled past its own connection would otherwise claim
+    /// the boolean after a teardown cleared it, and the next connection's
+    /// completion would find the guard taken and never start a finisher.
+    pub(crate) offline_sync_finish_started: Arc<AtomicU64>,
+    /// Highest connection generation whose resume already published a terminal
+    /// event, either `OfflineSyncCompleted` or `OfflineSyncInterrupted`, held
+    /// as `generation + 1` so zero reads as "none yet".
+    ///
+    /// Monotonic rather than a boolean that something clears, because the
+    /// publications race in two directions. The finisher runs detached and
+    /// checks the generation before publishing, so it can pass that check and
+    /// then be descheduled past a teardown, past a reconnect, and past the
+    /// next drain's preview. A claim therefore fails both for a drain already
+    /// reported and for one a *newer* drain has overtaken, and nothing has to
+    /// reopen the guard for the next drain: its own higher stamp does that.
+    pub(crate) offline_terminal_reported: Arc<AtomicU64>,
     /// Delivery receipts buffered during offline sync, flushed as aggregate
     /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
     /// Empty (zero capacity) outside the offline window.
@@ -1775,6 +1794,16 @@ pub struct Client {
     /// holds it around the settle. Lock order is always this-gate → processing
     /// permit / sessions lock, so no inversion.
     pub(crate) signal_flush_lifecycle: Mutex<()>,
+    /// Serializes a drain's end against the teardown that retires it.
+    ///
+    /// The generation stamp decides *who* reports, but the finisher runs
+    /// detached, so without this its check and its publication interleave with
+    /// the teardown's own resets: the winner's writes could land on either
+    /// side of them, and a semaphore widened after the reset would follow the
+    /// next connection into its drain. Held across the claim and everything it
+    /// publishes on one side, and across the teardown's offline resets on the
+    /// other.
+    pub(crate) offline_terminal_lock: Mutex<()>,
     /// Injected failures for the coalesced flush (consumed one per attempt),
     /// so tests can exercise the retry/backoff path deterministically.
     #[cfg(test)]

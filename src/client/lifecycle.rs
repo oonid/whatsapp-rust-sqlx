@@ -516,7 +516,8 @@ impl Client {
             signed_pre_key_rotation_lock: Arc::new(Mutex::new(())),
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
-            offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
+            offline_sync_finish_started: Arc::new(AtomicU64::new(0)),
+            offline_terminal_reported: Arc::new(AtomicU64::new(0)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
@@ -536,6 +537,7 @@ impl Client {
             subsystems: subsystem::Subsystems::default(),
             signal_flush_state: AtomicU64::new(0),
             signal_flush_lifecycle: Mutex::new(()),
+            offline_terminal_lock: Mutex::new(()),
             #[cfg(test)]
             signal_flush_test_failures: AtomicU32::new(0),
             #[cfg(test)]
@@ -1051,9 +1053,15 @@ impl Client {
         // refuse the login. `run` already clears it before each attempt; a
         // caller driving connections itself has nowhere else to learn of it.
         self.expected_disconnect.store(false, Ordering::Relaxed);
+        // Runs before the flags it reads are cleared below. Teardown normally
+        // reported the interruption already and this is a no-op; it covers the
+        // paths that reach a new attempt without one. The current generation
+        // is the right stamp here: this connection has not logged in yet, so
+        // its own drain arms at a higher one.
+        self.abandon_offline_sync_if_interrupted(
+            self.connection_generation.load(Ordering::Acquire),
+        );
         self.offline_sync_completed.store(false, Ordering::Relaxed);
-        self.offline_sync_finish_started
-            .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
         // them on this fresh connection. The cache decision is coupled to the
@@ -1724,10 +1732,7 @@ impl Client {
         // process_classified_message — no decrypt can START after the
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
-        #[cfg(feature = "client-lifecycle")]
         let closed_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst);
-        #[cfg(not(feature = "client-lifecycle"))]
-        self.connection_generation.fetch_add(1, Ordering::SeqCst);
         #[cfg(feature = "client-lifecycle")]
         let scope_close = self.lifecycle.as_ref().map(|lifecycle| {
             let lifecycle = Arc::clone(lifecycle);
@@ -1843,10 +1848,16 @@ impl Client {
         // connection don't trigger an immediate reconnect on the next one.
         self.stats.reset_connection_activity();
         self.pending_device_sync.clear();
-        // Reset offline sync state for next connection
+        // Reset offline sync state for next connection, under the lock the
+        // finisher publishes beneath: whichever of the two wins the stamp, its
+        // writes land wholly before or wholly after the other's, so a widened
+        // semaphore can never survive into the next connection's drain.
+        // The report is stamped with the generation being retired, not the one
+        // just installed, so it silences that drain's own stale finisher
+        // without claiming the slot the next drain will need.
+        let terminal_gate = self.offline_terminal_lock.lock().await;
+        self.abandon_offline_sync_if_interrupted(closed_generation);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
-        self.offline_sync_finish_started
-            .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Same rule as receipts: uncommitted entries drop here and the server
         // redelivers them on the next connect. The cache falls with dropped
@@ -1874,6 +1885,7 @@ impl Client {
             Ok(mut guard) => *guard = None,
             Err(poison) => *poison.into_inner() = None,
         }
+        drop(terminal_gate);
         self.history_sync_activity.reset();
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.
