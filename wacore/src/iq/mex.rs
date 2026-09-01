@@ -105,6 +105,21 @@ impl MexGraphQLError {
     }
 }
 
+/// Code reported for a fatal MEX error whose payload carried none.
+const DEFAULT_MEX_ERROR_CODE: i32 = 500;
+
+/// A GraphQL error the server marked fatal, raised as a typed error so the
+/// code survives the trip: the IQ layer wraps this in `IqError::ParseError`,
+/// which keeps the source, and a caller that cares about a particular code
+/// (a MEX 404 is how the server says "nothing here") downcasts to it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("MEX fatal error (query={query}, code={code}): {message}")]
+pub struct MexFatalError {
+    pub query: &'static str,
+    pub code: i32,
+    pub message: String,
+}
+
 /// MEX GraphQL response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MexResponse {
@@ -225,13 +240,12 @@ impl IqSpec for MexQuerySpec {
                     self.doc.name, self.doc.id, fatal.message
                 );
             }
-            let code = fatal.error_code().unwrap_or(500);
-            return Err(anyhow!(
-                "MEX fatal error (query={}, code={}): {}",
-                self.doc.name,
-                code,
-                fatal.message
-            ));
+            return Err(MexFatalError {
+                query: self.doc.name,
+                code: fatal.error_code().unwrap_or(DEFAULT_MEX_ERROR_CODE),
+                message: fatal.message.clone(),
+            }
+            .into());
         }
 
         Ok(mex_response)
@@ -363,5 +377,36 @@ mod tests {
         assert!(!looks_like_stale_persisted_query(&mk(
             "Group does not exist"
         )));
+    }
+
+    /// The whole point of the typed error: a fatal GraphQL code has to survive
+    /// `parse_response`, because the IQ layer erases everything else about it
+    /// and a caller reads a MEX 404 as "nothing here" rather than as a failure.
+    #[test]
+    fn a_fatal_graphql_code_survives_parse_response() {
+        let spec = MexQuerySpec::new(TEST_DOC, &json!({})).expect("serialize test variables");
+        let payload = json!({
+            "data": null,
+            "errors": [{
+                "message": "no username",
+                "extensions": {"error_code": 404, "is_retryable": false, "severity": "CRITICAL"}
+            }]
+        })
+        .to_string();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("result")
+                .bytes(payload.into_bytes())
+                .build()])
+            .build();
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a fatal error must fail the parse");
+        let fatal = error
+            .downcast_ref::<MexFatalError>()
+            .expect("the fatal error keeps its type");
+        assert_eq!(fatal.code, 404);
+        assert_eq!(fatal.query, TEST_DOC.name);
     }
 }
