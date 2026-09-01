@@ -511,11 +511,10 @@ mod tests {
     #[tokio::test]
     async fn companion_reg_refresh_waits_for_a_pending_pair_success() {
         use wacore::libsignal::protocol::KeyPair;
-        use wacore::pair_code::{PairCodeState, PairCodeUtils};
+        use wacore::pair_code::PairCodeState;
 
         let client = create_test_client().await;
-        let expired =
-            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        let expired = wacore::time::Instant::ZERO;
         *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref: b"3@2:ref".to_vec(),
             phone_jid: "15551234567".to_string(),
@@ -523,7 +522,7 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: expired,
+            code_expires_at: expired,
             // Stage 2 ran: companion_finish is out and pair-success is pending.
             primary_hello_attempt_count: 1,
         };
@@ -557,7 +556,8 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: wacore::time::now_secs(),
+            code_expires_at: wacore::time::Instant::now()
+                + wacore::pair_code::PairCodeUtils::code_validity(),
             primary_hello_attempt_count: 0,
         };
         let before = adv_secret(&client).await;
