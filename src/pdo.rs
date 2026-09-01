@@ -294,6 +294,143 @@ impl Client {
         self.send_peer_message(peer_target, &msg).await
     }
 
+    /// Ask the primary device for a collection this side could not validate.
+    ///
+    /// Sent when a snapshot's MAC does not match the one we compute over it.
+    /// There is no way forward through the server after that -- the same bytes
+    /// arrive on every retry and fail the same way -- so the collection would
+    /// otherwise stay at version 0 for ever, and every mutation this client
+    /// tries to write to it (a chat marked read, a mute, an archive) is refused
+    /// with a conflict it can never resolve.
+    ///
+    /// Fire-and-forget, like every other PDO here: the answer arrives later as
+    /// an ordinary peer message and is applied then. Nothing waits, so a phone
+    /// that is off simply means the collection stays as it was.
+    pub async fn request_syncd_snapshot_recovery(
+        self: &Arc<Self>,
+        collection: &str,
+    ) -> Result<String, anyhow::Error> {
+        // Both gates are enforced here as well as at the escalation, because this
+        // is public and takes a name.
+        //
+        // A name this client has no rules for is refused outright: the reply
+        // side rejects `Unknown` *before* spending the marker, and an
+        // outstanding request only ever expires when the same name is asked for
+        // again -- so one typo would sit in the map for the life of the process,
+        // having been sent to the phone for nothing.
+        let patch_name = collection
+            .parse::<wacore::appstate::patch_decode::WAPatchName>()
+            .unwrap_or(wacore::appstate::patch_decode::WAPatchName::Unknown);
+        if patch_name == wacore::appstate::patch_decode::WAPatchName::Unknown {
+            return Err(anyhow::anyhow!(
+                "{collection} is not an app-state collection this client knows"
+            ));
+        }
+        // And the block list is refused because a caller asking for it would
+        // otherwise mark it pending and send, and the reply passes the
+        // known-collection check and applies. Rebuilding a block list from a
+        // device that may itself be behind is the one collection where being
+        // wrong means talking to somebody who was blocked.
+        if patch_name == wacore::appstate::patch_decode::WAPatchName::CriticalBlock {
+            return Err(anyhow::anyhow!(
+                "the block list is not recovered from the primary"
+            ));
+        }
+
+        // And the rollout gate, for the same reason the two above are here: an
+        // explicit `0` is the account being told its primary cannot do this, and
+        // a caller reaching past the escalation would spend a whole-collection
+        // request on a device that will ignore it. Silence still proceeds --
+        // this client is not on WhatsApp's rollout and may simply never be sent
+        // the prop, and reading that as a refusal would disable the escalation
+        // for everyone it exists to help.
+        if self
+            .ab_props()
+            .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
+            .await
+            .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+        {
+            return Err(anyhow::anyhow!(
+                "the account has peer snapshot recovery turned off"
+            ));
+        }
+
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let peer_target = self_peer_target(&device_snapshot)?;
+
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
+                wa::message::PeerDataOperationRequestType::COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY,
+            ),
+            syncd_collection_fatal_recovery_request: buffa::MessageField::some(
+                wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest {
+                    collection_name: Some(collection.to_string()),
+                    timestamp: Some(wacore::time::now_secs() as i64),
+                },
+            ),
+            ..Default::default()
+        };
+
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
+        };
+
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
+        };
+
+        info!(
+            "Asking {} to send back the {} collection after a snapshot we could not validate",
+            peer_target.observe(),
+            collection
+        );
+
+        self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
+            .await?;
+
+        // Marked before the send, not after. The reply is handled on the inbound
+        // path by a different task, and a primary that answers quickly can be
+        // read before a mark placed afterwards is visible -- which would drop a
+        // perfectly good recovery for a request that really was made. Marking
+        // first cannot lose one; the only cost is a marker to take back if the
+        // send never happened, which is what the failure arm does.
+        // Generated here, not inside the send: the answer is identified by this
+        // id, and a reply that beats the send's return would otherwise find the
+        // request recorded with no id at all -- unrecognisable, and so unable to
+        // free the ask it answers.
+        let request_id = self.generate_message_id();
+
+        let proc = self.get_app_state_processor();
+        if !proc.mark_recovery_requested(collection).await {
+            // One is already outstanding, and the reply that is coming answers
+            // this ask too. Suppressing the duplicate is also what keeps the
+            // marker honest: a second send that failed would otherwise withdraw
+            // the first request's only record of itself.
+            debug!("A recovery for {collection} is already outstanding; not asking again");
+            return Ok(String::new());
+        }
+        proc.note_recovery_request_id(collection, &request_id).await;
+        match self
+            .send_peer_message_with_id(peer_target, &msg, &request_id)
+            .await
+        {
+            Ok(()) => Ok(request_id),
+            Err(e) => {
+                // By id, not by name. The window this marker holds is shorter
+                // than a send can take, so by now another ask for the same
+                // collection may have replaced this entry -- and withdrawing by
+                // name would take *its* marker, leaving a request that really is
+                // on the wire with nothing to recognise its answer. Taking by id
+                // withdraws this ask or nothing.
+                proc.take_recovery_request_by_id(&request_id).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Sends a peer message (message to our own devices).
     /// This is used for PDO requests and similar device-to-device communication.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.send_peer_message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
@@ -303,20 +440,32 @@ impl Client {
         msg: &wa::Message,
     ) -> Result<String, anyhow::Error> {
         let msg_id = self.generate_message_id();
+        self.send_peer_message_with_id(to, msg, &msg_id).await?;
+        Ok(msg_id)
+    }
 
+    /// [`Self::send_peer_message`] for a caller that has to know the id before
+    /// the send, because it records something against it that an answer can
+    /// arrive and look up before this returns.
+    async fn send_peer_message_with_id(
+        self: &Arc<Self>,
+        to: Jid,
+        msg: &wa::Message,
+        msg_id: &str,
+    ) -> Result<(), anyhow::Error> {
         // Send with peer category and high priority
         self.send_message_impl(
             to,
             msg,
             crate::send::SendPipelineOptions {
-                request_id: Some(&msg_id),
+                request_id: Some(msg_id),
                 peer: true,
                 ..Default::default()
             },
         )
         .await?;
 
-        Ok(msg_id)
+        Ok(())
     }
 
     /// Handles a PDO response message from our primary phone.
@@ -355,6 +504,282 @@ impl Client {
                     .await;
             }
         }
+
+        // One response can carry several recovery results, and they all answer
+        // the one ask this stanza id was made about -- so exactly one of them is
+        // handled, and a populated one wins. Taking them in order would let an
+        // empty result arriving first spend the request the good one still
+        // needs; an empty one is answered only when nothing here carries a
+        // collection at all.
+        let recoveries: Vec<_> = response
+            .peer_data_operation_result
+            .iter()
+            .filter_map(|result| result.syncd_snapshot_fatal_recovery_response.as_option())
+            .collect();
+        if let Some(recovery) = recoveries
+            .iter()
+            // Present and non-empty. A zero-length field is a result that
+            // carries nothing -- an empty payload decodes to a default recovery
+            // naming no collection, which would then spend the request in the
+            // mismatch path and leave a usable sibling unconsidered.
+            .find(|recovery| {
+                recovery
+                    .collection_snapshot
+                    .as_deref()
+                    .is_some_and(|blob| !blob.is_empty())
+            })
+            .or(recoveries.first())
+        {
+            self.handle_syncd_snapshot_recovery_response(recovery, request_id)
+                .await;
+        } else {
+            // A response under this id carrying no recovery result at all --
+            // an empty list, or only somebody else's result. It is still the
+            // answer to the ask that id was made about, so it spends it:
+            // leaving the request would suppress every retry for the rest of
+            // the window over a question already answered, badly.
+            //
+            // Claimed before it is spent, for the reason the absent-blob path
+            // is: a resultless response arriving beside one already being
+            // decoded must not delete the request that decoder will take at the
+            // end, or a usable recovery is dropped and the collection stays
+            // behind the MAC failure it started at.
+            let proc = self.get_app_state_processor();
+            if let Some(name) = proc.claim_recovery_request_by_id(request_id).await {
+                proc.take_recovery_request_by_id(request_id).await;
+                warn!(
+                    "Snapshot recovery response for {name} carries no result; it may be asked for again"
+                );
+            }
+        }
+    }
+
+    /// Apply a collection the primary sent back after a snapshot we refused.
+    ///
+    /// Logged rather than returned: this arrives on the inbound message path,
+    /// long after the sync that asked, and there is nobody left to hand an error
+    /// to. What a failure costs is the collection staying where it was, which is
+    /// where it already was.
+    async fn handle_syncd_snapshot_recovery_response(
+        &self,
+        response: &wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse,
+        request_id: &str,
+    ) {
+        // An empty byte field is a result carrying nothing, handled as the
+        // absent one: decoding it would produce a default recovery naming no
+        // collection, which is a mismatch against the ask and reads in the log
+        // as the primary having answered about something else.
+        let Some(blob) = response
+            .collection_snapshot
+            .as_deref()
+            .filter(|blob| !blob.is_empty())
+        else {
+            // Answered, with nothing. Leaving the marker would suppress every
+            // retry for the rest of the window over an ask already spent.
+            //
+            // Claimed first, though, rather than removed outright: one response
+            // can carry several results under one id, so an empty one arriving
+            // beside a good one would otherwise delete the request the good
+            // one's decoder is still working against -- and that task, finding
+            // no marker at the end, would drop a usable recovery.
+            let proc = self.get_app_state_processor();
+            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
+                warn!(
+                    "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
+                );
+                return;
+            };
+            proc.take_recovery_request_by_id(request_id).await;
+            warn!(
+                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
+            );
+            return;
+        };
+
+        // Which collection this id was asked about -- claimed, before a byte is
+        // cloned or inflated.
+        //
+        // Correlating here rather than after the decode is the difference
+        // between a map read and up to 64 MiB of inflate plus a record graph
+        // built for a reply that was never eligible to apply. Claiming rather
+        // than reading is what makes one ask cost one decode: a response that
+        // repeats the result, or a second copy arriving before the first is
+        // consumed, would otherwise each spawn a collection-sized job against
+        // the same request.
+        //
+        // The payload names a collection too, but that is the reply's claim
+        // about itself -- and with two recoveries outstanding, a reply carrying
+        // A's id and B's name would select B's marker and be checked against its
+        // own name, which always agrees. So the ask decides.
+        let Some(asked) = self
+            .get_app_state_processor()
+            .claim_recovery_request_by_id(request_id)
+            .await
+        else {
+            warn!("Ignoring a snapshot recovery nothing here asked for");
+            return;
+        };
+
+        // The whole continuation is detached, not just the CPU inside it.
+        // `receive.rs` awaits this handler inline and inbound processing is
+        // serialized per chat, so awaiting the decode -- even one that runs on
+        // the blocking pool -- keeps the self-chat lane closed behind it, and
+        // the primary's key shares queue behind a payload of the primary's own
+        // choosing. Nothing here has an answer to give back.
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let compressed = response.is_compressed.unwrap_or(false);
+
+        // Bounded before it is copied, not after. The ceiling was enforced
+        // inside the task, so a malformed gigabyte reply was still allocated and
+        // memcpy'd in full on the inbound lane before anything looked at its
+        // size -- on the self-chat lane, where the primary's key shares queue
+        // behind it.
+        //
+        // Both branches are bounded, by what each can legitimately be. An
+        // uncompressed reply is its own output, so the ceiling is the ceiling. A
+        // compressed one is measured against the largest a stream whose *output*
+        // fits can be on the wire: deflate stores what it cannot compress, at a
+        // cost of about a thousandth plus a small header, so anything past that
+        // could not have inflated to something this path would accept. The
+        // inflate still enforces the real ceiling on the way out; this only
+        // decides whether the bytes are worth copying.
+        let max_wire = if compressed {
+            wacore::history_sync::MAX_DECOMPRESSED
+                + wacore::history_sync::MAX_DECOMPRESSED / 1000
+                + 64
+        } else {
+            wacore::history_sync::MAX_DECOMPRESSED
+        };
+        if blob.len() as u64 > max_wire {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
+                blob.len()
+            );
+            return;
+        }
+        let payload = blob.to_vec();
+        let request_id = request_id.to_string();
+        let generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        self.runtime.spawn_detached(Box::pin(async move {
+            // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
+            // pins its instantiation: off the runtime's async workers either
+            // way.
+            let decoded = wacore::runtime::blocking(&*client.runtime, move || {
+                let bytes = if compressed {
+                    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+                        &payload,
+                        wacore::history_sync::MAX_DECOMPRESSED,
+                    );
+                    let mut plain = Vec::new();
+                    loop {
+                        match reader.ensure(1) {
+                            Ok(true) => {}
+                            // `ensure(1)` answers false only with nothing left.
+                            Ok(false) => break,
+                            Err(e) => return Err(format!("failed to decompress: {e}")),
+                        }
+                        let taken = {
+                            let chunk = reader.available();
+                            plain.extend_from_slice(chunk);
+                            chunk.len()
+                        };
+                        if taken == 0 {
+                            break;
+                        }
+                        reader.consume(taken);
+                    }
+                    // Running out is not ending. A payload cut short after a
+                    // parseable prefix would otherwise be applied as the whole
+                    // collection, and a short collection cannot be told from a
+                    // real one -- nothing here knows how many records to expect.
+                    if !reader.stream_ended() {
+                        return Err("is a truncated compressed stream".to_string());
+                    }
+                    // And ending is not all of it. A complete stream followed by
+                    // a second member or by trailing bytes leaves the reader
+                    // done with input to spare, and taking the first member for
+                    // the collection is the same silent short read the check
+                    // above refuses -- reached from the other direction.
+                    let (read, whole) = reader.compressed_progress();
+                    if read != whole {
+                        return Err(format!(
+                            "carries {} byte(s) after its compressed stream",
+                            whole - read
+                        ));
+                    }
+                    std::borrow::Cow::Owned(plain)
+                } else {
+                    // Already bounded: the raw blob was measured against the
+                    // same ceiling before it was copied, which is what an
+                    // uncompressed reply needs -- the decode allocates a record
+                    // graph from whatever arrives.
+                    std::borrow::Cow::Borrowed(&payload[..])
+                };
+                waproto::codec::syncd_snapshot_recovery_decode(&bytes)
+                    .map_err(|e| format!("failed to decode: {e}"))
+            })
+            .await;
+
+            let recovery = match decoded {
+                Ok(recovery) => recovery,
+                Err(e) => {
+                    // The request was answered, badly. Its collection name is
+                    // inside the payload that would not read, so the id the
+                    // answer carried is the only way to say which ask this was
+                    // -- and leaving the marker would suppress every retry for
+                    // the rest of the window over a question already answered.
+                    let proc = client.get_app_state_processor();
+                    match proc.take_recovery_request_by_id(&request_id).await {
+                        Some(name) => warn!(
+                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
+                        ),
+                        None => warn!("Snapshot recovery response {e}"),
+                    }
+                    return;
+                }
+            };
+
+            let proc = client.get_app_state_processor();
+
+            match recovery.collection_name.as_deref() {
+                Some(named) if named == asked => {}
+                other => {
+                    proc.take_recovery_request_by_id(&request_id).await;
+                    warn!(
+                        "Snapshot recovery answering the ask for {asked} names {}; refusing it",
+                        other.unwrap_or("nothing")
+                    );
+                    return;
+                }
+            }
+
+            // The reservation is a connection's, and a disconnect clears the
+            // registry wholesale -- so a task that started before one and
+            // applied after it would write beside the new connection's own sync
+            // and dispatch events for a session that has since been replaced.
+            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
+            {
+                // Spent, like every other ending that is not an apply. The ask
+                // was answered; dropping the answer because the connection went
+                // is this side's decision, and leaving the marker would have the
+                // next connection unable to ask again until the window ran out.
+                proc.take_recovery_request_by_id(&request_id).await;
+                debug!("Dropping the {asked} recovery: the connection it belongs to is gone");
+                return;
+            }
+
+            client
+                .apply_recovered_collection(&asked, &request_id, generation, recovery)
+                .await;
+        }));
     }
 
     async fn handle_placeholder_resend_response(

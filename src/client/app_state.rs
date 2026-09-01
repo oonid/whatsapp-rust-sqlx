@@ -2223,6 +2223,7 @@ impl Client {
                             target: "Client/AppState",
                             "Batched sync: apply failed for {name:?}: {e}"
                         );
+                        self.escalate_to_snapshot_recovery(name, &e).await;
                         apply_error = Some(e);
                         break;
                     }
@@ -2549,7 +2550,17 @@ impl Client {
             }
 
             let (mutations, new_state, list) =
-                proc.process_parsed_patch_list(pl, &download, true).await?;
+                match proc.process_parsed_patch_list(pl, &download, true).await {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        // The single-collection path fails the same way the batched
+                        // one does and deserves the same escalation; without it, a
+                        // collection would recover only when its failure happened to
+                        // arrive in a batch.
+                        self.escalate_to_snapshot_recovery(name, &e).await;
+                        return Err(e);
+                    }
+                };
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
@@ -3233,7 +3244,311 @@ impl Client {
         Recovery::Recovered
     }
 
-    async fn dispatch_app_state_mutation(
+    /// Write a collection the primary sent back, and announce what changed.
+    ///
+    /// Lives here rather than beside the peer-message plumbing because the write
+    /// is app-state's: it takes the same reservation a sync and a patch send
+    /// take, since it is a clear, a put and a set over the very rows they write,
+    /// and interleaving with either can leave the persisted ltHash and the MAC
+    /// store describing different states.
+    ///
+    /// The caller is already detached from the inbound path, so this waits for
+    /// the reservation on its own time.
+    pub(crate) async fn apply_recovered_collection(
+        &self,
+        name: &str,
+        request_id: &str,
+        generation: u64,
+        recovery: waproto::whatsapp::SyncdSnapshotRecovery,
+    ) {
+        // `WAPatchName::from_str` is infallible: every unrecognised name maps to
+        // `Unknown`, which is one shared reservation slot and one collection
+        // this side has no rules for. Rejecting it explicitly is the difference
+        // between ignoring a name we do not know and applying it under a
+        // reservation that means nothing.
+        let patch_name = name.parse::<WAPatchName>().unwrap_or(WAPatchName::Unknown);
+        if patch_name == WAPatchName::Unknown {
+            // Released for the same reason as every other ending that is not an
+            // apply: the ask has been answered, badly, and keeping it would
+            // refuse the next one for nothing.
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                target: "Client/AppState",
+                "Snapshot recovery names an unknown collection {name}; ignoring"
+            );
+            return;
+        }
+
+        // The record count WA Web allows a recovery to carry. The byte ceiling
+        // bounds the payload, but small records encode in a few bytes each, so
+        // 64 MiB is room for orders of magnitude more than a collection has --
+        // and every one of them is an HMAC, a store row and a dispatched event.
+        // The prop's registry default is 2000, which is what an account that is
+        // never sent it reads.
+        let allowed = self
+            .ab_props()
+            .get_int(wacore::iq::abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED)
+            .await;
+        if allowed > 0 && recovery.mutation_records.len() as i64 > allowed {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                target: "Client/AppState",
+                "Snapshot recovery for {name} carries {} records, over the {allowed} allowed; refusing it",
+                recovery.mutation_records.len()
+            );
+            return;
+        }
+
+        // Refused before anything is reserved on its behalf: an unsolicited
+        // reply should cost a map lookup, not a wait. The marker is only *taken*
+        // once the reservation is held, so a wait that times out does not
+        // consume a request that was really made.
+        let proc = self.get_app_state_processor();
+        if !proc.has_recovery_request(name).await {
+            warn!(
+                target: "Client/AppState",
+                "Ignoring an unsolicited snapshot recovery for {name}: nothing here asked for one"
+            );
+            return;
+        }
+
+        // The keys the primary signed these records with, asked for before the
+        // reservation rather than during it. A recovery is reached because the
+        // collection is already stuck, and a historical key this side never
+        // received would fail every attempt at it identically -- the normal
+        // snapshot path repairs exactly this with a key share, and skipping it
+        // here would leave the one escalation that exists to unstick a
+        // collection stuck on a key nobody ever asked for.
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut missing_keys = Vec::new();
+        for record in &recovery.mutation_records {
+            let Some(key_id) = record.key_id.as_deref() else {
+                continue;
+            };
+            if !seen.insert(key_id.to_vec()) {
+                continue;
+            }
+            // Only a key that is genuinely absent. Any other store error means
+            // the key may well be there, and asking peers for it buys a ten
+            // second wait and a message nobody needed -- the apply below reports
+            // the real failure.
+            if let Err(wacore::appstate_sync::AppStateSyncError::KeyNotFound(_)) =
+                proc.get_app_state_key(key_id).await
+            {
+                missing_keys.push(key_id.to_vec());
+            }
+        }
+        if !missing_keys.is_empty() {
+            let asked = missing_keys.len();
+            if !self
+                .request_keys_and_wait(missing_keys, APP_STATE_KEY_REQUEST_TIMEOUT)
+                .await
+            {
+                // Not a refusal: the apply below reports which record it could
+                // not read, and the ask is spent either way rather than left to
+                // suppress the next one.
+                warn!(
+                    target: "Client/AppState",
+                    "{asked} app-state key(s) the {name} recovery needs are still missing"
+                );
+            }
+        }
+
+        let Ok(_reservation) = rt_timeout(
+            &*self.runtime,
+            APP_STATE_RESERVATION_WAIT,
+            self.app_state_syncing.begin(patch_name, SyncHolder::Sync),
+        )
+        .await
+        else {
+            // Released, not left claimed. The reply is being dropped, and one
+            // ask has one reply -- so holding the request would refuse a repeat
+            // of this one and suppress the next escalation for the rest of the
+            // window, over a collection still exactly as stuck as it was.
+            proc.take_recovery_request_by_id(request_id).await;
+            warn!(
+                target: "Client/AppState",
+                "Gave up waiting to reserve {name} for a snapshot recovery"
+            );
+            return;
+        };
+
+        // Taken by the id, never by the name. The reservation above may wait
+        // longer than a request lives -- 450 seconds against a 300-second TTL --
+        // so by the time this runs the ask that produced this reply can have
+        // expired and been replaced. Taking by name would consume the
+        // replacement's marker, apply the older reply, and have the newer one
+        // refused as unsolicited.
+        if proc.take_recovery_request_by_id(request_id).await.is_none() {
+            debug!(
+                target: "Client/AppState",
+                "The recovery request for {name} is no longer outstanding; dropping this reply"
+            );
+            return;
+        }
+
+        // Rechecked after the waits above, not only before them. A disconnect
+        // during the key share or the reservation clears the registry, so the
+        // guard this holds would no longer exclude the new connection's own
+        // sync from the rows about to be written.
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            debug!(
+                target: "Client/AppState",
+                "Dropping the {name} recovery: the connection it belongs to went while it waited"
+            );
+            return;
+        }
+
+        // The generation check above is true only until the next await. Beneath
+        // this call are a store lookup per key, a whole collection's worth of
+        // HMACs, and then the three writes that replace the collection -- and a
+        // disconnect anywhere in there drops the registry wholesale, so the
+        // reservation held here stops excluding the new connection's own sync
+        // from the very rows about to be written. So the apply asks again, on
+        // the far side of that work and in front of the first write.
+        // The counter, not `self`: the predicate is `Send + Sync` so it can be
+        // held across the awaits inside the apply, and `Client` carries trait
+        // objects that are neither on wasm.
+        let live = Arc::clone(&self.connection_generation);
+        let still_current = move || live.load(Ordering::Acquire) == generation;
+        match proc
+            .apply_snapshot_recovery(recovery, name, &still_current)
+            .await
+        {
+            Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
+                info!(
+                    target: "Client/AppState",
+                    "Recovered the {name} collection from the primary device: {} record(s)",
+                    mutations.len()
+                );
+                wacore::telemetry::appstate_mutations(mutations.len() as u64);
+                // Announced unconditionally, even if the connection has gone in
+                // the meantime. The rows are committed and the collection now
+                // reads as current, so the next sync starts past these records
+                // and they are never offered again -- withholding them here
+                // would lose a mute or an archive for good. And what they
+                // describe is the account, not the session that learned it,
+                // which is why the ordinary sync path dispatches the same way.
+                for m in &mutations {
+                    self.dispatch_app_state_mutation(m, true).await;
+                }
+            }
+            Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
+                debug!(
+                    target: "Client/AppState",
+                    "Dropping the {name} recovery: the connection it belongs to went before it was written"
+                );
+            }
+            Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
+                info!(
+                    target: "Client/AppState",
+                    "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
+                );
+            }
+            Err(e) => {
+                // The marker stays taken. One request was answered, and this was
+                // the answer -- no second reply is coming, so putting it back
+                // would only suppress the next ask for the rest of the window
+                // while the collection stayed stuck.
+                //
+                // What happens instead is the next sync of this collection: the
+                // snapshot fails to validate exactly as before and escalates
+                // again. That is not necessarily soon -- the retry rounds that
+                // produced this ask may already be spent -- so the honest
+                // statement is that the collection stays where it was until the
+                // next connection syncs it, which is where it was anyway.
+                warn!(
+                    target: "Client/AppState",
+                    "Failed to apply the snapshot recovery for {name}: {e}"
+                );
+            }
+        }
+    }
+
+    /// Ask the primary for a collection whose snapshot this side cannot validate.
+    ///
+    /// A snapshot MAC that does not match is the one app-state failure with
+    /// nothing behind it: the server serves the same bytes on every retry, they
+    /// fail the same way, and the collection stays at version 0 for ever --
+    /// which means every mutation written to it (a chat marked read, a mute, an
+    /// archive) is refused with a conflict that can never resolve. WA Web treats
+    /// it as an expected condition and asks the phone; so does this.
+    ///
+    /// Narrow on purpose. A missing key is answered by a key share and a bad
+    /// decode is answered by nothing, so only the mismatch escalates, and only
+    /// after the error has been carried here as itself rather than as a string.
+    ///
+    /// `critical_block` is excluded for the reason WA Web excludes it: it is the
+    /// block list, and rebuilding it from a device that may itself be behind is
+    /// the one collection where being wrong means talking to somebody who was
+    /// blocked.
+    async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &anyhow::Error) {
+        use wacore::appstate::AppStateError;
+
+        // A snapshot that omits its MAC or key id is refused by the same gate
+        // for the same reason -- unverified records are not applied -- and
+        // leaves the collection just as stuck. WA Web's anti-tampering compares
+        // against a possibly-undefined mac and reaches recovery either way.
+        if !matches!(
+            err.downcast_ref::<AppStateError>(),
+            Some(AppStateError::SnapshotMACMismatch | AppStateError::SnapshotMACMissing)
+        ) {
+            return;
+        }
+        if name == WAPatchName::CriticalBlock {
+            warn!(
+                target: "Client/AppState",
+                "Not asking the primary to rebuild {name:?}: the block list is not recovered this way"
+            );
+            return;
+        }
+
+        // The rollout gate WA Web reads. Honoured when the server has actually
+        // spoken: a `0` is the account being told the primary cannot do this,
+        // and asking anyway spends a whole-collection request every window on a
+        // device that will ignore it. Absence is not a refusal, though -- this
+        // client is not on WhatsApp's rollout and may simply never be sent the
+        // prop, and treating silence as "no" would turn the escalation off for
+        // everyone it exists to help.
+        if self
+            .ab_props()
+            .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
+            .await
+            .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+        {
+            warn!(
+                target: "Client/AppState",
+                "Not asking the primary to rebuild {name:?}: the account has peer snapshot recovery turned off"
+            );
+            return;
+        }
+
+        info!(
+            target: "Client/AppState",
+            "Asking the primary device to send back {name:?}: its snapshot did not validate here"
+        );
+        // The send needs an owned handle and the sync path holds `&self`; this
+        // is the same weak-self route the other `&self` callers here take.
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            warn!(
+                target: "Client/AppState",
+                "Could not ask the primary to rebuild {name:?}: the client is going away"
+            );
+            return;
+        };
+        if let Err(e) = client.request_syncd_snapshot_recovery(name.as_str()).await {
+            warn!(
+                target: "Client/AppState",
+                "Could not ask the primary to rebuild {name:?}: {e}"
+            );
+        }
+    }
+
+    pub(crate) async fn dispatch_app_state_mutation(
         &self,
         m: &crate::appstate_sync::Mutation,
         full_sync: bool,
