@@ -6,7 +6,7 @@
 
 use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
-use crate::hash::{HashState, generate_patch_mac};
+use crate::hash::{HashState, generate_patch_mac, value_mac_tail};
 use crate::keys::ExpandedAppStateKeys;
 use log::{Level, debug, log_enabled, trace, warn};
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,24 @@ where
 
     // Update hash state directly from records (no cloning needed)
     let fold = initial_state.update_hash_from_records(&snapshot.records);
+
+    // A record with no value blob is one nobody can agree about: WA Web reads
+    // `.byteLength` off the absent buffer and the whole fold throws. Refused
+    // here rather than folded around, because the fold and the decode both have
+    // to leave it out to stay in step -- and two passes quietly agreeing to
+    // ignore a record is how a malformed snapshot would validate and be stored
+    // as though it were whole. Rejecting keeps the old answer
+    // (`decode_record`'s `MissingValueBlob`) for input that never changed.
+    if fold.valueless > 0 {
+        warn!(
+            target: "AppState",
+            "Snapshot {} v{} carries {} record(s) with no value blob; refusing it",
+            collection_name,
+            version,
+            fold.valueless,
+        );
+        return Err(AppStateError::MissingValueBlob);
+    }
 
     debug!(
         target: "AppState",
@@ -326,12 +344,24 @@ where
         } else {
             get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))?
         };
-        if let Some(rec) = patch.mutations[idx].record.as_option()
+        // The operand `update_hash` just added for this SET, by the same rule it
+        // used -- so the next SET on this index subtracts what the first one
+        // contributed rather than the store's pre-patch value. A short blob is
+        // folded there, so recording it only when it is 32 bytes long leaves the
+        // first SET's operand added and never cancelled.
+        //
+        // Only a SET, because only a SET adds one. A REMOVE subtracts, and after
+        // it the index holds nothing -- so recording its tail here would have a
+        // later SET on that index subtract a value the patch had already taken
+        // out. `update_hash` suppresses that lookup entirely, but only when
+        // every mutation carries an index; one that does not drops the whole
+        // patch to the legacy path, where this map is what answers.
+        if !is_remove
+            && let Some(rec) = patch.mutations[idx].record.as_option()
             && let Some(index) = rec.index.as_option().and_then(|i| i.blob.as_deref())
             && let Some(value) = rec.value.as_option().and_then(|v| v.blob.as_deref())
-            && value.len() >= 32
         {
-            in_patch.insert(index, &value[value.len() - 32..]);
+            in_patch.insert(index, value_mac_tail(value));
         }
         Ok(prev)
     });
@@ -577,25 +607,42 @@ pub fn validate_patch_macs(
 }
 
 /// The records a keyed snapshot actually describes: one per index, the last of
-/// any run, plus every record that carries no index and so cannot collide.
+/// any run.
 ///
 /// Mirrors the `Map` WA Web builds in `WAWebSyncdAntiTampering`, and must stay in
 /// step with [`HashState::update_hash_from_records`] -- the ltHash is folded over
 /// this same set, and a snapshot whose MAC we accepted has to be the snapshot we
 /// then decode.
+///
+/// Which is why a record carrying no index is keyed here too, on the empty
+/// slice, exactly as the fold keys it. Letting every such record through as its
+/// own winner read as "they cannot collide" and was the same mistake the fold
+/// made: WA Web keys on `hex(index.blob)`, `hex` of an absent buffer is the
+/// empty string, and they all collide there. Keeping the two in step matters
+/// more than either answer on its own -- the fold decides which MAC we accept
+/// and this decides what we then decrypt, so a disagreement means accepting a
+/// snapshot on one set of records and storing another.
 fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
     let mut winners: Vec<&wa::SyncdRecord> = Vec::with_capacity(records.len());
     let mut seen: Vec<&[u8]> = Vec::new();
     // Backwards, so the first hit for an index is its last record.
     for rec in records.iter().rev() {
-        match rec.index.as_option().and_then(|idx| idx.blob.as_deref()) {
-            Some(index_mac) => {
-                if !seen.contains(&index_mac) {
-                    seen.push(index_mac);
-                    winners.push(rec);
-                }
-            }
-            None => winners.push(rec),
+        // Skipped for the same reason the fold skips it: a record with no value
+        // blob contributes no value MAC, so it is not part of what the accepted
+        // MAC describes. Letting it win an index anyway is worse than letting it
+        // through -- it displaces the record that *was* folded, so the two
+        // passes disagree about a snapshot that is otherwise perfectly ordinary.
+        if rec.value.blob.is_none() {
+            continue;
+        }
+        let index_mac = rec
+            .index
+            .as_option()
+            .and_then(|idx| idx.blob.as_deref())
+            .unwrap_or_default();
+        if !seen.contains(&index_mac) {
+            seen.push(index_mac);
+            winners.push(rec);
         }
     }
     winners.reverse();
@@ -696,6 +743,142 @@ mod tests {
                 id: Some(key_id.to_vec()),
             }),
         }
+    }
+
+    /// A run of one index and three records with no index describe two things,
+    /// and both passes have to say two -- the last of the run and the last of
+    /// the unkeyed.
+    #[test]
+    fn the_decode_set_is_the_set_the_fold_folded() {
+        fn record(index: Option<&[u8]>, value_mac: u8) -> wa::SyncdRecord {
+            let mut blob = vec![0u8; 16];
+            blob.extend_from_slice(&[value_mac; 32]);
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: index.map(<[u8]>::to_vec),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                ..Default::default()
+            }
+        }
+
+        // One ordinary index carrying a run of two, and three records with no
+        // index at all: five records describing two things.
+        let records = vec![
+            record(Some(&[0x01; 32]), 0x11),
+            record(None, 0x22),
+            record(Some(&[0x01; 32]), 0x33),
+            record(None, 0x44),
+            record(None, 0x55),
+        ];
+
+        let mut state = HashState::default();
+        let fold = state.update_hash_from_records(&records);
+        let winners = last_record_per_index(&records);
+
+        assert_eq!(fold.folded, 2, "one index and one empty key");
+        assert_eq!(
+            winners.len(),
+            fold.folded,
+            "the decode walks the records the fold folded, or the MAC we accepted \
+             was computed over a different snapshot than the one we store"
+        );
+        assert_eq!(
+            fold.unkeyed, 3,
+            "and it still says how many arrived unkeyed"
+        );
+
+        // Last wins in both, and on the same records.
+        let last_of = |mac: u8| {
+            winners
+                .iter()
+                .any(|rec| rec.value.blob.as_ref().is_some_and(|b| b[16] == mac))
+        };
+        assert!(last_of(0x33), "the run's last record, not its first");
+        assert!(last_of(0x55), "the last unkeyed record, not the first");
+    }
+
+    /// The regression the invariant above did not catch on its own: a record
+    /// with no value blob is skipped by the fold, so it must not be allowed to
+    /// win an index from the record that *was* folded. Every record here is
+    /// perfectly ordinary except the last, and the snapshot is one the server
+    /// could send.
+    #[test]
+    fn a_record_with_no_value_cannot_displace_the_one_that_folded() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x11; 32]);
+        let records = vec![
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(vec![0x01; 32]),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                ..Default::default()
+            },
+            // Same index, no value: later in the run, and so the winner under a
+            // dedup that only looks at indices.
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(vec![0x01; 32]),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: None }),
+                ..Default::default()
+            },
+        ];
+
+        let mut state = HashState::default();
+        let fold = state.update_hash_from_records(&records);
+        let winners = last_record_per_index(&records);
+
+        assert_eq!(fold.folded, 1, "only the record carrying a value folded");
+        assert_eq!(winners.len(), 1, "and only that record is decoded");
+        assert!(
+            winners[0].value.blob.is_some(),
+            "the winner is the folded record, not the valueless one that followed it"
+        );
+    }
+
+    /// A snapshot carrying a record with no value blob is refused, not quietly
+    /// folded around. Both passes leave such a record out to stay in step, so
+    /// without this the two would agree to ignore it and a malformed snapshot
+    /// would validate and be stored as though it were whole -- where before it
+    /// was rejected at the decode.
+    #[test]
+    fn a_snapshot_with_a_valueless_record_is_refused() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x11; 32]);
+        let snapshot = wa::SyncdSnapshot {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(7) }),
+            records: vec![
+                wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(vec![0x01; 32]),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                    ..Default::default()
+                },
+                wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(vec![0x02; 32]),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue { blob: None }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut state = HashState::default();
+        // Refused before the MAC is even reached, so it needs no key and no mac.
+        let err = process_snapshot(
+            &snapshot,
+            &mut state,
+            |_| panic!("a valueless record is refused before any key is looked up"),
+            true,
+            "regular_low",
+        )
+        .expect_err("a snapshot with a valueless record must be refused");
+        assert!(matches!(err, AppStateError::MissingValueBlob), "{err:?}");
     }
 
     #[test]
@@ -1467,6 +1650,163 @@ mod tests {
             result.state.hash.as_slice(),
             both_kept.as_slice(),
             "both SET values must not remain: in-patch overwrite regressed"
+        );
+    }
+
+    /// A REMOVE leaves nothing behind for a later SET to subtract.
+    ///
+    /// `update_hash` suppresses that subtraction outright, but only when every
+    /// mutation carries an index MAC; the unindexed third mutation here is what
+    /// drops the patch to the legacy path, where the overwrite map is the only
+    /// thing answering. A REMOVE recorded there would have the SET subtract a
+    /// value the REMOVE had already taken out.
+    #[test]
+    fn a_remove_leaves_nothing_for_a_later_set_to_subtract() {
+        let index_mac = vec![9u8; 32];
+        let removed: Vec<u8> = (0..48u8).collect();
+        let set: Vec<u8> = (100..148u8).collect();
+        let unindexed: Vec<u8> = (200..248u8).collect();
+        let tail = |b: &[u8]| b[b.len() - 32..].to_vec();
+
+        let mutation = |op: wa::syncd_mutation::SyncdOperation,
+                        index: Option<&[u8]>,
+                        blob: &[u8]| wa::SyncdMutation {
+            operation: Some(op.into()),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: index.map(<[u8]>::to_vec),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue {
+                    blob: Some(blob.to_vec()),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(b"test_key_id".to_vec()),
+                }),
+            }),
+        };
+
+        use wa::syncd_mutation::SyncdOperation::{REMOVE, SET};
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![
+                mutation(REMOVE, Some(&index_mac), &removed),
+                mutation(SET, Some(&index_mac), &set),
+                // No index: this is what makes it the legacy path.
+                mutation(SET, None, &unindexed),
+            ],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(b"test_key_id".to_vec()),
+            }),
+            ..Default::default()
+        };
+
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let mut state = HashState::default();
+        let _ = process_patch(
+            &patch,
+            &mut state,
+            |_: &[u8]| Ok(Arc::new(keys.clone())),
+            |_: &[u8]| Ok(None),
+            false,
+            "regular",
+        );
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[tail(&set), tail(&unindexed)],
+        );
+        assert_eq!(
+            state.hash.as_slice(),
+            expected.as_slice(),
+            "the store held nothing, so the two SETs are all there is to fold"
+        );
+
+        // The exact regression: the SET subtracting the REMOVE's own tail.
+        let subtracted_the_remove = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            &[tail(&removed)],
+            &[tail(&set), tail(&unindexed)],
+        );
+        assert_ne!(
+            state.hash.as_slice(),
+            subtracted_the_remove.as_slice(),
+            "a REMOVE must not leave an operand for the SET after it to cancel"
+        );
+    }
+
+    /// A first SET whose value blob is short must still be cancelled by the
+    /// second SET on the same index.
+    ///
+    /// Read off the state rather than the return value: a 16-byte blob is not
+    /// decryptable, so this patch fails after the hash has already been updated,
+    /// and the ltHash it left behind is the thing under test.
+    #[test]
+    fn a_short_first_set_is_cancelled_by_the_second() {
+        let index_mac = vec![9u8; 32];
+        let short = vec![0xABu8; 16];
+        let second: Vec<u8> = (0..48u8).collect();
+
+        let mutation = |blob: &[u8]| wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(index_mac.clone()),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue {
+                    blob: Some(blob.to_vec()),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(b"test_key_id".to_vec()),
+                }),
+            }),
+        };
+
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![mutation(&short), mutation(&second)],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(b"test_key_id".to_vec()),
+            }),
+            ..Default::default()
+        };
+
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let mut state = HashState::default();
+        let _ = process_patch(
+            &patch,
+            &mut state,
+            |_: &[u8]| Ok(Arc::new(keys.clone())),
+            |_: &[u8]| Ok(None),
+            false,
+            "regular",
+        );
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let only_second = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[second[second.len() - 32..].to_vec()],
+        );
+        assert_eq!(
+            state.hash.as_slice(),
+            only_second.as_slice(),
+            "the short first SET must be cancelled by the second, not left in the ltHash"
+        );
+
+        // The exact regression: the short operand added and never subtracted.
+        let both_kept = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[short.clone(), second[second.len() - 32..].to_vec()],
+        );
+        assert_ne!(
+            state.hash.as_slice(),
+            both_kept.as_slice(),
+            "the overwrite map forgot the short operand the fold added"
         );
     }
 
