@@ -7585,6 +7585,104 @@ async fn wait_for_startup_sync_reports_a_teardown_without_waiting_out_its_timeou
     );
 }
 
+/// `async_lock::Semaphore` does not report its count, so ask it the question
+/// the drain actually asks: can two stanzas be in flight at once?
+fn concurrent_permits(client: &Arc<Client>) -> bool {
+    let semaphore = client.read_message_semaphore().1;
+    let first = semaphore.try_acquire_arc();
+    let second = semaphore.try_acquire_arc();
+    first.is_some() && second.is_some()
+}
+
+/// Exactly one, not merely "not two": a drain that could acquire nothing at
+/// all would satisfy the negation of [`concurrent_permits`] while being just
+/// as broken.
+fn exactly_one_permit(client: &Arc<Client>) -> bool {
+    let semaphore = client.read_message_semaphore().1;
+    let first = semaphore.try_acquire_arc();
+    let second = semaphore.try_acquire_arc();
+    first.is_some() && second.is_none()
+}
+
+/// A finisher that arrives after its teardown cannot widen the semaphore the
+/// next drain needs narrow.
+///
+/// This is the sequential half of the invariant: the finisher's own late
+/// publication is refused. The contended half, that the reset itself sits
+/// inside the lock, is [`the_permit_reset_is_inside_the_terminal_lock`].
+#[tokio::test]
+async fn a_late_finisher_cannot_widen_the_next_drains_semaphore() {
+    let client = offline_resume_test_client().await;
+
+    arm_offline_drain(&client, 711, 700).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.enter_live_mode_for_tests();
+    assert!(
+        concurrent_permits(&client),
+        "live mode is the wide semaphore"
+    );
+
+    client.cleanup_connection_state().await;
+
+    // The finisher of the retired drain runs late and finds its slot taken.
+    client
+        .complete_offline_sync_for_generation(711, stale_generation)
+        .await;
+
+    assert!(
+        exactly_one_permit(&client),
+        "the next drain starts on exactly one permit, whatever the old finisher does"
+    );
+}
+
+/// The permit reset happens under `offline_terminal_lock`, not before it.
+///
+/// Holding the lock is the only way to observe that from outside: while it is
+/// held, a teardown must not have narrowed the semaphore, because the reset is
+/// on the far side of the same lock a publishing finisher holds. With the
+/// reset moved back out, the teardown reaches it without waiting and the
+/// assertion below fails.
+///
+/// Not vacuous, because it waits on `offline_terminal_gate_reached` rather
+/// than on elapsed scheduler turns: that flag is set on the line above the
+/// acquisition, so the teardown has provably arrived at the lock by the time
+/// the assertion runs.
+#[tokio::test]
+async fn the_permit_reset_is_inside_the_terminal_lock() {
+    let client = offline_resume_test_client().await;
+
+    arm_offline_drain(&client, 711, 700).await;
+    client.enter_live_mode_for_tests();
+
+    let terminal_gate = client.offline_terminal_lock.lock().await;
+
+    let teardown = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.cleanup_connection_state().await }
+    });
+
+    // Wait for the teardown to reach the lock itself, not for a guess at how
+    // many scheduler turns that takes: the flag is set on the line above the
+    // acquisition, so when it fires the reset is still ahead of the lock the
+    // test holds. Move the reset back out and it has already run by then.
+    crate::test_utils::poll_until("the teardown to reach the terminal lock", || {
+        client.offline_terminal_gate_reached.load(Ordering::Acquire)
+    })
+    .await;
+
+    assert!(
+        concurrent_permits(&client),
+        "the teardown narrowed the semaphore without the lock a finisher publishes under"
+    );
+
+    drop(terminal_gate);
+    teardown.await.expect("teardown must not panic");
+    assert!(
+        exactly_one_permit(&client),
+        "and once it has the lock, it does narrow it to exactly one"
+    );
+}
+
 /// A completion belongs to the connection whose drain it is.
 ///
 /// The inactivity watchdog and the offline-delivery waiter both check the
