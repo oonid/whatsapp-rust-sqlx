@@ -512,10 +512,9 @@ impl Client {
         // the scopeguard instead of cloning again.
         let pending = Arc::clone(&self.pending_retries);
         let _guard = scopeguard::guard((), move |()| {
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&processing_key);
+            let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.remove(&processing_key);
+            crate::client::release_after_burst(&mut pending);
         });
 
         // A retry from a device missing from our registry signals a stale device
@@ -2123,7 +2122,7 @@ mod tests {
         // Case 1: Device sync DM
         let recipient_lid = Jid::lid("200000000000002");
         let device_sync_info = MessageInfo {
-            id: "DEVICE_SYNC_MSG_001".to_string(),
+            id: "DEVICE_SYNC_MSG_001".into(),
             source: MessageSource {
                 chat: recipient_lid.clone(),
                 sender: our_lid.clone(),
@@ -2156,7 +2155,7 @@ mod tests {
         // Case 2: Peer DM with category="peer"
         let other_pn = Jid::pn("551188888888");
         let peer_info = MessageInfo {
-            id: "PEER123".to_string(),
+            id: "PEER123".into(),
             source: MessageSource {
                 chat: other_pn.clone(),
                 sender: our_pn.clone(),
@@ -2182,7 +2181,7 @@ mod tests {
 
         // Case 3: Group message from our own account
         let group_info = MessageInfo {
-            id: "GROUP123".to_string(),
+            id: "GROUP123".into(),
             source: MessageSource {
                 chat: "123456789@g.us".parse().unwrap(),
                 sender: our_lid.clone(),
@@ -2211,7 +2210,7 @@ mod tests {
 
         // Case 4: DM from someone else
         let other_dm_info = MessageInfo {
-            id: "OTHER123".to_string(),
+            id: "OTHER123".into(),
             source: MessageSource {
                 chat: other_pn.clone(),
                 sender: other_pn.clone(),
@@ -3014,7 +3013,7 @@ mod tests {
                 is_group: true,
                 ..Default::default()
             })
-            .message_ids(vec![msg_id.to_string()])
+            .message_ids(vec![msg_id.into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -3085,7 +3084,7 @@ mod tests {
                 is_group: chat.is_group(),
                 ..Default::default()
             })
-            .message_ids(vec![msg_id.to_string()])
+            .message_ids(vec![msg_id.into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(offline)
@@ -3372,7 +3371,7 @@ mod tests {
                 sender: peer,
                 ..Default::default()
             })
-            .message_ids(vec!["DMMISS001".to_string()])
+            .message_ids(vec!["DMMISS001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4057,7 +4056,7 @@ mod tests {
                 is_group: true,
                 ..Default::default()
             })
-            .message_ids(vec![msg_id.to_string()])
+            .message_ids(vec![msg_id.into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4575,7 +4574,7 @@ mod tests {
                 sender: from.parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4691,7 +4690,7 @@ mod tests {
                 sender: "236395184570386:33@lid".parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4717,7 +4716,7 @@ mod tests {
                 sender: "somebot:4@bot".parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4743,7 +4742,7 @@ mod tests {
                 sender: "somebot@bot".parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
