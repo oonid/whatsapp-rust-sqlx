@@ -376,6 +376,10 @@ type ChatStateHandler = Arc<dyn Fn(ChatStateEvent) + Send + Sync>;
 pub(crate) struct ChatLane {
     pub enqueue_lock: Arc<Mutex<()>>,
     pub queue_tx: async_channel::Sender<QueuedChatMessage>,
+    /// Held by the lane's worker for as long as it runs; a replacement
+    /// worker takes it before its first message. Why it is shared across
+    /// lane generations is explained at `create_chat_lane`.
+    pub worker_running: Arc<Mutex<()>>,
 }
 
 impl ChatLane {
