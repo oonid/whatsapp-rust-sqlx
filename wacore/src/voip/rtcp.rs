@@ -497,6 +497,61 @@ pub fn build_compact_rtcp_209(local_ssrc: u32) -> [u8; 8] {
     buf
 }
 
+/// 12-byte Picture Loss Indication (PT 206, FMT=1), RFC 4585 s6.3.1.
+///
+/// WhatsApp ships two PLI builders and picks between them on a per-stream
+/// feature bit: this one, and a 16-byte form carrying a monotonic sequence
+/// number so the receiver can coalesce repeats. **We deliberately send the
+/// short one, and the reason is in the peer's deduplicator rather than in the
+/// RFC.**
+///
+/// That deduplicator accepts a sequence only when `stored < seq`, or when
+/// `seq < 400` and `stored` is near the wrap; a rejected one does not advance
+/// `stored`. Its initial value is the same sentinel it substitutes for a PLI
+/// that carries no sequence at all. So a sender whose counter has passed 400
+/// and then meets a receiver whose state is fresh -- a peer that rebuilt its
+/// video stream, or an answering device after a rekey -- has every request
+/// dropped, silently, for the rest of the call, with no path back. The
+/// sentinel is special-cased to "not a duplicate" instead, so a PLI with no
+/// sequence is honoured unconditionally and forever.
+///
+/// What the short form costs is the peer's own coalescing, which our throttle
+/// already provides on this side, and a log line about the mismatch. What it
+/// buys is that the request cannot stop working.
+pub(crate) fn build_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[0] = 0x81; // V=2, P=0, FMT=1 (PLI)
+    buf[1] = RTCP_PT_PSFB;
+    buf[2] = 0;
+    buf[3] = 2; // (2+1)*4 = 12 bytes
+    buf[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    buf[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+    buf
+}
+
+/// A PLI on the native video profile, which sets bit 4 beside the FMT.
+///
+/// Not an extension invented here to match a capture: the peer's transport
+/// recognises a video PLI by `packet_type == 206 && byte0 & 0x1F == 0x11`, so
+/// the bit is required rather than tolerated, and the same bit is already on
+/// this pipeline's SDES and sender report. It costs nothing to read, because
+/// the FMT is masked with `& 0x0F` on both sides -- `summarize_rtcp` included.
+///
+/// A receiver following RFC 4585 to the letter reads FMT 17 and must discard
+/// the packet. That is the correct trade only because this transport carries
+/// WhatsApp peers and nothing else.
+pub(crate) fn build_whatsapp_picture_loss_indication(
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    profile_extension: bool,
+) -> [u8; 12] {
+    let mut packet = build_picture_loss_indication(sender_ssrc, media_ssrc);
+    if profile_extension {
+        packet[0] |= 0x10;
+    }
+    packet
+}
+
 /// 28-byte Sender Report (PT 200, RC=0). `now_ms` is the wall clock in milliseconds.
 pub fn build_sender_report(local_ssrc: u32, stats: &RtcpSenderStats, now_ms: u64) -> [u8; 28] {
     let mut buf = [0u8; 28];
@@ -1073,6 +1128,50 @@ mod tests {
         assert!(summary.uses_whatsapp_profile_extension);
         assert_eq!(summary.feedback[0].fmt, 1);
         assert_eq!(summary.referenced_ssrcs, [video]);
+    }
+
+    /// Both builders, byte for byte, and back through the parser that reads a
+    /// peer's. They differ in one bit, which the profile flag decides.
+    #[test]
+    fn picture_loss_indications_match_the_wire_layout() {
+        let sender = 0x1111_2222u32;
+        let video = 0x5555_6666u32;
+
+        let plain = build_picture_loss_indication(sender, video);
+        assert_eq!(&plain[..4], &[0x81, RTCP_PT_PSFB, 0, 2]);
+        assert_eq!(&plain[4..8], &sender.to_be_bytes());
+        assert_eq!(&plain[8..12], &video.to_be_bytes());
+        // No FCI: a sequence number is what the 16-byte form adds, and the
+        // builder's doc says why we do not send it.
+        assert_eq!(plain.len(), 12);
+
+        assert_eq!(
+            build_whatsapp_picture_loss_indication(sender, video, false),
+            plain,
+            "off the profile, the WhatsApp spelling is the RFC one"
+        );
+        let profile = build_whatsapp_picture_loss_indication(sender, video, true);
+        assert_eq!(profile[0], 0x91);
+        assert_eq!(&profile[1..], &plain[1..]);
+
+        for packet in [plain, profile] {
+            let summary = summarize_rtcp(&packet).expect("a PLI parses as one");
+            assert_eq!(summary.feedback[0].fmt, 1);
+            assert_eq!(summary.feedback[0].media_ssrc, video);
+            assert!(summary.feedback[0].fci.is_empty());
+            assert_eq!(summary.referenced_ssrcs, [video]);
+        }
+        // The bit is the only difference the parser sees, in both directions.
+        assert!(
+            summarize_rtcp(&profile)
+                .expect("a PLI parses as one")
+                .uses_whatsapp_profile_extension
+        );
+        assert!(
+            !summarize_rtcp(&plain)
+                .expect("a PLI parses as one")
+                .uses_whatsapp_profile_extension
+        );
     }
 
     #[test]

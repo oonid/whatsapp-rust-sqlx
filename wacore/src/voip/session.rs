@@ -10,7 +10,8 @@ use super::e2e_srtp::{
 };
 use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, PacketizedAu, au_has_idr, packetize_au};
 use super::rtcp::{
-    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN, build_whatsapp_rtcp_cname,
+    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN,
+    build_whatsapp_picture_loss_indication, build_whatsapp_rtcp_cname,
     build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description,
     parse_rtcp_sender_ssrc,
 };
@@ -456,6 +457,17 @@ impl SrtcpSender {
         out
     }
 
+    /// Build and SRTCP-protect a Picture Loss Indication naming `media_ssrc`.
+    ///
+    /// On this sender's own profile, like every other report it emits: the bit
+    /// is a property of the session, not of the packet kind.
+    fn picture_loss_indication(&mut self, ssrc: u32, media_ssrc: u32) -> Vec<u8> {
+        self.protect(
+            ssrc,
+            &build_whatsapp_picture_loss_indication(ssrc, media_ssrc, self.profile_extension),
+        )
+    }
+
     fn source_description(&mut self, ssrc: u32) -> Vec<u8> {
         self.protect(
             ssrc,
@@ -881,6 +893,32 @@ impl VideoPipeline {
         self.rtp.ssrc
     }
 
+    /// The peer stream this pipeline is reassembling, once one has authenticated.
+    ///
+    /// What a PLI names, and therefore what the rate at which we complain about
+    /// it belongs to: a caller holding both can tell a second complaint about
+    /// one picture from the first about a new one.
+    pub(crate) fn inbound_ssrc(&self) -> Option<u32> {
+        self.depacketizer_ssrc
+    }
+
+    /// Ask the peer for a keyframe, or `None` when there is nobody to ask.
+    ///
+    /// Addressed to `depacketizer_ssrc`, the peer stream this pipeline is
+    /// actually reassembling, rather than to any SSRC that has ever
+    /// authenticated: a PLI naming a stream the peer has renumbered away from
+    /// asks for a reset of something it no longer sends. Absent until the
+    /// first packet authenticates, which is the honest answer -- before that
+    /// there is no inbound stream to have lost.
+    ///
+    /// On the native video profile, and protected under our own SSRC, like
+    /// every other report this sender emits.
+    pub(crate) fn picture_loss_indication(&mut self) -> Option<Vec<u8>> {
+        let media_ssrc = self.depacketizer_ssrc?;
+        let ours = self.rtp.ssrc;
+        Some(self.srtcp.picture_loss_indication(ours, media_ssrc))
+    }
+
     pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {
         self.rtp.ssrc = ssrc;
     }
@@ -902,12 +940,7 @@ impl VideoPipeline {
         };
         self.recv_keys = keys;
         self.recv_streams = SrtpRecvStreams::default();
-        self.depacketizer.reset();
-        self.depacketizer_ssrc = None;
-        self.retired_ssrcs.clear();
-        self.contender_ssrc = None;
-        self.packets_since_stream_change = 0;
-        self.retired_ssrc_run = 0;
+        self.reset_depacketizer();
         true
     }
 
@@ -943,6 +976,27 @@ impl VideoPipeline {
         };
         self.recv_keys = recv_keys;
         true
+    }
+
+    /// Drop what the depacketizer holds without forgetting which streams have
+    /// left.
+    ///
+    /// For a change on *our* side -- a local video downgrade and resume -- where
+    /// the peer is still the peer: [`Self::reset_depacketizer`] would also clear
+    /// `retired_ssrcs`, and a straggler from a stream the peer renumbered away
+    /// from would then take possession of a plane that has just come back, so
+    /// anything addressed to the stream being reassembled would name a stream
+    /// nobody is sending.
+    /// The retired list is the only thing kept: it is a fact about the peer,
+    /// which did not change. The run and grace counters are evidence about
+    /// packets that arrived before the pause, and a reclaim part-way through one
+    /// would otherwise be completed by fewer stragglers than it takes to earn.
+    pub(crate) fn reset_reassembly(&mut self) {
+        self.depacketizer.reset();
+        self.depacketizer_ssrc = None;
+        self.contender_ssrc = None;
+        self.packets_since_stream_change = 0;
+        self.retired_ssrc_run = 0;
     }
 
     pub(crate) fn reset_depacketizer(&mut self) {
@@ -2034,6 +2088,72 @@ mod tests {
         assert_eq!(
             delivered, 8,
             "the live stream must keep reassembly; one latecomer is not a resumption"
+        );
+    }
+
+    // A local downgrade and resume drops possession, which is what the run being built was counted
+    // against. Carried across the pause, two stragglers from a stream the peer had already
+    // renumbered away from -- one either side of the reset -- completed a single reclaim between
+    // them, and the resumed plane went to the stream nobody is sending.
+    //
+    // The live stream takes it back on its next packet, because the wrongly seated straggler
+    // retired nothing on the way in, so this is one discarded access unit rather than a freeze.
+    // The window matters anyway: a keyframe request made inside it names the wrong stream, which
+    // is the one thing this feature exists to get right.
+    #[test]
+    fn a_resumed_plane_does_not_complete_a_reclaim_begun_before_it() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut original = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut replacement = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(60);
+        let packet = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        // The peer renumbers and stays there, well past the grace.
+        for _ in 0..(RETIRED_SSRC_GRACE_PACKETS + 4) {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&packet);
+        }
+
+        // Part of a run from the retired stream, one short of reclaiming.
+        for _ in 0..(RETIRED_SSRC_RESUME_PACKETS - 1) {
+            let au = video_au(60);
+            let straggler = original.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&straggler);
+        }
+
+        rx.reset_reassembly();
+
+        // One more straggler must not finish what the pause interrupted: seating it would deliver
+        // its access unit, which is what taking the plane looks like from here.
+        let au = video_au(60);
+        let straggler = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(
+            rx.unprotect_video(&straggler),
+            None,
+            "a straggler must not take the resumed plane on a run built before the reset"
+        );
+
+        let mut delivered = 0;
+        for _ in 0..8 {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            if rx.unprotect_video(&packet) == Some(vec![au]) {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 8,
+            "the stream the peer is actually sending must take the resumed plane"
         );
     }
 
