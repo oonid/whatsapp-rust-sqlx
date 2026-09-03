@@ -375,7 +375,15 @@ impl Client {
         let device_snapshot = persistence_manager.get_device_snapshot();
         let core = wacore::client::CoreClient::new(device_snapshot.core.clone());
 
-        let (tx, rx) = async_channel::bounded(32);
+        // `MajorSyncTask` queue. 8 slots, not 32: `async_channel` allocates the
+        // whole ring up front (~66 B/slot), so the depth is always-resident
+        // structure on every client, and this queue is empty on every idle one.
+        // The producers are history-sync and app-state notifications — rare, and
+        // history sync is separately concurrency-capped at 2 in the worker — so a
+        // backlog deeper than 8 means the worker is wedged, in which case
+        // back-pressuring a detached notification handler is the better answer
+        // than buffering more of them.
+        let (tx, rx) = async_channel::bounded(8);
 
         let device_topology = device_topology::DeviceTopology::new();
         let sent_frame_tap = Arc::new(SentFrameTap::new(core.event_bus.clone()));
@@ -388,14 +396,14 @@ impl Client {
             ),
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
-            is_logged_in: Arc::new(AtomicBool::new(false)),
+            is_logged_in: AtomicBool::new(false),
             #[cfg(feature = "client-lifecycle")]
             login_transition: std::sync::Mutex::new(()),
-            is_connecting: Arc::new(AtomicBool::new(false)),
-            is_running: Arc::new(AtomicBool::new(false)),
-            is_connected: Arc::new(AtomicBool::new(false)),
+            is_connecting: AtomicBool::new(false),
+            is_running: AtomicBool::new(false),
+            is_connected: AtomicBool::new(false),
             send_active_receipts: AtomicU32::new(0),
-            ik_handshake_failures: Arc::new(AtomicU32::new(0)),
+            ik_handshake_failures: AtomicU32::new(0),
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
             #[cfg(feature = "client-lifecycle")]
@@ -422,7 +430,7 @@ impl Client {
             message_processing_semaphore: std::sync::Mutex::new(Arc::new(
                 async_lock::Semaphore::new(1),
             )),
-            message_semaphore_generation: Arc::new(AtomicU64::new(0)),
+            message_semaphore_generation: AtomicU64::new(0),
             // Coordination caches: capacity-only eviction, no TTL/TTI.
             // These hold live mutexes and channel senders; time-based eviction
             // while tasks hold references would silently break serialisation.
@@ -446,7 +454,7 @@ impl Client {
             ab_props: Arc::new(wacore::store::ab_props::AbPropsCache::new()),
             group_cache: std::sync::OnceLock::new(),
 
-            expected_disconnect: Arc::new(AtomicBool::new(false)),
+            expected_disconnect: AtomicBool::new(false),
             intentional_reconnect: AtomicBool::new(false),
             connection_generation: Arc::new(AtomicU64::new(0)),
 
@@ -487,13 +495,13 @@ impl Client {
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
             paused: AtomicBool::new(false),
-            pause_state_notifier: Arc::new(event_listener::Event::new()),
+            pause_state_notifier: event_listener::Event::new(),
             pause_teardown_pending: AtomicBool::new(false),
             pause_generation: AtomicU64::new(0),
             connection_publish: Mutex::new(()),
-            auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
-            connected_at: Arc::new(wacore::time::AtomicInstant::unset()),
-            backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
+            auto_reconnect_errors: AtomicU32::new(0),
+            connected_at: wacore::time::AtomicInstant::unset(),
+            backoff_reset_suppressed: AtomicBool::new(false),
 
             needs_initial_full_sync: Arc::new(app_state::BootstrapGate::new(false)),
 
@@ -502,13 +510,13 @@ impl Client {
             app_state_syncing: app_state::SyncInFlight::new(),
             app_state_send_lock: Arc::new(Mutex::new(())),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
-            initial_app_state_keys_received: Arc::new(AtomicBool::new(false)),
+            initial_app_state_keys_received: AtomicBool::new(false),
             prekey_upload_lock: Arc::new(Mutex::new(())),
             signed_pre_key_rotation_lock: Arc::new(Mutex::new(())),
-            offline_sync_notifier: Arc::new(event_listener::Event::new()),
-            offline_sync_completed: Arc::new(AtomicBool::new(false)),
-            offline_sync_finish_started: Arc::new(AtomicU64::new(0)),
-            offline_terminal_reported: Arc::new(AtomicU64::new(0)),
+            offline_sync_notifier: event_listener::Event::new(),
+            offline_sync_completed: AtomicBool::new(false),
+            offline_sync_finish_started: AtomicU64::new(0),
+            offline_terminal_reported: AtomicU64::new(0),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
@@ -516,11 +524,11 @@ impl Client {
             delivery_receipt_queue: std::sync::OnceLock::new(),
             transport_ack_queue: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            socket_ready_notifier: Arc::new(event_listener::Event::new()),
-            is_ready: Arc::new(AtomicBool::new(false)),
-            connected_notifier: Arc::new(event_listener::Event::new()),
-            authenticated_generation: Arc::new(AtomicU64::new(NO_AUTHENTICATED_GENERATION)),
-            session_state_notifier: Arc::new(event_listener::Event::new()),
+            socket_ready_notifier: event_listener::Event::new(),
+            is_ready: AtomicBool::new(false),
+            connected_notifier: event_listener::Event::new(),
+            authenticated_generation: AtomicU64::new(NO_AUTHENTICATED_GENERATION),
+            session_state_notifier: event_listener::Event::new(),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
@@ -1922,13 +1930,6 @@ impl Client {
         // Drop stale media connection (auth tokens become invalid on reconnect)
         *self.media_conn.write().await = None;
 
-        // Clear app state key cache — keys will be re-fetched from DB on demand
-        // main took the processor out of the mutex before awaiting so the guard
-        // did not span the clear; the write-once cell has no guard to span, so
-        // the borrow is the whole of it.
-        if let Some(proc) = self.app_state_processor.get() {
-            proc.clear_key_cache().await;
-        }
         #[cfg(feature = "client-lifecycle")]
         drop(scope_close);
     }
@@ -2326,6 +2327,81 @@ impl Drop for Connection<'_> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// What one `Client` costs before it has connected, cached or received
+    /// anything: pure structure, shared `PersistenceManager` and backend
+    /// excluded (they are one per client only in the simplest deployments).
+    ///
+    /// The guard is what keeps the per-client footprint from drifting upward a
+    /// field at a time on a host running hundreds of sessions in one process.
+    /// Bounds, not exact figures: allocator sizes and struct layout are not the
+    /// contract, the order of magnitude is.
+    #[tokio::test]
+    async fn one_client_costs_a_bounded_amount_of_fixed_structure() {
+        // Generous enough that a layout change does not fail this, tight enough
+        // that a new eager `Arc` per cache (the shape this replaced) would: that
+        // shape cost ~20 allocations and ~3.9 KB more. The allocation count is
+        // the looser of the two on purpose: the minimum this window observes
+        // moved by 20 between one machine and CI (112 against 132), so the
+        // bound leaves room for that without letting the replaced shape back in.
+        const MAX_BYTES_PER_CLIENT: i64 = 17_000;
+        const MAX_ALLOCS_PER_CLIENT: u64 = 160;
+        const CLIENTS: usize = 16;
+
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let transport_factory: Arc<dyn crate::transport::TransportFactory> =
+            Arc::new(crate::transport::mock::MockTransportFactory::new());
+        let http_client: Arc<dyn crate::http::HttpClient> =
+            Arc::new(crate::test_utils::MockHttpClient);
+        let cache_config = CacheConfig::default();
+
+        let build = || {
+            Client::assemble(
+                runtime.clone(),
+                persistence_manager.clone(),
+                transport_factory.clone(),
+                http_client.clone(),
+                None,
+                cache_config.clone(),
+                ClientExtensions {
+                    #[cfg(feature = "client-lifecycle")]
+                    lifecycle: None,
+                    #[cfg(feature = "plugins")]
+                    plugin_host: None,
+                },
+            )
+        };
+
+        // One client first, so process-wide lazies a first construction happens
+        // to fill are not charged to the steady state.
+        drop(build());
+
+        // A stack array, not a `Vec`: the collection holding the clients must not
+        // allocate inside the measured window.
+        let (bytes, allocs) = crate::test_alloc::min_live(
+            (
+                MAX_BYTES_PER_CLIENT * CLIENTS as i64,
+                MAX_ALLOCS_PER_CLIENT * CLIENTS as u64,
+            ),
+            || std::array::from_fn::<_, CLIENTS, _>(|_| build()),
+        );
+
+        // The aggregate is what is compared: dividing first would let a total
+        // up to `CLIENTS - 1` over the scaled budget round down into it.
+        let bytes_per_client = bytes / CLIENTS as i64;
+        let allocs_per_client = allocs / CLIENTS as u64;
+        assert!(
+            bytes <= MAX_BYTES_PER_CLIENT * CLIENTS as i64
+                && allocs <= MAX_ALLOCS_PER_CLIENT * CLIENTS as u64,
+            "a Client costs {bytes_per_client} B in {allocs_per_client} allocations; \
+             the budget is {MAX_BYTES_PER_CLIENT} B / {MAX_ALLOCS_PER_CLIENT} allocations",
+        );
+    }
 
     /// A connection with one frame already waiting on it, and everything needed
     /// to see whether that frame ever becomes a node.

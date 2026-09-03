@@ -14,9 +14,15 @@
 #[allow(clippy::disallowed_types)]
 pub(crate) mod test_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
     pub(crate) static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    /// Bytes currently live, as a wrapping signed counter: allocation adds, free
+    /// subtracts, so a *delta* over a window is what that window still holds even
+    /// though the absolute value is meaningless (the process was already running
+    /// when counting started). Wrapping arithmetic keeps a window that frees more
+    /// than it allocates from being a panic in debug.
+    pub(crate) static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
 
     /// Size of the largest single block requested since it was last reset.
     /// Separate from `ALLOCS` because the two answer different questions: a
@@ -30,13 +36,63 @@ pub(crate) mod test_alloc {
     unsafe impl GlobalAlloc for CountingAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
+            LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
             MAX_BLOCK.fetch_max(layout.size(), Ordering::Relaxed);
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
             unsafe { System.dealloc(ptr, layout) }
         }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+            MAX_BLOCK.fetch_max(new_size, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    /// The quietest (live bytes, allocations) delta observed while running `op`,
+    /// retrying until one sample is within `expected` on both counts.
+    ///
+    /// Same contract and the same reason as [`min_allocs`]: both counters are
+    /// process-wide, so a sibling test thread allocating inside the window
+    /// inflates that window. Retrying until the window lands quiet makes ambient
+    /// traffic cost iterations instead of a false failure, and a real regression
+    /// never reaches `expected`, so the caller's assertion still fires with what
+    /// was actually observed.
+    pub(crate) fn min_live<T>(expected: (i64, u64), mut op: impl FnMut() -> T) -> (i64, u64) {
+        const BUDGET: u32 = 10_000;
+
+        let mut best = (i64::MAX, u64::MAX);
+        for _ in 0..BUDGET {
+            let (bytes_before, allocs_before) = (
+                LIVE_BYTES.load(Ordering::Relaxed),
+                ALLOCS.load(Ordering::Relaxed),
+            );
+            let held = std::hint::black_box(op());
+            let (bytes, allocs) = (
+                LIVE_BYTES
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(bytes_before),
+                ALLOCS.load(Ordering::Relaxed) - allocs_before,
+            );
+            // Dropped outside the window: what it frees is not this window's.
+            drop(held);
+            let sample = (bytes, allocs);
+            if sample.0 <= expected.0 && sample.1 <= expected.1 {
+                return sample;
+            }
+            // Always one real window, never minima stitched from two: ambient
+            // traffic inflates both counters together, so the sample with the
+            // fewest allocations is the quietest one this window saw.
+            if (sample.1, sample.0) < (best.1, best.0) {
+                best = sample;
+            }
+        }
+        best
     }
 
     #[global_allocator]

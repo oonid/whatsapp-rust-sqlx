@@ -474,6 +474,116 @@ pub struct MessageInfo {
     pub bcl_participants: Vec<Jid>,
 }
 
+impl crate::stats::HeapSize for MessageSource {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        self.chat.heap_bytes()
+            + self.sender.heap_bytes()
+            + [
+                &self.sender_alt,
+                &self.recipient_alt,
+                &self.broadcast_list_owner,
+                &self.recipient,
+            ]
+            .iter()
+            .filter_map(|jid| jid.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+    }
+}
+
+impl crate::stats::HeapSize for MsgBotInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        self.edit_target_id.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
+}
+
+impl crate::stats::HeapSize for MsgMetaInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        let spilled = |bytes: &Option<ReportingBytes>| {
+            bytes
+                .as_ref()
+                .filter(|b| b.spilled())
+                .map_or(0, |b| b.capacity())
+        };
+        [
+            &self.target_id,
+            &self.thread_message_id,
+            &self.content_type,
+            &self.appdata,
+        ]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .map(HeapSize::heap_bytes)
+        .sum::<usize>()
+            + [
+                &self.target_sender,
+                &self.target_chat,
+                &self.thread_message_sender_jid,
+            ]
+            .iter()
+            .filter_map(|jid| jid.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+            + spilled(&self.reporting_tag)
+            + spilled(&self.reporting_token)
+    }
+}
+
+impl crate::stats::HeapSize for DeviceSentMeta {
+    fn heap_bytes(&self) -> usize {
+        self.destination_jid.heap_bytes() + self.phash.heap_bytes()
+    }
+}
+
+/// Every allocation the message owns, the boxed sub-structs and the fallback
+/// enum payloads included. All of them are absent on the overwhelming majority
+/// of messages, but a buffer that retains whole messages
+/// (`offline_receipt_buffer`) is exactly where a report that skipped them would
+/// read quietest while it grows.
+impl crate::stats::HeapSize for MessageInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        fn boxed<T: HeapSize>(value: &Option<Box<T>>) -> usize {
+            value
+                .as_ref()
+                .map_or(0, |v| size_of::<T>() + v.heap_bytes())
+        }
+        self.source.heap_bytes()
+            + self.id.heap_bytes()
+            + self.push_name.heap_bytes()
+            + match &self.category {
+                MessageCategory::Other(value) => value.heap_bytes(),
+                _ => 0,
+            }
+            + match &self.edit {
+                EditAttribute::Unknown(value) => value.heap_bytes(),
+                _ => 0,
+            }
+            + boxed(&self.bot_info)
+            + boxed(&self.meta_info)
+            + boxed(&self.verified_name)
+            + boxed(&self.device_sent_meta)
+            + self
+                .unavailable_request_id
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.verified_level.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self
+                .peer_recipient_pn
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.bcl_participants.capacity() * size_of::<Jid>()
+            + self
+                .bcl_participants
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+    }
+}
+
 /// What [`MessageInfo::meta`] hands out for a stanza that carried no `<meta>`
 /// or `<reporting>` child: every field `None`, shared by every such message.
 static EMPTY_META: std::sync::LazyLock<MsgMetaInfo> =
@@ -521,6 +631,55 @@ mod tests {
             EditAttribute::from("99"),
             EditAttribute::Unknown("99".to_owned())
         );
+    }
+
+    /// The fallback enum payloads and the boxed sub-structs are the only places
+    /// a `MessageInfo` can hold an allocation the report would otherwise miss.
+    #[test]
+    fn message_info_heap_bytes_counts_the_fallback_strings_and_boxed_metadata() {
+        use crate::stanza::business::VerifiedName;
+        use crate::stats::HeapSize;
+
+        let baseline = MessageInfo::default().heap_bytes();
+
+        let category = "some-category";
+        let edit = "99";
+        let business = "Fictitious Business";
+        let certificate = vec![0u8; 64];
+        let target_id = "a-target-id-longer-than-twenty-four-bytes";
+        let destination = "19045550180@s.whatsapp.net";
+
+        let mut info = MessageInfo {
+            category: MessageCategory::Other(category.to_owned()),
+            edit: EditAttribute::Unknown(edit.to_owned()),
+            ..Default::default()
+        };
+        info.verified_name = Some(Box::new(VerifiedName {
+            name: Some(business.to_owned()),
+            serial: None,
+            issuer: None,
+            certificate: Some(certificate.clone()),
+        }));
+        info.meta_info = Some(Box::new(MsgMetaInfo {
+            target_id: Some(target_id.into()),
+            ..Default::default()
+        }));
+        info.device_sent_meta = Some(Box::new(DeviceSentMeta {
+            destination_jid: destination.to_owned(),
+            phash: String::new(),
+        }));
+
+        let expected = baseline
+            + category.len()
+            + edit.len()
+            + size_of::<VerifiedName>()
+            + business.len()
+            + certificate.capacity()
+            + size_of::<MsgMetaInfo>()
+            + target_id.len()
+            + size_of::<DeviceSentMeta>()
+            + destination.len();
+        assert_eq!(info.heap_bytes(), expected);
     }
 
     #[test]
