@@ -283,10 +283,11 @@ impl Client {
     /// `is_offline` mirrors the single-entry path: skip the persist task for
     /// offline replays; mappings are re-learned from the next live event.
     ///
-    /// Takes owned `(lid, phone_number)` pairs; each `String` moves directly
-    /// into the `LidPnEntry` stored in the cache, then (via `into_iter`) into
-    /// the `LidPnMappingEntry` that's persisted — no clones on either step.
-    /// The `Vec` itself is consumed, so no copy of the outer container either.
+    /// Takes owned `(lid, phone_number)` pairs. The record path borrows them,
+    /// so each is copied once into the `Arc<str>` fields of the `LidPnEntry`
+    /// stored in the cache. The entries stay alive across the backend write so
+    /// the persisted markers share those `Arc<str>`s; the storage row copies
+    /// them a second time into its own `String` fields.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.learn_lid_pn_batch", level = "debug", skip_all, fields(count = mappings.len(), is_offline = is_offline)))]
     pub(crate) async fn learn_lid_pn_mappings_batch(
         self: &Arc<Self>,
@@ -579,7 +580,7 @@ impl Client {
         // After the write, not before: a failed persist stays un-marked so the
         // next live message retries instead of skipping.
         self.lid_pn_cache
-            .mark_persisted(&storage_entry.phone_number, &storage_entry.lid)
+            .mark_persisted(&entry.phone_number, &entry.lid)
             .await;
 
         if needs_migration {
@@ -617,11 +618,11 @@ impl Client {
     ) -> Result<Vec<LidPnMappingEntry>> {
         use anyhow::anyhow;
 
-        // Consume entries so `lid`/`phone_number` move into storage rather
-        // than being cloned. Only `learning_source` is allocated, and only
-        // because `LidPnMappingEntry.learning_source` is a `String` field.
+        // The storage row copies `lid`/`phone_number` into `String`s because
+        // `LidPnMappingEntry` is a `String` type; the cache's persisted marker
+        // keeps sharing the entry's `Arc<str>` pair instead.
         let storage: Vec<LidPnMappingEntry> = entries
-            .into_iter()
+            .iter()
             .map(|entry| LidPnMappingEntry {
                 lid: entry.lid.to_string(),
                 phone_number: entry.phone_number.to_string(),
@@ -637,7 +638,7 @@ impl Client {
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
-        for entry in &storage {
+        for entry in &entries {
             self.lid_pn_cache
                 .mark_persisted(&entry.phone_number, &entry.lid)
                 .await;
@@ -1645,7 +1646,10 @@ mod tests {
             .await;
         assert_eq!(retry.migration_flags, vec![true]);
 
-        client.lid_pn_cache.mark_persisted(phone, lid).await;
+        client
+            .lid_pn_cache
+            .mark_persisted(&Arc::from(phone), &Arc::from(lid))
+            .await;
         let durable = client
             .record_lid_pn_batch_in_memory(mapping(), LearningSource::Other)
             .await;
