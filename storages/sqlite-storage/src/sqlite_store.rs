@@ -306,6 +306,30 @@ pub type ConnectionInitHook = Arc<
 ///
 /// Sessions that share one database file can go further and share the connection
 /// itself: see [`SqliteStore::share_for_device`].
+///
+/// **The other profile: one long-lived session, one large database.** A process
+/// that pairs once and stays connected for weeks — a bot — is the opposite
+/// shape from the default's assumption. There is one store, not fifty, and its
+/// database reaches a few hundred MB (`msg_secrets` dominates it; its
+/// `CacheConfig::msg_secret_retention` horizon is what sets the size). Against
+/// that file a 512 KiB page cache is a fraction of a percent, so nearly every
+/// b-tree descent is an OS read, and one reader connection means the decrypt
+/// path queues behind whatever write is in flight. The default is not raised
+/// for everyone because the density case is real and pays for both in memory;
+/// name the profile instead:
+///
+/// ```
+/// # use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
+/// let config = SqliteStoreConfig {
+///     // A warm cache for a database far larger than the default assumes.
+///     cache_size_kib: 16 * 1024,
+///     // Two readers, so a session lookup never waits out a write-behind flush.
+///     read_pool_size: 2,
+///     ..Default::default()
+/// }
+/// // Optional: moves reads onto reclaimable file-backed pages.
+/// .with_mmap_size(256 * 1024 * 1024);
+/// ```
 #[derive(Clone)]
 pub struct SqliteStoreConfig {
     /// Max concurrent operations: r2d2 `max_size` AND the internal semaphore permits,
@@ -489,6 +513,13 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
             format!("PRAGMA cache_size = -{};", self.cache_size_kib),
             "PRAGMA temp_store = memory;".to_string(),
             "PRAGMA foreign_keys = ON;".to_string(),
+            // A WAL grows to the largest single transaction ever committed and,
+            // with no limit set, stays that size for the life of the file: an
+            // auto-checkpoint only resets the WAL, it never shortens it. The
+            // history-sync msg_secrets seed is one such transaction, so a
+            // month-long process pays its peak forever. 32 MiB is well above any
+            // ordinary commit here, so the cap only ever trims the outlier.
+            "PRAGMA journal_size_limit = 33554432;".to_string(),
         ];
         // Opt-in: emit mmap_size only for a non-zero value, so the default keeps
         // SQLite's mmap off (current behavior).
@@ -534,6 +565,74 @@ fn parse_database_path(database_url: &str) -> Result<String> {
     }
 
     Ok(path.to_string())
+}
+
+/// The filesystem path behind a parsed database path, for sidecar files.
+///
+/// `parse_database_path` keeps a `file:` scheme because SQLite wants it back
+/// verbatim, but the WAL and shm sidecars live beside the *file* the scheme
+/// names: `file:db.sqlite?mode=rwc` writes `db.sqlite-wal`, not
+/// `file:db.sqlite-wal`. `file:///abs/path` is the same file as `/abs/path`.
+///
+/// The scheme is also what decides whether `%20` is an escape: inside a URI
+/// SQLite decodes it, so `file:/tmp/my%20db.sqlite` opens `/tmp/my db.sqlite`
+/// and writes `/tmp/my db.sqlite-wal`. A bare path is a filename SQLite passes
+/// through untouched, where the same three characters are themselves the name
+/// — so decoding happens only on the URI branch, and `Cow` keeps the common
+/// case (no escape to expand) allocation-free.
+fn filesystem_path(database_path: &str) -> std::borrow::Cow<'_, str> {
+    let Some(path) = database_path
+        .strip_prefix("file://")
+        .or_else(|| database_path.strip_prefix("file:"))
+    else {
+        return std::borrow::Cow::Borrowed(database_path);
+    };
+    // `file://localhost/abs` names the local file too; nothing else after the
+    // authority slashes is a path this crate would have opened.
+    let path = path
+        .strip_prefix("localhost/")
+        .map_or(path, |rest| &path[path.len() - rest.len() - 1..]);
+    percent_decode(path)
+}
+
+/// Expand `%HH` escapes, the way SQLite does when it parses a URI filename.
+///
+/// A `%` that does not introduce two hex digits stays literal, which is also
+/// SQLite's behaviour: it decodes what it recognizes and copies the rest.
+fn percent_decode(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains('%') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1).zip(bytes.get(i + 2)))
+            .flatten()
+            .and_then(|(hi, lo)| {
+                Some(
+                    (char::from(*hi).to_digit(16)? << 4) as u8
+                        | char::from(*lo).to_digit(16)? as u8,
+                )
+            });
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    // A decoded escape can only be invalid UTF-8 if the URI carried one, in
+    // which case the original text is the closest thing to a usable path.
+    String::from_utf8(out).map_or_else(
+        |_| std::borrow::Cow::Borrowed(path),
+        std::borrow::Cow::Owned,
+    )
 }
 
 /// Whether the URI asks SQLite for shared cache.
@@ -3241,6 +3340,22 @@ impl ProtocolStore for SqliteStore {
         Ok(())
     }
 
+    async fn delete_expired_base_keys(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let device_id = self.device_id;
+        self.with_retry("delete_expired_base_keys", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    base_keys::table
+                        .filter(base_keys::created_at.lt(cutoff_timestamp as i32))
+                        .filter(base_keys::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
+        })
+        .await
+    }
+
     async fn update_device_list(&self, record: DeviceListRecord) -> Result<()> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -3647,36 +3762,36 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
-        crate::pool::spawn_blocking(move || -> Result<u32> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // Remove a row only when its received token is expired-or-absent AND
-            // its sender bucket is expired-or-absent, so recent sender state
-            // survives an expired received token (and vice versa). A null
-            // sender_timestamp counts as stale.
-            let deleted = diesel::delete(
-                tc_tokens::table
-                    .filter(
-                        tc_tokens::token
-                            .eq(Vec::<u8>::new())
-                            .or(tc_tokens::token_timestamp.lt(token_cutoff)),
-                    )
-                    .filter(
-                        tc_tokens::sender_timestamp
-                            .is_null()
-                            .or(tc_tokens::sender_timestamp.lt(sender_cutoff)),
-                    )
-                    .filter(tc_tokens::device_id.eq(device_id)),
-            )
-            .execute(&mut *conn)
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(deleted as u32)
+        // Through the write queue, like every other retention sweep: a bare
+        // `pool.get()` here would park a blocking thread on r2d2's 30 s
+        // connection timeout behind whatever holds the single connection, and
+        // then fail the sweep outright instead of waiting its turn.
+        self.with_retry("delete_expired_tc_tokens", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Remove a row only when its received token is expired-or-absent AND
+                // its sender bucket is expired-or-absent, so recent sender state
+                // survives an expired received token (and vice versa). A null
+                // sender_timestamp counts as stale.
+                let deleted = diesel::delete(
+                    tc_tokens::table
+                        .filter(
+                            tc_tokens::token
+                                .eq(Vec::<u8>::new())
+                                .or(tc_tokens::token_timestamp.lt(token_cutoff)),
+                        )
+                        .filter(
+                            tc_tokens::sender_timestamp
+                                .is_null()
+                                .or(tc_tokens::sender_timestamp.lt(sender_cutoff)),
+                        )
+                        .filter(tc_tokens::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn store_received_tc_token(
@@ -3851,23 +3966,19 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_expired_sent_messages(&self, cutoff_timestamp: i64) -> Result<u32> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
-        crate::pool::spawn_blocking(move || -> Result<u32> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let deleted = diesel::delete(
-                sent_messages::table
-                    .filter(sent_messages::created_at.lt(cutoff_timestamp))
-                    .filter(sent_messages::device_id.eq(device_id)),
-            )
-            .execute(&mut *conn)
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(deleted as u32)
+        self.with_retry("delete_expired_sent_messages", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    sent_messages::table
+                        .filter(sent_messages::created_at.lt(cutoff_timestamp))
+                        .filter(sent_messages::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn store_pending_inbound(
@@ -3947,23 +4058,19 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
-        crate::pool::spawn_blocking(move || -> Result<u32> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let deleted = diesel::delete(
-                pending_inbound_messages::table
-                    .filter(pending_inbound_messages::inserted_at.lt(cutoff_timestamp))
-                    .filter(pending_inbound_messages::device_id.eq(device_id)),
-            )
-            .execute(&mut *conn)
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(deleted as u32)
+        self.with_retry("delete_expired_pending_inbound", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    pending_inbound_messages::table
+                        .filter(pending_inbound_messages::inserted_at.lt(cutoff_timestamp))
+                        .filter(pending_inbound_messages::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn store_pending_inbound_batch(&self, rows: &[PendingInboundRow<'_>]) -> Result<()> {
@@ -4271,6 +4378,43 @@ impl DeviceStore for SqliteStore {
         Ok(())
     }
 
+    async fn maintenance(&self) -> Result<()> {
+        self.with_retry("maintenance", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Caps how many index rows each ANALYZE samples. Without it the
+                // first `optimize` over a table with hundreds of thousands of
+                // rows scans whole indexes; with it the pass stays in
+                // milliseconds, which is what makes it safe on a live connection.
+                diesel::sql_query("PRAGMA analysis_limit = 400;").execute(conn)?;
+                // A no-op unless a table has changed materially since the last
+                // ANALYZE, so calling it every pass costs nothing on an idle
+                // database and keeps query plans honest as tables grow past the
+                // sizes the built-in heuristics assume.
+                diesel::sql_query("PRAGMA optimize;").execute(conn)?;
+                // Opportunistic: TRUNCATE is the only checkpoint mode that
+                // returns the -wal file's blocks to the filesystem, and it
+                // declines rather than blocks when a reader still holds a
+                // snapshot (the reader pool, or another process). It reports that
+                // by returning busy in its result row, and on some builds as
+                // SQLITE_BUSY, so a skipped truncate is the normal outcome and
+                // never a reason to fail the pass.
+                //
+                // Only that outcome is swallowed, though: an I/O error, a full
+                // disk or a permission problem says the log could not be
+                // written back at all, which is exactly the condition this pass
+                // exists to catch — and discarding it would hand `with_retry`
+                // and the keepalive a success they could neither retry nor log.
+                if let Err(e) = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE);").execute(conn)
+                    && !is_retriable_sqlite_error(&e)
+                {
+                    return Err(e);
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// Per-session storage memory, the largest per-session chunk in the
     /// profiling that motivated this (the default 512 KiB page cache).
     ///
@@ -4295,6 +4439,7 @@ impl DeviceStore for SqliteStore {
         // pool's, so a report that counted only one pool would under-state a
         // read-enabled store by the whole reader side.
         let read_pool = self.reads.as_ref().map(|reads| reads.pool.clone());
+        let database_path = self.database_path.clone();
         crate::pool::spawn_blocking(move || {
             // Non-blocking checkout: this report is best-effort, so contention
             // (e.g. a long write holding the only connection) degrades to "not
@@ -4331,6 +4476,15 @@ impl DeviceStore for SqliteStore {
             wacore::stats::StorageResourceReport {
                 memory_bytes: Some(per_conn_cache.saturating_mul(open_connections)),
                 pages: Some(page_count),
+                // Both are separately optional: a missing one is "not reported",
+                // and neither is worth discarding the memory estimate over.
+                free_pages: pragma_i64(&mut conn, "freelist_count").map(|n| n.max(0) as u64),
+                // The WAL is a sidecar file, so its size comes from the
+                // filesystem rather than a pragma. Absent for in-memory and
+                // non-WAL databases, which is exactly the honest answer there.
+                wal_bytes: std::fs::metadata(format!("{}-wal", filesystem_path(&database_path)))
+                    .ok()
+                    .map(|m| m.len()),
                 ..Default::default()
             }
         })
@@ -7569,5 +7723,421 @@ mod share_for_device_tests {
             "no sibling may starve on the shared write queue: \
              fastest {fastest:?}, slowest {slowest:?}"
         );
+    }
+}
+
+/// Periodic engine maintenance: the WAL cap and the `maintenance()` pass.
+#[cfg(test)]
+mod maintenance_tests {
+    use super::read_routing_tests::TempDb;
+    use super::*;
+
+    /// The `-wal` sidecar's size, or 0 when it has already been truncated away.
+    fn wal_bytes(db: &TempDb) -> u64 {
+        std::fs::metadata(format!("{}-wal", db.url()))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_runs_maintenance_and_caps_its_wal() {
+        let db = TempDb::new("maintenance_fresh");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+
+        #[derive(diesel::QueryableByName)]
+        struct Limit {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            journal_size_limit: i64,
+        }
+        let mut conn = store.pool.get().expect("connection");
+        let limit: Limit = diesel::sql_query("PRAGMA journal_size_limit")
+            .get_result(&mut *conn)
+            .expect("read journal_size_limit");
+        assert_eq!(
+            limit.journal_size_limit, 33_554_432,
+            "on_acquire caps the WAL at 32 MiB"
+        );
+        drop(conn);
+
+        DeviceStore::maintenance(&store)
+            .await
+            .expect("maintenance succeeds on a fresh store");
+    }
+
+    /// A single large transaction is what leaves a WAL permanently big, so this
+    /// writes one and then checks that the pass hands the space back.
+    /// The parsed path keeps its `file:` scheme for SQLite's sake; the WAL
+    /// sidecar does not carry one, so the report must look beside the file the
+    /// scheme names.
+    #[test]
+    fn the_wal_sidecar_is_looked_up_beside_the_file_the_uri_names() {
+        assert_eq!(filesystem_path("/tmp/db.sqlite"), "/tmp/db.sqlite");
+        assert_eq!(filesystem_path("db.sqlite"), "db.sqlite");
+        assert_eq!(filesystem_path("file:db.sqlite"), "db.sqlite");
+        assert_eq!(filesystem_path("file:/tmp/db.sqlite"), "/tmp/db.sqlite");
+        assert_eq!(filesystem_path("file:///tmp/db.sqlite"), "/tmp/db.sqlite");
+        assert_eq!(
+            filesystem_path("file://localhost/tmp/db.sqlite"),
+            "/tmp/db.sqlite"
+        );
+        // Escapes are a URI feature: decoded behind a scheme, literal without
+        // one (a file really named `my%20db.sqlite` opens by that name).
+        assert_eq!(
+            filesystem_path("file:/tmp/my%20db.sqlite"),
+            "/tmp/my db.sqlite"
+        );
+        assert_eq!(
+            filesystem_path("file:///tmp/a%2Fb%3Fc.sqlite"),
+            "/tmp/a/b?c.sqlite"
+        );
+        assert_eq!(
+            filesystem_path("/tmp/my%20db.sqlite"),
+            "/tmp/my%20db.sqlite"
+        );
+        // A `%` that introduces no hex pair stays as it is, like SQLite's own
+        // parser.
+        assert_eq!(filesystem_path("file:/tmp/100%.sqlite"), "/tmp/100%.sqlite");
+        assert_eq!(filesystem_path("file:/tmp/a%2.sqlite"), "/tmp/a%2.sqlite");
+    }
+
+    /// The escaped counterpart of the test below: SQLite opens the decoded
+    /// name, so the sidecar probe has to decode too or it reports no WAL for a
+    /// database that has one.
+    #[tokio::test]
+    async fn a_percent_encoded_uri_store_reports_its_wal() {
+        let db = TempDb::new("maintenance uri wal");
+        let url = format!("file:{}?mode=rwc", db.url().replace(' ', "%20"));
+        assert!(url.contains("%20"), "the fixture path must carry an escape");
+        let store = SqliteStore::new(&url)
+            .await
+            .expect("store opens by an escaped URI");
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: Arc::from("19045550180@s.whatsapp.net"),
+                sender: Arc::from("100000000000002@lid"),
+                msg_id: Arc::from("MSGURIESCAPED"),
+                secret: [0x7A; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 1_700_000_000,
+            }])
+            .await
+            .expect("seed one secret");
+
+        let report = DeviceStore::resource_report(&store).await;
+        assert_eq!(
+            report.wal_bytes,
+            Some(wal_bytes(&db)),
+            "an escaped URI must resolve to the same WAL the database wrote"
+        );
+        assert!(
+            report.wal_bytes.is_some_and(|bytes| bytes > 0),
+            "the WAL exists after a write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_uri_opened_store_reports_its_wal() {
+        let db = TempDb::new("maintenance_uri_wal");
+        let url = format!("file:{}?mode=rwc", db.url());
+        let store = SqliteStore::new(&url).await.expect("store opens by URI");
+        // One write so the WAL exists on disk.
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: Arc::from("19045550180@s.whatsapp.net"),
+                sender: Arc::from("100000000000002@lid"),
+                msg_id: Arc::from("MSGURIWAL"),
+                secret: [0x7A; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 1_700_000_000,
+            }])
+            .await
+            .expect("seed one secret");
+        let report = DeviceStore::resource_report(&store).await;
+        assert_eq!(
+            report.wal_bytes,
+            Some(wal_bytes(&db)),
+            "a file: URI store must find the WAL beside the file it names"
+        );
+        assert!(
+            report.wal_bytes.is_some_and(|bytes| bytes > 0),
+            "the WAL exists after a write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_batch_leaves_no_oversized_wal_after_maintenance() {
+        const ROWS: u64 = 100_000;
+        const LIMIT: u64 = 33_554_432;
+
+        let db = TempDb::new("maintenance_wal");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let entries: Vec<MsgSecretEntry> = (0..ROWS)
+            .map(|i| MsgSecretEntry {
+                chat: Arc::from(format!("1904555{:04}@s.whatsapp.net", i % 10_000).as_str()),
+                sender: Arc::from("100000000000002@lid"),
+                msg_id: Arc::from(format!("MSG{i:016X}").as_str()),
+                secret: [0x7A; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 1_700_000_000,
+            })
+            .collect();
+        store.put_msg_secrets(entries).await.expect("seed secrets");
+
+        DeviceStore::maintenance(&store)
+            .await
+            .expect("maintenance succeeds");
+
+        let after = wal_bytes(&db);
+        assert!(
+            after <= LIMIT,
+            "the WAL must be back under the 32 MiB cap, was {after} bytes"
+        );
+
+        // The same figures an operator would read out of `resource_report`.
+        let report = DeviceStore::resource_report(&store).await;
+        assert!(report.pages.is_some_and(|p| p > 0), "page count reported");
+        assert!(report.free_pages.is_some(), "freelist reported");
+        assert_eq!(
+            report.wal_bytes,
+            Some(after),
+            "the report's WAL size is the file's"
+        );
+    }
+}
+
+/// The keepalive retention sweeps: what they delete, and that a busy write
+/// permit makes them wait their turn rather than fail.
+#[cfg(test)]
+mod retention_sweep_tests {
+    use super::read_routing_tests::TempDb;
+    use super::*;
+
+    /// Backdate one row's age column so a sweep with a "now" cutoff sees it as
+    /// expired. Both columns default to `strftime('%s','now')` on insert, so
+    /// there is no other way to write an old row.
+    async fn backdate(store: &SqliteStore, sql: &'static str) {
+        let pool = store.pool.clone();
+        crate::pool::spawn_blocking(move || {
+            let mut conn = pool.get().expect("connection");
+            diesel::sql_query(sql)
+                .execute(&mut *conn)
+                .expect("backdate");
+        })
+        .await
+        .expect("blocking join");
+    }
+
+    #[tokio::test]
+    async fn each_sweep_deletes_only_its_expired_rows() {
+        let db = TempDb::new("retention_sweeps");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let now = wacore::time::now_secs();
+
+        store
+            .store_sent_message("1@s.whatsapp.net", "OLD", b"payload")
+            .await
+            .expect("store old sent");
+        store
+            .store_sent_message("1@s.whatsapp.net", "NEW", b"payload")
+            .await
+            .expect("store new sent");
+        backdate(
+            &store,
+            "UPDATE sent_messages SET created_at = created_at - 86400 WHERE message_id = 'OLD'",
+        )
+        .await;
+
+        store
+            .store_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "OLD", b"msg")
+            .await
+            .expect("store old pending");
+        store
+            .store_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "NEW", b"msg")
+            .await
+            .expect("store new pending");
+        backdate(
+            &store,
+            "UPDATE pending_inbound_messages SET inserted_at = inserted_at - 86400 WHERE id = 'OLD'",
+        )
+        .await;
+
+        // tc_tokens carry their own explicit timestamps, so no backdating.
+        store
+            .put_tc_token(
+                "old@lid",
+                &TcTokenEntry {
+                    token: vec![1],
+                    token_timestamp: now - 86_400,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .expect("store old token");
+        store
+            .put_tc_token(
+                "new@lid",
+                &TcTokenEntry {
+                    token: vec![2],
+                    token_timestamp: now,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .expect("store new token");
+
+        let cutoff = now - 3600;
+        assert_eq!(
+            store
+                .delete_expired_sent_messages(cutoff)
+                .await
+                .expect("sweep sent"),
+            1
+        );
+        assert_eq!(
+            store
+                .delete_expired_pending_inbound(cutoff)
+                .await
+                .expect("sweep pending"),
+            1
+        );
+        assert_eq!(
+            store
+                .delete_expired_tc_tokens(cutoff, cutoff)
+                .await
+                .expect("sweep tokens"),
+            1
+        );
+
+        assert!(
+            store
+                .take_sent_message("1@s.whatsapp.net", "OLD")
+                .await
+                .expect("read sent")
+                .is_none(),
+            "the expired sent message is gone"
+        );
+        assert!(
+            store
+                .take_sent_message("1@s.whatsapp.net", "NEW")
+                .await
+                .expect("read sent")
+                .is_some(),
+            "the fresh sent message survives"
+        );
+        assert!(
+            store
+                .get_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "OLD")
+                .await
+                .expect("read pending")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "NEW")
+                .await
+                .expect("read pending")
+                .is_some()
+        );
+        assert!(store.get_tc_token("old@lid").await.expect("read").is_none());
+        assert!(store.get_tc_token("new@lid").await.expect("read").is_some());
+    }
+
+    /// `base_keys` had no deletion path for its common case (a peer retries
+    /// once, the resend decrypts, no retry #3 ever arrives), so the row stayed
+    /// for the life of the database.
+    #[tokio::test]
+    async fn the_base_key_sweep_deletes_only_backdated_rows() {
+        let db = TempDb::new("base_key_sweep");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let now = wacore::time::now_secs();
+
+        store
+            .save_base_key("1@s.whatsapp.net.0", "OLD", &[0xAA; 32])
+            .await
+            .expect("save old");
+        store
+            .save_base_key("1@s.whatsapp.net.0", "NEW", &[0xBB; 32])
+            .await
+            .expect("save new");
+        backdate(
+            &store,
+            "UPDATE base_keys SET created_at = created_at - 7200 WHERE message_id = 'OLD'",
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .delete_expired_base_keys(now - 3600)
+                .await
+                .expect("sweep base keys"),
+            1
+        );
+        assert!(
+            !store
+                .has_same_base_key("1@s.whatsapp.net.0", "OLD", &[0xAA; 32])
+                .await
+                .expect("read old"),
+            "the expired base key is gone"
+        );
+        assert!(
+            store
+                .has_same_base_key("1@s.whatsapp.net.0", "NEW", &[0xBB; 32])
+                .await
+                .expect("read new"),
+            "a base key inside the retry window survives"
+        );
+    }
+
+    /// The regression this routing exists for: with a bare `pool.get()` a sweep
+    /// issued while the single connection is checked out blocks a blocking
+    /// thread on r2d2's connection timeout and then errors. Through the write
+    /// permit it simply queues, so it completes.
+    #[tokio::test]
+    async fn a_sweep_completes_while_another_writer_holds_the_pool() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wacore::appstate::processor::AppStateMutationMAC;
+
+        let db = TempDb::new("retention_under_write");
+        let store = Arc::new(SqliteStore::new(&db.url()).await.expect("store opens"));
+        store
+            .store_sent_message("1@s.whatsapp.net", "OLD", b"payload")
+            .await
+            .expect("store sent");
+
+        // Same shape as `benches/store_contention.rs`: back-to-back MAC upserts
+        // that keep the write permit busy for the whole sweep.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut seed = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    seed = seed.wrapping_add(1);
+                    let macs: Vec<AppStateMutationMAC> = (0..500)
+                        .map(|i: u64| {
+                            let mut index = [0u8; 32];
+                            index[..8].copy_from_slice(&i.to_be_bytes());
+                            index[8] = seed;
+                            AppStateMutationMAC {
+                                index_mac: index.to_vec(),
+                                value_mac: vec![0xC5; 32],
+                            }
+                        })
+                        .collect();
+                    let _ = store.put_mutation_macs("regular", 1, &macs).await;
+                }
+            })
+        };
+
+        let deleted = store
+            .delete_expired_sent_messages(wacore::time::now_secs() + 1)
+            .await
+            .expect("the sweep queues behind the writer instead of failing");
+        assert_eq!(deleted, 1);
+
+        stop.store(true, Ordering::Relaxed);
+        writer.await.expect("writer task");
     }
 }

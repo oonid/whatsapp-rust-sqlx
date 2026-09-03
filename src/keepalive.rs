@@ -4,12 +4,40 @@ use futures::FutureExt;
 use log::{debug, warn};
 use rand::RngExt;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wacore::iq::spec::IqSpec;
 use wacore::protocol::keepalive::{
     KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE, elapsed_since,
     elapsed_since_at, is_dead_socket_at,
 };
+
+/// Keepalive ticks between two mid-session maintenance passes (~6 h).
+///
+/// The tick interval is drawn uniformly from
+/// [`KEEP_ALIVE_INTERVAL_MIN`, `KEEP_ALIVE_INTERVAL_MAX`], so a tick count is
+/// converted at the midpoint and the real period lands somewhere in 4-9 h. That
+/// spread is fine because nothing here is scheduled *by* this cadence: the
+/// signed pre-key rotation gates itself on its own 27-day interval and the
+/// tcToken prune is idempotent. The cadence only has to be short enough that a
+/// connection which never drops still reaches them, which the connect-only
+/// callers could not promise.
+const MAINTENANCE_TICKS: u32 = ticks_for(6 * 60 * 60);
+
+/// Keepalive ticks between two storage-engine maintenance passes (~1 h).
+///
+/// Its own, shorter cadence than [`MAINTENANCE_TICKS`]: the backend pass is
+/// local work with no IQ behind it, and the WAL truncation half only takes
+/// effect on a pass that finds no reader holding a snapshot, so trying more
+/// often is how it eventually succeeds.
+const ENGINE_MAINTENANCE_TICKS: u32 = ticks_for(60 * 60);
+
+/// Keepalive ticks that cover `period_secs`, at the midpoint of the randomized
+/// interval.
+const fn ticks_for(period_secs: u64) -> u32 {
+    let midpoint = (KEEP_ALIVE_INTERVAL_MIN.as_secs() + KEEP_ALIVE_INTERVAL_MAX.as_secs()) / 2;
+    (period_secs / midpoint) as u32
+}
 
 #[derive(Debug, PartialEq)]
 enum KeepaliveResult {
@@ -168,6 +196,8 @@ impl Client {
     ) {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
+        let mut maintenance_counter = 0u32;
+        let mut engine_maintenance_counter = 0u32;
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
         // Seeded once, not per tick: a fresh `StdRng` costs OS entropy and a
         // 320-byte state to draw one number, and this loop wakes every 15-30 s
@@ -198,7 +228,7 @@ impl Client {
                     // loop would go on pinging a socket it was never started
                     // for, alongside that connection's own keepalive.
                     let current = self.connection_generation.load(
-                        std::sync::atomic::Ordering::Acquire,
+                        Ordering::Acquire,
                     );
                     if current != generation {
                         debug!(
@@ -216,6 +246,20 @@ impl Client {
                         cleanup_counter = 0;
                         self.spawn_retention_cleanup(sent_msg_ttl);
                         self.spawn_cache_maintenance();
+                    }
+
+                    // Same placement and the same reason, on a much coarser
+                    // counter: see MAINTENANCE_TICKS.
+                    maintenance_counter += 1;
+                    if maintenance_counter >= MAINTENANCE_TICKS {
+                        maintenance_counter = 0;
+                        self.spawn_session_maintenance();
+                    }
+
+                    engine_maintenance_counter += 1;
+                    if engine_maintenance_counter >= ENGINE_MAINTENANCE_TICKS {
+                        engine_maintenance_counter = 0;
+                        self.spawn_engine_maintenance();
                     }
 
                     // Same reason as the retention sweep above: driven by the
@@ -348,59 +392,126 @@ impl Client {
     /// they enable/disable independently. `0` disables a sweep. TTLs are
     /// converted with a checked cast (absurd values clamp instead of wrapping
     /// the cutoff negative).
+    ///
+    /// One task running them in sequence, not three racing ones: every sweep
+    /// goes through the store's single write permit anyway, so racing them only
+    /// buys three blocking threads queueing for the same slot ahead of live
+    /// traffic. Failures are logged at `warn!` because a sweep that fails every
+    /// time is how a bounded table quietly stops being bounded.
     fn spawn_retention_cleanup(&self, sent_msg_ttl: u64) {
         let now = wacore::time::now_secs();
         let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
 
-        if sent_msg_ttl > 0 {
-            let backend = self.persistence_manager.backend();
-            let cutoff = cutoff_for(sent_msg_ttl);
-            self.runtime
-                .spawn(Box::pin(async move {
-                    if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
-                        log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
-                    }
-                }))
-                .detach();
-        }
-
+        let backend = self.persistence_manager.backend();
+        let sent_cutoff = (sent_msg_ttl > 0).then(|| cutoff_for(sent_msg_ttl));
         // Pending inbound buffer retention (inbound durability hook): a row a
         // permanently-failing hook never commits would otherwise linger once the
         // server stops redelivering it. Run unconditionally (not gated on the hook
         // being set now) so rows buffered by a hook in a previous run are still
         // swept after it is disabled. Backends without the buffer return 0 from
         // the default impl, so this is a cheap no-op there.
-        {
-            const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-            let backend = self.persistence_manager.backend();
-            let cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);
-            self.runtime
-                .spawn(Box::pin(async move {
-                    if let Err(e) = backend.delete_expired_pending_inbound(cutoff).await {
-                        log::debug!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
-                    }
-                }))
-                .detach();
-        }
+        const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+        let pending_cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);
+        // A base key is recorded when a peer's retry #2 arrives and is read back
+        // only by a retry #3 for the same message. One retry conversation is the
+        // whole lifetime of the row: past that window it answers a question
+        // nobody asks again, and before this sweep existed the common case (no
+        // retry #3) kept it forever. An hour is generous — the retries it guards
+        // arrive seconds apart — and a too-short TTL only degrades collision
+        // detection to "no collision", the behaviour that predates the check.
+        const BASE_KEY_TTL_SECS: u64 = 60 * 60;
+        let base_key_cutoff = cutoff_for(BASE_KEY_TTL_SECS);
+        let prune_msg_secrets = self.cache_config.msg_secret_policy.prunes();
 
-        // msg_secrets retention: prune rows whose per-row deadline has passed.
-        // expires_at is absolute, so the cutoff is simply "now"; per-kind
-        // horizons and never-expire (0) rows are baked in at write time.
-        if self.cache_config.msg_secret_policy.prunes() {
-            let backend = self.persistence_manager.backend();
-            self.runtime
-                .spawn(Box::pin(async move {
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Some(cutoff) = sent_cutoff
+                    && let Err(e) = backend.delete_expired_sent_messages(cutoff).await
+                {
+                    warn!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
+                }
+
+                if let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await {
+                    warn!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
+                }
+
+                if let Err(e) = backend.delete_expired_base_keys(base_key_cutoff).await {
+                    warn!(target: "Client/Keepalive", "Base key cleanup error: {e}");
+                }
+
+                // msg_secrets retention: prune rows whose per-row deadline has passed.
+                // expires_at is absolute, so the cutoff is simply "now"; per-kind
+                // horizons and never-expire (0) rows are baked in at write time.
+                if prune_msg_secrets {
                     match backend.delete_expired_msg_secrets(now).await {
                         Ok(n) if n > 0 => {
-                            log::debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
+                            debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            log::debug!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
+                            warn!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
                         }
                     }
-                }))
-                .detach();
+                }
+            }))
+            .detach();
+    }
+
+    /// Mid-session key and token maintenance, on the keepalive tick.
+    ///
+    /// Both jobs used to run only from the connect-time background init
+    /// (`client/node_io.rs`), which is fine for a process that reconnects often
+    /// and useless for one that does not: a session held for longer than the
+    /// 27-day rotation cadence never rotated its signed pre-key, and pruned
+    /// tcTokens exactly once, at hour zero. The connect-time calls stay — they
+    /// are the ones that cover a freshly started process.
+    fn spawn_session_maintenance(self: &Arc<Self>) {
+        let client = Arc::clone(self);
+        let generation = self.connection_generation.load(Ordering::SeqCst);
+        self.runtime
+            .spawn(Box::pin(async move {
+                client.run_session_maintenance(generation).await;
+            }))
+            .detach();
+    }
+
+    /// Storage-engine upkeep: whatever the backend needs to stay in shape over
+    /// a session measured in weeks. A no-op for backends that don't implement
+    /// it, and cheap enough for a live connection by contract
+    /// (`DeviceStore::maintenance`).
+    fn spawn_engine_maintenance(&self) {
+        let backend = self.persistence_manager.backend();
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Err(e) = backend.maintenance().await {
+                    warn!(target: "Client/Keepalive", "Storage maintenance error: {e}");
+                }
+            }))
+            .detach();
+    }
+
+    /// The body of [`Self::spawn_session_maintenance`]; separate so a test can
+    /// await the pass instead of racing a detached task.
+    pub(crate) async fn run_session_maintenance(&self, generation: u64) {
+        // Only the rotation is generation-gated: it uploads the new key over
+        // this connection, so a reconnect between the tick and the upload means
+        // a newer background init already owns the work — the same guard the
+        // connect-time caller applies. The tcToken prune is a local delete and
+        // is correct on any generation.
+        if self.connection_generation.load(Ordering::SeqCst) == generation {
+            let rotation = self.maybe_rotate_signed_pre_key().await;
+            if let Err(e) = rotation
+                && !self.is_shutting_down()
+            {
+                warn!(target: "Client/Keepalive", "Signed pre-key rotation check failed: {e:?}");
+            }
+        }
+
+        let pruned = self.tc_token().prune_expired().await;
+        if let Err(e) = pruned
+            && !self.is_shutting_down()
+        {
+            warn!(target: "Client/Keepalive", "Failed to prune expired tc_tokens: {e:?}");
         }
     }
 }
@@ -410,6 +521,43 @@ mod tests {
     use super::*;
     use crate::socket::error::{EncryptSendError, SocketError};
     use wacore_binary::builder::NodeBuilder;
+
+    // The maintenance cadence is a tick count, so the interval it really lands
+    // on depends on where each randomized tick falls. Both ends must stay in
+    // "a few times a day": short enough that a weeks-long connection reaches
+    // the 27-day rotation check with room to spare, long enough that the pass
+    // is not competing with real traffic for the write permit.
+    #[test]
+    fn the_maintenance_cadence_lands_in_hours_not_minutes_or_days() {
+        let fastest = MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MIN.as_secs();
+        let slowest = MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MAX.as_secs();
+        assert!(
+            (4 * 3600..=6 * 3600).contains(&fastest),
+            "fastest maintenance period was {fastest}s"
+        );
+        assert!(
+            (6 * 3600..=12 * 3600).contains(&slowest),
+            "slowest maintenance period was {slowest}s"
+        );
+    }
+
+    // The engine pass is the shorter of the two cadences, and deliberately so:
+    // its WAL truncation only lands on a pass that finds no reader holding a
+    // snapshot.
+    #[test]
+    fn the_engine_cadence_is_shorter_than_the_session_cadence() {
+        const { assert!(ENGINE_MAINTENANCE_TICKS < MAINTENANCE_TICKS) };
+        let fastest = ENGINE_MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MIN.as_secs();
+        let slowest = ENGINE_MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MAX.as_secs();
+        assert!(
+            (30 * 60..=3600).contains(&fastest),
+            "fastest engine period was {fastest}s"
+        );
+        assert!(
+            (3600..=2 * 3600).contains(&slowest),
+            "slowest engine period was {slowest}s"
+        );
+    }
 
     /// Three, and the two below it are not. The counter was already being
     /// computed and logged; this is the decision that makes it load-bearing.
@@ -434,14 +582,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn keepalive_exits_when_its_connection_generation_is_retired() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
-        let stale_generation = client
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire);
+        let stale_generation = client.connection_generation.load(Ordering::Acquire);
         // The connection this loop was started for is retired, and (as after a
         // reconnect) the client is connected again on a newer one.
-        client
-            .connection_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
 
         tokio::time::timeout(
             Duration::from_secs(600),
@@ -461,9 +605,7 @@ mod tests {
         // generation rather than about a fixture that could not have sent
         // anything: the same loop on the live generation does ping (and then
         // ends itself, because nothing answers it).
-        let live_generation = client
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire);
+        let live_generation = client.connection_generation.load(Ordering::Acquire);
         tokio::time::timeout(
             Duration::from_secs(600),
             client
