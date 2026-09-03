@@ -510,8 +510,11 @@ pub async fn encrypt_for_devices_into(
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
     participant_nodes: &mut Vec<Node>,
+    signal_addresses: Option<&[Jid]>,
 ) -> Result<EncryptFanoutSummary> {
-    let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
+    let plan =
+        ensure_sessions_for_devices_resolved(runtime, stores, resolver, devices, signal_addresses)
+            .await?;
     let RawEncryptAttempt {
         result: raw,
         first_error,
@@ -670,6 +673,25 @@ pub async fn ensure_sessions_for_devices(
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
 ) -> Result<SessionPlan> {
+    ensure_sessions_for_devices_resolved(runtime, stores, resolver, devices, None).await
+}
+
+/// [`ensure_sessions_for_devices`] for a caller that already resolved each
+/// device's Signal address: `signal_addresses[i]` is what `devices[i]`
+/// encrypts under (the device itself when no LID upgrade applies), so no
+/// mapping is looked up here. `None` resolves per device as before.
+pub async fn ensure_sessions_for_devices_resolved(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+    signal_addresses: Option<&[Jid]>,
+) -> Result<SessionPlan> {
+    // A list that is not parallel to `devices` cannot be indexed by device;
+    // resolving per device is always correct, so that is the fallback in
+    // every build rather than a debug-only assertion that would make a
+    // malformed caller panic in tests and silently degrade in release.
+    let signal_addresses = signal_addresses.filter(|addrs| addrs.len() == devices.len());
     // Per-device LID upgrade map: encryption_overrides[i] mirrors devices[i].
     // None = use devices[i] as-is; Some(jid) = use this LID-upgraded version.
     // The Vec replaces a HashMap<&Jid, Jid> that paid hash + alloc per insert
@@ -691,14 +713,18 @@ pub async fn ensure_sessions_for_devices(
     for (idx, device_jid) in devices.iter().enumerate() {
         // Resolved once per device: both the session probe and the prekey
         // branch below want it, and the lookup is a boxed `async_trait` call
-        // into an async-locked cache.
-        let lid_jid = if device_jid.is_pn() {
-            resolver
+        // into an async-locked cache. A caller-resolved address that equals
+        // the device is "no upgrade", the same answer the lookup gives.
+        let lid_jid: Option<Cow<'_, Jid>> = match signal_addresses {
+            Some(addrs) => {
+                let addr = &addrs[idx];
+                (addr != device_jid).then_some(Cow::Borrowed(addr))
+            }
+            None if device_jid.is_pn() => resolver
                 .get_lid_for_phone(&device_jid.user)
                 .await
-                .map(|lid_user| Jid::lid_device(lid_user, device_jid.device))
-        } else {
-            None
+                .map(|lid_user| Cow::Owned(Jid::lid_device(lid_user, device_jid.device))),
+            None => None,
         };
         // WhatsApp Web's SignalAddress.toString() normalizes PN → LID before
         // creating signal addresses. We do the same: check LID session FIRST.
@@ -718,7 +744,7 @@ pub async fn ensure_sessions_for_devices(
                     &mut encryption_overrides,
                     devices.len(),
                     idx,
-                    lid_jid.clone(),
+                    lid_jid.clone().into_owned(),
                 );
                 continue;
             }
@@ -738,7 +764,12 @@ pub async fn ensure_sessions_for_devices(
                 lid_jid.observe(),
                 device_jid.observe()
             );
-            record_encryption_override(&mut encryption_overrides, devices.len(), idx, lid_jid);
+            record_encryption_override(
+                &mut encryption_overrides,
+                devices.len(),
+                idx,
+                lid_jid.into_owned(),
+            );
         }
         indices_needing_prekeys.push(idx);
     }
