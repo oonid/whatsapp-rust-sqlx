@@ -4921,8 +4921,10 @@ async fn memory_report_display_sections_stay_aligned() {
     let ttl_start = rendered
         .find("--- TTL-bounded caches ---")
         .expect("ttl section");
+    let lid_pn_start = rendered.find("--- LID/PN maps").expect("lid/pn section");
     let signal_start = rendered.find("--- Signal store").expect("signal section");
-    let ttl_block = &rendered[ttl_start..signal_start];
+    let ttl_block = &rendered[ttl_start..lid_pn_start];
+    let lid_pn_block = &rendered[lid_pn_start..signal_start];
 
     for name in [
         "group_cache:",
@@ -4936,6 +4938,23 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the TTL-bounded heading, got:\n{rendered}"
         );
     }
+    // No TTL bounds these; a contact-list-sized map rendered as a TTL-bounded
+    // cache would make sustained growth read as normal cache activity.
+    for name in [
+        "lid_pn (lid):",
+        "lid_pn (pn):",
+        "lid_pn (hash):",
+        "lid_pn (persisted):",
+    ] {
+        assert!(
+            lid_pn_block.contains(name),
+            "{name} must render under the LID/PN heading, got:\n{rendered}"
+        );
+        assert!(
+            !ttl_block.contains(name),
+            "{name} must not render as a TTL-bounded cache, got:\n{rendered}"
+        );
+    }
     for name in [
         "signal_sessions:",
         "signal_identities:",
@@ -4946,6 +4965,23 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the Signal heading, got:\n{rendered}"
         );
     }
+
+    // The lanes are capped; their queues are not, so the backlog belongs with
+    // the drain-bounded collections, not beside the lane count.
+    let capacity_start = rendered
+        .find("--- Capacity-only caches ---")
+        .expect("capacity section");
+    let unbounded_start = rendered
+        .find("--- Unbounded collections ---")
+        .expect("unbounded section");
+    assert!(
+        !rendered[capacity_start..unbounded_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must not render as capacity-bounded, got:\n{rendered}"
+    );
+    assert!(
+        rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must render under the unbounded heading, got:\n{rendered}"
+    );
 
     // The last two `collections()` entries are transient retention, one section
     // each. Their order is what the two boundary constants encode, so a cache
@@ -5002,6 +5038,182 @@ async fn memory_report_counts_the_offline_device_sync_queue() {
 
     client.pending_device_sync.take_all();
     assert_eq!(client.memory_report().await.pending_device_sync, 0);
+}
+
+/// The LID/PN cache's side maps grow with the contact list for the process
+/// lifetime, one entry per identifier and one per persisted pair, and were
+/// invisible to the report; the counts must surface and the bytes must be the
+/// table alone, since both maps hold the entry's own strings.
+#[tokio::test]
+async fn memory_report_counts_lid_pn_side_maps() {
+    let client = crate::test_utils::create_test_client_with_name("lid_pn_side_maps").await;
+    let before = client.memory_report().await;
+    assert_eq!(before.lid_pn_contact_hash_entries.entries, 0);
+    assert_eq!(before.lid_pn_persisted_entries.entries, 0);
+
+    let entry = crate::lid_pn_cache::LidPnEntry::new(
+        "100000000000002".to_string(),
+        "19045550180".to_string(),
+        LearningSource::Usync,
+    );
+    client.lid_pn_cache.add(&entry).await;
+    client
+        .lid_pn_cache
+        .mark_persisted(&entry.phone_number, &entry.lid)
+        .await;
+
+    let report = client.memory_report().await;
+    assert_eq!(
+        report.lid_pn_contact_hash_entries.entries, 2,
+        "both sides of a pair are hash-indexed"
+    );
+    assert_eq!(report.lid_pn_persisted_entries.entries, 1);
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes > 0 && report.lid_pn_persisted_entries.bytes > 0,
+        "table structure is charged even though the strings are the entry's"
+    );
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes < report.lid_pn_lid_entries.bytes,
+        "a side map must not re-charge the payload the entry map already counts"
+    );
+    let names: Vec<&str> = report
+        .unbounded_counts()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(names.contains(&"lid_pn_contact_hash_entries"));
+    assert!(names.contains(&"lid_pn_persisted_entries"));
+}
+
+/// A lane's queue is unbounded and each queued message retains its frame, so
+/// a stuck worker is a backlog the report has to show; the lane count alone
+/// reads the same whether the queues are empty or a million deep.
+#[tokio::test]
+async fn memory_report_sums_chat_lane_backlog() {
+    let client = crate::test_utils::create_test_client_with_name("chat_lane_backlog").await;
+    assert_eq!(client.memory_report().await.chat_lane_backlog, 0);
+
+    // A lane with no worker: nothing drains what is enqueued.
+    let chat: Jid = "120363000000000042@g.us".parse().unwrap();
+    let (queue_tx, _queue_rx) = async_channel::unbounded();
+    let lane = ChatLane {
+        enqueue_lock: Arc::new(Mutex::new(())),
+        queue_tx,
+        worker_running: Arc::new(Mutex::new(())),
+    };
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+    for id in ["A", "B", "C"] {
+        let node = NodeBuilder::new("message")
+            .attr("from", chat.clone())
+            .attr("id", id)
+            .build();
+        lane.try_enqueue(node_to_owned_ref(node))
+            .expect("an unbounded lane queue accepts every message");
+    }
+
+    let report = client.memory_report().await;
+    assert_eq!(report.chat_lanes, 1);
+    assert_eq!(report.chat_lane_backlog, 3);
+    assert!(
+        report
+            .unbounded_counts()
+            .contains(&("chat_lane_backlog", 3)),
+        "the backlog is a drain-bounded collection, so the soak compares it"
+    );
+}
+
+/// An online device refresh releases its dedup entry when it finishes. Left
+/// in place, the entry outlived the refresh by the whole connection: the user
+/// was retained until teardown, and a later unknown device from them never
+/// triggered another refresh.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry() {
+    let client = crate::test_utils::create_test_client_with_name("online_device_sync").await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    // Not connected, so the refresh fails; the release must not depend on it
+    // succeeding.
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    for _ in 0..1_000 {
+        if client.pending_device_sync.len() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "the dedup entry must leave with the refresh that took it"
+    );
+    assert!(
+        client.pending_device_sync.add(&jid),
+        "a later unknown device from the same user triggers a refresh again"
+    );
+}
+
+/// A runtime may drop a spawned future before its first poll. The release
+/// guard is built before the spawn and moved into the task, so even then the
+/// dedup entry leaves with the work it was deduplicating.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry_when_never_polled() {
+    let pm = Arc::new(
+        PersistenceManager::new(crate::test_utils::create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, _rx) = Client::new_with_cache_config(
+        Arc::new(DropSpawnRuntime),
+        pm,
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+        CacheConfig::default(),
+    )
+    .await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "a task dropped before its first poll must still release its entry"
+    );
+    assert!(client.pending_device_sync.add(&jid));
+}
+
+/// Expired entries leave a quiet cache only when something sweeps: nothing
+/// accesses them and nothing inserts, so without the maintenance tick the
+/// dedup gates hold five-minute-old keys for weeks.
+#[tokio::test]
+async fn cache_maintenance_sweeps_expired_entries() {
+    let mut cache_config = CacheConfig::default();
+    cache_config.dispatched_messages =
+        crate::cache_config::CacheEntryConfig::new(Some(Duration::from_millis(20)), 64);
+    let client = crate::test_utils::create_test_client_with_config(
+        "cache_maintenance",
+        Arc::new(MockHttpClient),
+        cache_config,
+    )
+    .await;
+
+    let chat: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+    let key =
+        wacore::types::message::SenderMessageId::new(chat.clone(), "3EB0EXPIRING".into(), chat);
+    client.dispatched_messages.insert(key, ()).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        client.dispatched_messages.entry_count_async().await,
+        1,
+        "a quiet cache keeps its expired entry until swept"
+    );
+
+    client.run_cache_maintenance().await;
+    assert_eq!(client.dispatched_messages.entry_count_async().await, 0);
+    assert_eq!(client.memory_report().await.dispatched_messages, 0);
 }
 
 #[tokio::test]
