@@ -420,7 +420,7 @@ async fn recv_frame(
         .await
         {
             Ok(Ok(TransportEvent::DataReceived(data))) => {
-                frame_decoder.feed(&data);
+                frame_decoder.feed_owned(data);
                 if let Some(frame) = frame_decoder.decode_frame() {
                     return Ok(frame);
                 }
