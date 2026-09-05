@@ -49,6 +49,19 @@ fn is_retriable_sqlite_error(error: &DieselError) -> bool {
     }
 }
 
+/// Back off between SQLite contention retries with the target's real timer.
+/// Native uses Tokio's timer, while the browser target uses its JavaScript
+/// `setTimeout` future because no Tokio time driver is installed there.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn retry_backoff(delay_ms: u64) {
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn retry_backoff(delay_ms: u64) {
+    gloo_timers::future::TimeoutFuture::new(delay_ms as u32).await;
+}
+
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 pub(crate) type SqlitePool = crate::pool::Pool;
@@ -1047,7 +1060,7 @@ impl SqliteStore {
                             MAX_RETRIES + 1
                         );
                     }
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    retry_backoff(delay_ms).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -1488,7 +1501,7 @@ impl SqliteStore {
                         attempt + 1,
                         MAX_RETRIES + 1,
                     );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    retry_backoff(delay_ms).await;
                     continue;
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -1619,7 +1632,7 @@ impl SqliteStore {
                         attempt + 1,
                         MAX_RETRIES + 1,
                     );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    retry_backoff(delay_ms).await;
                     continue;
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -2369,7 +2382,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    retry_backoff(delay_ms).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -2499,7 +2512,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    retry_backoff(delay_ms).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -2626,7 +2639,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    retry_backoff(delay_ms).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -2709,7 +2722,7 @@ impl SignalStore for SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    retry_backoff(delay_ms).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
@@ -4471,6 +4484,38 @@ fn pragma_i64(conn: &mut SqliteConnection, pragma: &str) -> Option<i64> {
         .get_result::<Row>(conn)
         .ok()
         .map(|r| r.value)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn only_busy_and_locked_database_errors_are_retriable() {
+        let busy = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("database is busy".to_string()),
+        );
+        let locked = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("database table is locked".to_string()),
+        );
+        let syntax = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("near SELECT: syntax error".to_string()),
+        );
+        assert!(is_retriable_sqlite_error(&busy));
+        assert!(is_retriable_sqlite_error(&locked));
+        assert!(!is_retriable_sqlite_error(&syntax));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn native_retry_backoff_waits_on_the_runtime_timer() {
+        let started = wacore::time::Instant::now();
+        retry_backoff(5).await;
+        assert!(started.elapsed() >= Duration::from_millis(4));
+    }
 }
 
 #[cfg(test)]
