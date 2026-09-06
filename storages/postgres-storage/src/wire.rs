@@ -89,6 +89,11 @@ pub(crate) fn decode_server_cert_chain(bytes: &[u8]) -> Result<CachedServerCertC
         .leaf
         .ok_or_else(|| StoreError::Serialization("server_cert_chain.leaf missing".into()))?;
     Ok(CachedServerCertChain {
+        // Rows written before this field existed deserialize as false, which is
+        // the documented upgrade path: the chain cannot authorize IK, one XX
+        // handshake re-verifies, and a marked chain is stored. Defaulting true
+        // would trust signatures this process never checked.
+        signature_verified: false,
         intermediate: noise_cert_from_wire(intermediate)?,
         leaf: noise_cert_from_wire(leaf)?,
     })
@@ -149,6 +154,12 @@ pub(crate) fn decode_hash_state(bytes: &[u8]) -> Result<HashState, StoreError> {
         .try_into()
         .map_err(|_| bad_len("hash_state.hash", HASH_STATE_LEN, got))?;
     Ok(HashState {
+        // Old rows carry no flag. `has_baseline()` is `bootstrapped || version > 0`,
+        // so an already-synced collection is still recognised by its version and
+        // only a genuine version-0 row is treated as never bootstrapped -- which
+        // is what upstream intends, and avoids re-downloading a snapshot per
+        // collection on upgrade.
+        bootstrapped: false,
         version: w.version,
         hash,
         index_value_map: w.index_value_map.into_iter().collect(),
@@ -174,9 +185,39 @@ mod tests {
                 not_before: 1_700_000_500,
                 not_after: 1_899_999_500,
             },
+            signature_verified: false,
         };
         let decoded = decode_server_cert_chain(&encode_server_cert_chain(&chain)).unwrap();
         assert_eq!(decoded, chain);
+    }
+
+    #[test]
+    fn server_cert_chain_does_not_yet_persist_signature_verified() {
+        // KNOWN GAP, asserted so it cannot rot silently: this wire format has no
+        // field for `signature_verified`, so a verified chain decodes unverified
+        // and the next handshake falls back to one XX that re-verifies and
+        // re-caches. Safe, but a wasted handshake per restart, and the sqlite
+        // backend does not pay it -- its proto carries the flag as field 3.
+        // Closing this means adding the field here too, which needs `protoc` and
+        // a postgres arm in scripts/regenerate-wire-desc.sh.
+        let chain = CachedServerCertChain {
+            intermediate: CachedNoiseCert {
+                key: [0xAB; 32],
+                not_before: 1_700_000_000,
+                not_after: 1_900_000_000,
+            },
+            leaf: CachedNoiseCert {
+                key: [0xCD; 32],
+                not_before: 1_700_000_500,
+                not_after: 1_899_999_500,
+            },
+            signature_verified: true,
+        };
+        let decoded = decode_server_cert_chain(&encode_server_cert_chain(&chain)).unwrap();
+        assert!(
+            !decoded.signature_verified,
+            "if this now survives the round trip the gap is closed -- delete this test"
+        );
     }
 
     #[test]
@@ -238,6 +279,11 @@ mod tests {
             hash,
             index_value_map: index_value_map.clone(),
             mac_mismatch_fatal: true,
+            // Same gap as signature_verified: no wire field yet, so this cannot
+            // round-trip. has_baseline() is `bootstrapped || version > 0`, so a
+            // synced collection is still recognised by its version; only a
+            // version-0 collection re-bootstraps once.
+            bootstrapped: false,
         };
         let decoded = decode_hash_state(&encode_hash_state(&state)).unwrap();
         assert_eq!(decoded.version, 42);

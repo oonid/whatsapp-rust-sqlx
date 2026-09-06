@@ -499,7 +499,7 @@ impl PostgresStore {
         &self,
         name: &str,
         device_id: i32,
-    ) -> Result<HashState> {
+    ) -> Result<Option<HashState>> {
         let row = sqlx::query(
             "SELECT state_data FROM app_state_versions WHERE name = $1 AND device_id = $2",
         )
@@ -510,14 +510,43 @@ impl PostgresStore {
         .map_err(|e| StoreError::Database(Box::new(e)))?;
 
         match row {
-            None => Ok(HashState::default()),
+            None => Ok(None),
             Some(r) => {
                 let data: Vec<u8> = r.get("state_data");
-                let state = crate::wire::decode_hash_state(&data)
-                    .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-                Ok(state)
+                // Mirrors the sqlite backend: an undecodable blob is answered as
+                // never-synced so the collection rebuilds from a snapshot.
+                // Answering version 0 instead would ask the server to resume from
+                // a baseline this side cannot actually read.
+                match crate::wire::decode_hash_state(&data) {
+                    Ok(state) => Ok(Some(state)),
+                    Err(e) => {
+                        log::warn!(
+                            "app_state_version blob ({} bytes) failed to decode: {e}; \
+                             treating the collection as never synced so it rebuilds",
+                            data.len()
+                        );
+                        Ok(None)
+                    }
+                }
             }
         }
+    }
+
+    /// Forget a collection's version, returning it to the never-synced state.
+    /// Deleting a row that is not there is a no-op, not an error: a collection
+    /// that never synced is already in the state a rebuild wants.
+    pub async fn delete_app_state_version_for_device(
+        &self,
+        name: &str,
+        device_id: i32,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM app_state_versions WHERE name = $1 AND device_id = $2")
+            .bind(name)
+            .bind(device_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        Ok(())
     }
 
     pub async fn set_app_state_version_for_device(
@@ -870,8 +899,13 @@ impl AppSyncStore for PostgresStore {
             .await
     }
 
-    async fn get_version(&self, name: &str) -> Result<HashState> {
+    async fn get_version(&self, name: &str) -> Result<Option<HashState>> {
         self.get_app_state_version_for_device(name, self.device_id)
+            .await
+    }
+
+    async fn delete_version(&self, name: &str) -> Result<()> {
+        self.delete_app_state_version_for_device(name, self.device_id)
             .await
     }
 
@@ -1899,6 +1933,7 @@ mod tests {
                 not_before: 1_700_000_500,
                 not_after: 1_899_999_500,
             },
+            signature_verified: false,
         };
 
         let mut device = store
@@ -2377,10 +2412,11 @@ mod tests {
     #[tokio::test]
     async fn test_app_state_version_roundtrip() {
         let store = create_test_store().await;
-        // Default is zero/empty HashState
+        // A collection that never synced is None, not a zero HashState. The
+        // distinction is the point of the Option: version 0 with an empty ltHash
+        // is byte-identical between "never synced" and "synced and empty".
         let initial = store.get_version("critical_unblock_to_sync").await.unwrap();
-        assert_eq!(initial.version, 0);
-        assert_eq!(initial.hash, [0u8; 128]);
+        assert!(initial.is_none(), "never-synced must be None, not a default");
 
         let state = HashState {
             version: 42,
@@ -2392,17 +2428,20 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store.get_version("critical_unblock_to_sync").await.unwrap();
+        let loaded = store
+            .get_version("critical_unblock_to_sync")
+            .await
+            .unwrap()
+            .expect("a collection that was just set must read back");
         assert_eq!(loaded.version, 42);
         assert_eq!(loaded.hash, [0xAB; 128]);
 
-        // Different name returns default
+        // A different, never-synced collection is None
         let other = store
             .get_version("regular_high_level_contact_node")
             .await
             .unwrap();
-        assert_eq!(other.version, 0);
-        assert_eq!(other.hash, [0u8; 128]);
+        assert!(other.is_none());
     }
 
     #[tokio::test]
@@ -2420,8 +2459,63 @@ mod tests {
         };
         store.set_version("notify_privacy_info", s2).await.unwrap();
 
-        let loaded = store.get_version("notify_privacy_info").await.unwrap();
+        let loaded = store
+            .get_version("notify_privacy_info")
+            .await
+            .unwrap()
+            .expect("upserted collection must read back");
         assert_eq!(loaded.version, 2);
+    }
+
+    #[tokio::test]
+    async fn delete_version_removes_one_device_and_tolerates_a_missing_row() {
+        let store = create_test_store().await;
+        const NAME: &str = "regular_low";
+
+        // A no-op, not an error: a collection that never synced is already in
+        // the state a rebuild wants it in.
+        store
+            .delete_app_state_version_for_device(NAME, 1)
+            .await
+            .expect("deleting a collection with no row is a no-op");
+
+        for device_id in [1, 2] {
+            store
+                .set_app_state_version_for_device(
+                    NAME,
+                    HashState {
+                        version: 7,
+                        ..Default::default()
+                    },
+                    device_id,
+                )
+                .await
+                .unwrap();
+        }
+
+        store
+            .delete_app_state_version_for_device(NAME, 1)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .get_app_state_version_for_device(NAME, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted device's collection must read back as never-synced"
+        );
+        assert_eq!(
+            store
+                .get_app_state_version_for_device(NAME, 2)
+                .await
+                .unwrap()
+                .expect("the other device must be untouched")
+                .version,
+            7,
+            "delete must be scoped to one device"
+        );
     }
 
     #[tokio::test]

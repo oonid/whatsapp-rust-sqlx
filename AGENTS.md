@@ -86,17 +86,27 @@ consumed by the `wa` crate there.
 **All `push` / `fetch` / `clone` belong to the user.** Agents do local git only —
 commit, branch, worktree, rebase, merge. Present remote commands for the user to run.
 
-### The three local commits
+### The local commits
+
+Oldest first, on top of an upstream base:
 
 ```
-fix(send): TC token issuance causing perpetual 463 MissingTcToken
+chore: append fork-specific guidelines to AGENTS.md
 fix(send): hash participant list in display format (Baileys-compat)
-feat: add PostgreSQL storage backend via sqlx (postgres-storage feature)
+fix(send): TC token issuance causing perpetual 463 MissingTcToken
+feat(postgres): rebuild postgres-storage for 0.7.0 (P2)
+fix(postgres): drop stale SCHEMA_STMTS, repair test mocks
+test(postgres): give the suite its own database and provision it once
+feat(postgres): implement pending-inbound store/delete with batched variants (P3a)
+feat(postgres): group metadata, batched mutation MACs, resource report (P3b/P3c)
+docs: correct the TC-token patch note — upstream fixed half of it
 <upstream base>
 ```
 
-**The two `fix(send)` patches re-conflict on every upstream rebase** — upstream keeps
-rewriting those exact files. Re-apply them by intent, not by blindly taking a side:
+**The two `fix(send)` patches are the ones to watch on an upstream rebase** — upstream
+keeps rewriting those exact files. Re-apply them by intent, not by blindly taking a side.
+(They applied cleanly on the rebase onto `3cf0d648`; that is luck, not a guarantee, and
+"applied cleanly" is not "still correct" — the checks below are what prove it.)
 
 - **phash** (`wacore/src/messages.rs`) — `participant_list_hash` must hash JIDs in
   **Display** form (`write!(arena, "{jid}")`), not upstream's ad-format `:0`. WhatsApp
@@ -126,17 +136,41 @@ rewriting those exact files. Re-apply them by intent, not by blindly taking a si
   already provisioned. Bump the `_wa_migrations` version when you do.
 - **Mirror `storages/sqlite-storage/`.** It is upstream's reference implementation and
   stays current; when the store traits change, read it first and follow its structure.
-- **The postgres backend has no unit tests of its own.** It is validated through the
-  `wa` crate's suite in the sapa-rs superproject.
+- **The postgres backend has its own suite: 63 tests** in
+  `storages/postgres-storage/src/`, needing a live Postgres (see Build and test). The
+  `wa` crate's suite in the sapa-rs superproject remains the integration gate; this one
+  is the fast local check.
+- **Two upstream fields are not yet persisted here**, and the sqlite backend does
+  persist them: `CachedServerCertChain.signature_verified` (its proto field 3) and
+  `HashState.bootstrapped` (its proto field 5). Ours decode to `false`, which is the
+  safe direction upstream documents for rows written before a field existed — but it
+  costs one extra XX handshake per restart, and a re-bootstrap for version-0
+  collections. `wire::tests::server_cert_chain_does_not_yet_persist_signature_verified`
+  asserts the gap so it cannot rot silently. Closing it means adding both fields to
+  `storages/postgres-storage/proto/wire.proto` and regenerating the descriptor — which
+  needs `protoc`, and needs a postgres arm added to
+  `scripts/regenerate-wire-desc.sh`, which today only handles sqlite.
 
 ### Build and test
 
 ```bash
 cargo check -p whatsapp-rust --features postgres-storage
 
+# this backend's own suite — needs a live Postgres whose role can CREATE DATABASE
+# (it provisions wa_pgstore_test itself)
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5434/postgres \
+  cargo test -p whatsapp-rust-postgres-storage
+
+# the two fork patches, specifically
+cargo test -p wacore --lib parse_message_info_tests   # phash vectors
+cargo test -p whatsapp-rust --lib tc_token            # cold A/B-prop cache
+
 # from the sapa-rs superproject — the real gate for this backend
 DATABASE_URL=postgres://postgres:postgres@localhost:5434/postgres cargo test -p wa
 ```
+
+`cargo build --workspace` fails without ALSA system libraries — that is the `voip-cli`
+example, unrelated to this backend. Build the two packages directly instead.
 
 Postgres runs in the `sapa-rs-postgres` container on **5434** (not 5432). If host
 connections start failing after long uptime (`ConnectionReset` / `PoolTimedOut`),
