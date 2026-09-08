@@ -117,7 +117,7 @@ impl MediaType {
 /// Mirrors WhatsApp Web's `isMediaCryptoExpectedForMediaType()` pattern:
 /// encrypted (E2EE) media requires AES-256-CBC decryption + HMAC verification,
 /// while unencrypted media (newsletters/channels) only needs SHA-256 validation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum MediaDecryption {
     /// E2E encrypted media: decrypt with AES-256-CBC using HKDF-expanded
     /// keys from the media key, then verify HMAC-SHA256 integrity.
@@ -128,6 +128,25 @@ pub enum MediaDecryption {
     /// Unencrypted media (newsletter/channel): verify SHA-256 hash of
     /// the raw downloaded bytes. No decryption needed.
     Plaintext { file_sha256: Vec<u8> },
+}
+
+/// Hand-written for the same reason as `DownloadRequest`'s: `media_key` is
+/// the secret that decrypts the media, and a derived `Debug` would print it
+/// in full. The variant and the media type are the useful part.
+impl std::fmt::Debug for MediaDecryption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encrypted { media_type, .. } => f
+                .debug_struct("Encrypted")
+                .field("media_key", &"<redacted>")
+                .field("media_type", media_type)
+                .finish(),
+            Self::Plaintext { .. } => f
+                .debug_struct("Plaintext")
+                .field("file_sha256", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 pub trait Downloadable: Sync + Send {
@@ -222,10 +241,51 @@ impl_downloadable!(
 impl_downloadable!(ExternalBlobReference, MediaType::AppState, file_size_bytes);
 impl_downloadable!(HistorySyncNotification, MediaType::History, file_length);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DownloadRequest {
     pub url: String,
     pub decryption: MediaDecryption,
+}
+
+impl DownloadRequest {
+    /// The part of this request's URL that is safe to log: scheme and host.
+    ///
+    /// The rest is key material. The path is the `direct_path`, and the
+    /// `token` query parameter is the base64 of `file_enc_sha256`; together
+    /// with the media key they locate and decrypt the media. Which host was
+    /// tried is the whole diagnostic value of logging a download failure, and
+    /// it is the only part that carries none of that.
+    ///
+    /// Named for the same reason as `Jid::observe`: a rendering meant for a
+    /// log, not the value itself.
+    pub fn observe(&self) -> &str {
+        match self.url.find("://") {
+            // The first `/` after the authority begins the `direct_path`.
+            Some(scheme_end) => {
+                let authority = scheme_end + 3;
+                match self.url[authority..].find('/') {
+                    Some(path_start) => &self.url[..authority + path_start],
+                    // No path: nothing to elide. Not a shape this crate
+                    // builds, but it must not panic if one ever reaches here.
+                    None => &self.url,
+                }
+            }
+            // Not a URL at all -- same reasoning as above.
+            None => &self.url,
+        }
+    }
+}
+
+/// Hand-written so a stray `{:?}` cannot print the whole decryption set.
+/// A derived `Debug` would render the full URL and, through `decryption`,
+/// the media key beside it.
+impl std::fmt::Debug for DownloadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadRequest")
+            .field("url", &self.observe())
+            .field("decryption", &self.decryption)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -706,6 +766,59 @@ impl DownloadUtils {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole point of `observe`: a download failure must be diagnosable
+    /// from the log without the log carrying what decrypts the media.
+    #[test]
+    fn observe_keeps_the_host_and_drops_the_path_and_query() {
+        let req = DownloadRequest {
+            url: "https://media-host.example/v/t62.0000-00/synthetic-path\
+                  ?auth=synthetic-auth&token=c3ludGhldGljLXRva2Vu"
+                .to_string(),
+            decryption: MediaDecryption::Plaintext {
+                file_sha256: vec![0u8; 32],
+            },
+        };
+
+        assert_eq!(req.observe(), "https://media-host.example");
+    }
+
+    /// A URL with no path must come back whole rather than panicking on a
+    /// slice boundary that is not there.
+    #[test]
+    fn observe_tolerates_a_url_with_no_path() {
+        let req = DownloadRequest {
+            url: "https://media-host.example".to_string(),
+            decryption: MediaDecryption::Plaintext {
+                file_sha256: vec![0u8; 32],
+            },
+        };
+
+        assert_eq!(req.observe(), "https://media-host.example");
+    }
+
+    /// `Debug` is hand-written precisely so a stray `{:?}` cannot print the
+    /// URL and the media key side by side.
+    #[test]
+    fn debug_prints_neither_the_full_url_nor_the_media_key() {
+        let req = DownloadRequest {
+            url: "https://media-host.example/v/secret-path?auth=A&token=T".to_string(),
+            decryption: MediaDecryption::Encrypted {
+                media_key: b"synthetic-media-key-value".to_vec(),
+                media_type: MediaType::Image,
+            },
+        };
+
+        let rendered = format!("{req:?}");
+
+        assert!(!rendered.contains("secret-path"));
+        assert!(!rendered.contains("auth=A"));
+        assert!(!rendered.contains("token=T"));
+        assert!(!rendered.contains("synthetic-media-key-value"));
+        // Still useful: which host, and what kind of media.
+        assert!(rendered.contains("media-host.example"));
+        assert!(rendered.contains("Image"));
+    }
     use super::*;
 
     struct MockDownloadable {
