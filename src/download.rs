@@ -284,7 +284,7 @@ where
                     let err = err.into_anyhow();
                     log::warn!(
                         "Failed to download from URL {}: {:?}. Trying next host.",
-                        request.url,
+                        request.observe(),
                         err
                     );
                     last_err = Some(err);
@@ -368,7 +368,7 @@ where
                     let err = err.into_anyhow();
                     log::warn!(
                         "Failed to stream-download from URL {}: {:?}. Trying next host.",
-                        request.url,
+                        request.observe(),
                         err
                     );
                     last_err = Some(err);
