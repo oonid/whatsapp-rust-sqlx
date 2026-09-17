@@ -199,7 +199,7 @@ impl Client {
     pub(crate) async fn keepalive_loop(
         self: Arc<Self>,
         shutdown_signal: wacore::runtime::ShutdownSignal,
-        generation: u64,
+        mut generation: u64,
     ) {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
@@ -238,11 +238,39 @@ impl Client {
                         Ordering::Acquire,
                     );
                     if current != generation {
+                        // A changed generation does not by itself mean we were
+                        // retired, and on a first login it always means the
+                        // opposite. The counter is incremented in exactly one
+                        // place in production -- `<success>` in node_io -- and
+                        // that happens AFTER this loop is spawned:
+                        // `drive_connection_with_outcome` reads the counter,
+                        // spawns us, and only then does `read_messages_loop`
+                        // reach the login that bumps it. Treating any change as
+                        // retirement therefore killed the keepalive of every
+                        // connection at its first tick, so no client ever
+                        // pinged, the dead-socket watchdog that depends on
+                        // those pings never armed, and a session that had
+                        // stopped receiving was indistinguishable from an idle
+                        // one.
+                        //
+                        // `shutdown_signal` is what actually names our
+                        // connection: it was captured at the spawn, it is
+                        // sticky, and `notify_connection_shutdown` is the one
+                        // point every connection ends through, planned or
+                        // fatal. If it has not fired we are still the live
+                        // connection and the bump was our own login.
+                        if shutdown_signal.is_fired() {
+                            debug!(
+                                target: "Client/Keepalive",
+                                "Connection generation moved on ({generation} -> {current}) and our connection has ended, exiting keepalive loop.",
+                            );
+                            return;
+                        }
                         debug!(
                             target: "Client/Keepalive",
-                            "Connection generation moved on ({generation} -> {current}), exiting keepalive loop.",
+                            "Adopting this connection's own login generation ({generation} -> {current}).",
                         );
-                        return;
+                        generation = current;
                     }
 
                     // Periodic DB retention (~every 12 ticks ≈ 5 min). Driven by
@@ -634,6 +662,46 @@ mod tests {
 
     /// Three, and the two below it are not. The counter was already being
     /// computed and logged; this is the decision that makes it load-bearing.
+    /// The keepalive must survive the generation bump caused by its OWN
+    /// connection logging in.
+    ///
+    /// `drive_connection_with_outcome` reads `connection_generation`, spawns
+    /// this loop with that value, and only then runs `read_messages_loop`,
+    /// inside which `<success>` increments the counter. The bump therefore
+    /// always lands after the spawn and before the first tick. Binding the loop
+    /// to the pre-login value meant every keepalive on every connection exited
+    /// at its first tick: no client ever sent a ping, so no ping ever went
+    /// unanswered, so the dead-socket watchdog never armed, so a session that
+    /// had silently stopped receiving reported itself connected indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_survives_its_own_connections_login_bump() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let spawn_generation = client.connection_generation.load(Ordering::Acquire);
+        let signal = client.connection_shutdown_signal();
+
+        // What `<success>` does, and nothing else: the connection is still the
+        // one this loop was started for, so its shutdown signal stays unfired.
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !signal.is_fired(),
+            "our own login must not look like the connection ending"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            client.clone().keepalive_loop(signal, spawn_generation),
+        )
+        .await
+        .expect("an unanswered ping ends the loop through the dead-socket check");
+
+        assert!(
+            transport.sent_count() >= 1,
+            "the keepalive must ping after its own connection's login bumped \
+             the generation; sending nothing is the bug that left every \
+             session unpinged"
+        );
+    }
+
     #[test]
     fn three_consecutive_unanswered_pings_are_terminal() {
         assert!(!keepalive_failures_are_terminal(0));
@@ -656,15 +724,24 @@ mod tests {
     async fn keepalive_exits_when_its_connection_generation_is_retired() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let stale_generation = client.connection_generation.load(Ordering::Acquire);
+        // The signal this loop holds, captured before the connection ends --
+        // exactly as `drive_connection_with_outcome` captures it at the spawn.
+        let stale_signal = client.connection_shutdown_signal();
         // The connection this loop was started for is retired, and (as after a
-        // reconnect) the client is connected again on a newer one.
+        // reconnect) the client is connected again on a newer one. Retirement
+        // goes through `notify_connection_shutdown` -- the one point every
+        // connection ends through -- and the replacement gets a fresh notifier.
+        // Without firing it this fixture modelled a state production cannot
+        // reach: a connection replaced without ending.
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
         client.connection_generation.fetch_add(1, Ordering::SeqCst);
 
         tokio::time::timeout(
             Duration::from_secs(600),
             client
                 .clone()
-                .keepalive_loop(client.connection_shutdown_signal(), stale_generation),
+                .keepalive_loop(stale_signal, stale_generation),
         )
         .await
         .expect("a keepalive on a retired generation must exit at its first tick");
