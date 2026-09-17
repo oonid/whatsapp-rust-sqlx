@@ -79,6 +79,7 @@ pub const WATCHED: &[abprops::AbProp] = &[
     abprops::web::WA_NCT_TOKEN_SEND_ENABLED,
     abprops::web::RECEIPT_MODE_BITMASK_ENABLED,
     abprops::web::WEB_SEND_HID_FAILED_DECRYPT_IN_RECEIPTS_ENABLED,
+    abprops::web::WEB_E2E_BACKFILL_EXPIRE_TIME,
     abprops::web::ENABLE_SPAM_REPORT_IQ_WITH_PRIVACY_TOKEN,
     abprops::web::PROFILE_SCRAPING_PRIVACY_TOKEN_IN_ABOUT_USYNC,
     abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY,

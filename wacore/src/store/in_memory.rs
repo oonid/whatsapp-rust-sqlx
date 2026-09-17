@@ -1025,6 +1025,16 @@ impl ProtocolStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn get_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .sent_messages
+            .get(&(chat_jid.to_string(), message_id.to_string()))
+            .map(|e| e.payload.clone()))
+    }
+
     async fn take_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
         Ok(self
             .state
@@ -1825,6 +1835,56 @@ mod tests {
             .await
             .unwrap();
         assert!(dev.has_signal_state_for_user(user).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_sent_message_preserves_payload_and_expiry() {
+        let backend = InMemoryBackend::new();
+        let chat = "120363000000000001@g.us";
+        backend
+            .store_sent_message(chat, "READ", b"payload")
+            .await
+            .unwrap();
+        backend
+            .state
+            .lock()
+            .await
+            .sent_messages
+            .get_mut(&(chat.into(), "READ".into()))
+            .unwrap()
+            .timestamp = 1;
+        for _ in 0..2 {
+            assert_eq!(
+                backend
+                    .get_sent_message(chat, "READ")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"payload".as_slice())
+            );
+        }
+        assert!(
+            backend
+                .get_sent_message(chat, "MISSING")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_sent_message("120363000000000002@g.us", "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(backend.delete_expired_sent_messages(2).await.unwrap(), 1);
+        assert!(
+            backend
+                .get_sent_message(chat, "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

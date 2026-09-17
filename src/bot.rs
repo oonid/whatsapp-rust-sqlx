@@ -11,6 +11,7 @@ use crate::store::traits::Backend;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
+use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::message::MessageInfo;
 use futures::FutureExt;
 use log::{info, warn};
@@ -714,6 +715,7 @@ pub struct BotBuilder<
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
@@ -746,6 +748,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             raw_handlers: Vec::new(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_admission: None,
             override_version: None,
             device_props_override: None,
             pair_code_options: None,
@@ -782,6 +785,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             raw_handlers: self.raw_handlers,
             custom_enc_handlers: self.custom_enc_handlers,
             inbound_durability_hook: self.inbound_durability_hook,
+            history_sync_admission: self.history_sync_admission,
             override_version: self.override_version,
             device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
@@ -1302,6 +1306,25 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Register a synchronous policy that can reject inbound history-sync
+    /// notifications before they create history-sync work.
+    pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
+    where
+        A: HistorySyncAdmission + 'static,
+    {
+        self.history_sync_admission = Some(Arc::new(admission));
+        self
+    }
+
+    /// Register an already-shared history-sync admission policy.
+    pub fn with_history_sync_admission_arc(
+        mut self,
+        admission: Arc<dyn HistorySyncAdmission>,
+    ) -> Self {
+        self.history_sync_admission = Some(admission);
+        self
+    }
+
     /// Override the WhatsApp version used by the client.
     ///
     /// By default, the client will automatically fetch the latest version from WhatsApp's servers.
@@ -1578,6 +1601,9 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         }
         if let Some(hook) = self.inbound_durability_hook {
             client_builder = client_builder.with_inbound_durability_hook_arc(hook);
+        }
+        if let Some(admission) = self.history_sync_admission {
+            client_builder = client_builder.with_history_sync_admission_arc(admission);
         }
         if let Some(count) = self.wanted_pre_key_count {
             client_builder = client_builder.with_wanted_pre_key_count(count);
@@ -2314,6 +2340,54 @@ mod tests {
             .expect("Failed to build bot");
 
         assert!(!bot.client().skip_history_sync_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_history_sync_admission_reaches_client() {
+        let backend = create_test_sqlite_backend().await;
+        let decisions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission_decisions = Arc::clone(&decisions);
+        struct Admission {
+            decisions: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl HistorySyncAdmission for Admission {
+            fn decide(
+                &self,
+                _metadata: &crate::HistorySyncMetadata<'_>,
+            ) -> crate::HistorySyncDecision {
+                self.decisions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::HistorySyncDecision::Accept
+            }
+        }
+
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_history_sync_admission(Admission {
+                decisions: admission_decisions,
+            })
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        let client = bot.client();
+        let admission = client
+            .history_sync_admission
+            .as_ref()
+            .expect("builder-installed history-sync admission");
+        assert_eq!(
+            admission.decide(&crate::HistorySyncMetadata {
+                sync_type: None,
+                chunk_order: None,
+                progress: None,
+                file_length: None,
+                inline_payload_len: None,
+                peer_data_request_session_id: None,
+            }),
+            crate::HistorySyncDecision::Accept
+        );
+        assert_eq!(decisions.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

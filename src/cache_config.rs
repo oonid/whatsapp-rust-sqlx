@@ -189,6 +189,9 @@ pub struct CacheConfig {
     /// observed resend window (production logs: median 12s between attempts,
     /// p90 189s, longest plausible resend 285s) and the capacity ~3.6x the
     /// busiest 5-minute burst measured (278 messages). Capacity 0 disables it.
+    /// Capacity counts identities, with up to eight payload digests per identity.
+    /// Further distinct payloads remain deliverable without deduplication.
+    /// The gate does not retain plaintext.
     pub dispatched_messages: CacheEntryConfig,
     /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,
@@ -244,11 +247,21 @@ pub struct CacheConfig {
 
     // --- MsgSecret retention ---
     /// How the per-message `messageSecret` store is managed (capture / seed /
-    /// prune). Default [`MsgSecretPolicy::Managed`] bounds DB growth: it seeds
-    /// only the still-relevant slice of history and prunes by a per-add-on-kind
-    /// event-time horizon. Set [`MsgSecretPolicy::Full`] to keep everything
-    /// forever, or [`MsgSecretPolicy::Disabled`] to persist nothing and delegate
-    /// to [`original_message_resolver`].
+    /// prune). The four tiers:
+    ///
+    /// * [`MsgSecretPolicy::Managed`] (default) — capture live secrets, seed
+    ///   only the still-relevant slice of history, and prune by a per-kind
+    ///   event-time horizon. This is the bounded default.
+    /// * [`MsgSecretPolicy::BotOnly`] — pre-#665 behavior: capture/seed only
+    ///   secrets in bot contexts, still pruned by the same horizons.
+    /// * [`MsgSecretPolicy::Full`] — capture and seed everything, never prune
+    ///   (`expires_at = 0` on every row). The store keeps growing; choose it
+    ///   only when the app needs every add-on to decrypt forever.
+    /// * [`MsgSecretPolicy::Disabled`] — persist nothing in core. Add-on
+    ///   decryption relies entirely on [`original_message_resolver`].
+    ///
+    /// `Disabled` still prunes legacy rows a prior policy left behind: it
+    /// writes none, but a policy change must not strand the old ones forever.
     ///
     /// [`original_message_resolver`]: CacheConfig::original_message_resolver
     pub msg_secret_policy: MsgSecretPolicy,
@@ -280,6 +293,13 @@ pub struct CacheConfig {
     /// is absent from the store (and its LID/PN alternates). Lets an app that
     /// keeps its own message store own secret retention; required for the
     /// `Disabled` policy to decrypt anything beyond what it has seen live.
+    ///
+    /// An implementation that also knows the parent message's event time should
+    /// override [`OriginalMessageResolver::resolve_msg_secret_with_metadata`],
+    /// which carries the timestamp and lets the receive path enforce the
+    /// 20-minute edit-processing window the same way a store row does. A
+    /// resolver that implements only `resolve_msg_secret` keeps compiling and
+    /// keeps the historical permissive behavior (no window check).
     pub original_message_resolver: Option<Arc<dyn OriginalMessageResolver>>,
     /// Bound on each [`original_message_resolver`] call. The resolver runs
     /// inside the per-chat receive lane, so a slow callback would stall that
@@ -412,9 +432,47 @@ impl Default for CacheConfig {
     }
 }
 
+/// Runtime-retained subset of [`CacheConfig`].
+///
+/// The constructor consumes most settings into live caches; only these fields
+/// are read after construction (lazy group-cache init, recent-message gate,
+/// sent-message sweep, secret policy). Converted once, so `Client` never
+/// holds the full construction config. Only the group-cache store is kept:
+/// the device-registry and LID-PN stores are owned by their live caches after
+/// construction, and keeping another `Arc` here would pin them for no reason.
+#[derive(Clone)]
+pub(crate) struct RuntimeCacheConfig {
+    pub(crate) group_cache: CacheEntryConfig,
+    pub(crate) group_cache_store: Option<Arc<dyn CacheStore>>,
+    pub(crate) recent_messages_enabled: bool,
+    pub(crate) sent_message_ttl_secs: u64,
+    pub(crate) msg_secret_policy: MsgSecretPolicy,
+    pub(crate) msg_secret_retention: MsgSecretRetention,
+    pub(crate) seed_msg_secrets_from_history: bool,
+    pub(crate) original_message_resolver: Option<Arc<dyn OriginalMessageResolver>>,
+    pub(crate) msg_secret_resolver_timeout: Duration,
+}
+
+impl From<&CacheConfig> for RuntimeCacheConfig {
+    fn from(config: &CacheConfig) -> Self {
+        Self {
+            group_cache: config.group_cache.clone(),
+            group_cache_store: config.cache_stores.group_cache.clone(),
+            recent_messages_enabled: config.recent_messages.capacity > 0,
+            sent_message_ttl_secs: config.sent_message_ttl_secs,
+            msg_secret_policy: config.msg_secret_policy,
+            msg_secret_retention: config.msg_secret_retention,
+            seed_msg_secrets_from_history: config.seed_msg_secrets_from_history,
+            original_message_resolver: config.original_message_resolver.clone(),
+            msg_secret_resolver_timeout: config.msg_secret_resolver_timeout,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     #[test]
     fn lid_pn_cache_default_is_effectively_unbounded() {
@@ -428,5 +486,58 @@ mod tests {
             u64::MAX,
             "lid_pn_cache must be effectively unbounded; capacity-LRU re-introduces the eviction bug at higher thresholds"
         );
+    }
+
+    /// The runtime config is built once per client and read on hot paths, so
+    /// it stays a fraction of the construction config and within its byte
+    /// budget. Rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
+    #[test]
+    fn runtime_config_is_compact() {
+        assert!(
+            size_of::<RuntimeCacheConfig>() * 2 < size_of::<CacheConfig>(),
+            "runtime config {} B must stay well under construction config {} B",
+            size_of::<RuntimeCacheConfig>(),
+            size_of::<CacheConfig>()
+        );
+        assert!(
+            size_of::<RuntimeCacheConfig>() <= 136,
+            "runtime config grew to {} B (budget 136)",
+            size_of::<RuntimeCacheConfig>()
+        );
+    }
+
+    #[test]
+    fn runtime_conversion_keeps_nondefault_settings() {
+        let cfg = CacheConfig {
+            group_cache: CacheEntryConfig::new(Some(Duration::from_secs(60)), 10),
+            recent_messages: CacheEntryConfig::new(Some(Duration::from_secs(300)), 64),
+            sent_message_ttl_secs: 60,
+            msg_secret_policy: MsgSecretPolicy::Full,
+            msg_secret_retention: MsgSecretRetention {
+                text: Duration::from_secs(7 * 86_400),
+                poll_event: Duration::from_secs(7 * 86_400),
+                bot: Duration::from_secs(7 * 86_400),
+            },
+            seed_msg_secrets_from_history: false,
+            msg_secret_resolver_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let runtime = RuntimeCacheConfig::from(&cfg);
+        assert_eq!(runtime.group_cache.capacity, 10);
+        assert_eq!(runtime.group_cache.timeout, Some(Duration::from_secs(60)));
+        assert!(runtime.recent_messages_enabled);
+        assert_eq!(runtime.sent_message_ttl_secs, 60);
+        assert_eq!(runtime.msg_secret_policy, MsgSecretPolicy::Full);
+        assert_eq!(
+            runtime.msg_secret_retention.text,
+            Duration::from_secs(7 * 86_400)
+        );
+        assert!(!runtime.seed_msg_secrets_from_history);
+        assert_eq!(runtime.msg_secret_resolver_timeout, Duration::from_secs(1));
+        assert!(runtime.group_cache_store.is_none());
+        assert!(runtime.original_message_resolver.is_none());
+
+        let disabled = CacheConfig::default();
+        assert!(!RuntimeCacheConfig::from(&disabled).recent_messages_enabled);
     }
 }

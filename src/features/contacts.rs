@@ -9,19 +9,84 @@ use log::debug;
 use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
-use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
+use wacore::iq::contacts::ProfilePictureSpec;
 use wacore::iq::usync::{
     IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec, UsernameLookupSpec,
 };
 use wacore_binary::{Jid, JidExt};
 
 // Re-export types from wacore
-pub use wacore::iq::contacts::ProfilePicture;
+pub use wacore::iq::contacts::{ProfilePicture, ProfilePictureLookup, ProfilePictureType};
 pub use wacore::iq::usync::{
     IsOnWhatsAppResult, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup,
     UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
 };
 pub use wacore::stanza::business::VerifiedName;
+
+/// Options for querying a profile picture with full protocol control.
+#[derive(Debug, Clone)]
+pub struct ProfilePictureLookupOptions<'a> {
+    pub jid: &'a Jid,
+    pub picture_type: ProfilePictureType,
+    pub existing_id: Option<&'a str>,
+    pub common_gid: Option<&'a Jid>,
+    pub invite: Option<&'a str>,
+    pub persona_id: Option<&'a str>,
+    pub timeout: Option<Duration>,
+}
+
+impl<'a> ProfilePictureLookupOptions<'a> {
+    pub fn new(jid: &'a Jid) -> Self {
+        Self {
+            jid,
+            picture_type: ProfilePictureType::Preview,
+            existing_id: None,
+            common_gid: None,
+            invite: None,
+            persona_id: None,
+            timeout: None,
+        }
+    }
+
+    pub fn preview(mut self, preview: bool) -> Self {
+        self.picture_type = if preview {
+            ProfilePictureType::Preview
+        } else {
+            ProfilePictureType::Full
+        };
+        self
+    }
+
+    pub fn picture_type(mut self, picture_type: ProfilePictureType) -> Self {
+        self.picture_type = picture_type;
+        self
+    }
+
+    pub fn existing_id(mut self, existing_id: Option<&'a str>) -> Self {
+        self.existing_id = existing_id;
+        self
+    }
+
+    pub fn common_gid(mut self, common_gid: Option<&'a Jid>) -> Self {
+        self.common_gid = common_gid;
+        self
+    }
+
+    pub fn invite(mut self, invite: Option<&'a str>) -> Self {
+        self.invite = invite;
+        self
+    }
+
+    pub fn persona_id(mut self, persona_id: Option<&'a str>) -> Self {
+        self.persona_id = persona_id;
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
 
 /// Error returned by contact-information operations (existence checks,
 /// profile pictures, user info).
@@ -208,46 +273,78 @@ impl<'a> Contacts<'a> {
         Ok(results)
     }
 
-    pub async fn get_profile_picture(
+    /// Lookup a profile picture preserving detailed protocol outcomes:
+    /// `Found`, `Unchanged`, `NotFound`, `NotAuthorized`.
+    pub async fn lookup_profile_picture(
         &self,
         jid: &Jid,
         preview: bool,
-    ) -> Result<Option<ProfilePicture>, ContactError> {
-        self.get_profile_picture_with_timeout(jid, preview, None)
-            .await
+        existing_id: Option<&str>,
+    ) -> Result<ProfilePictureLookup, ContactError> {
+        self.lookup_profile_picture_with_options(
+            ProfilePictureLookupOptions::new(jid)
+                .preview(preview)
+                .existing_id(existing_id),
+        )
+        .await
     }
 
-    /// Fetch a profile picture with an optional request timeout override.
-    pub async fn get_profile_picture_with_timeout(
+    /// Lookup a profile picture with configurable picture, cache, group, invite, persona, and timeout options.
+    ///
+    /// A valid privacy token is loaded automatically from the client store when applicable.
+    pub async fn lookup_profile_picture_with_options(
         &self,
-        jid: &Jid,
-        preview: bool,
-        timeout: Option<Duration>,
-    ) -> Result<Option<ProfilePicture>, ContactError> {
-        // The system JID never answers this IQ; skip it to save the full timeout.
+        options: ProfilePictureLookupOptions<'_>,
+    ) -> Result<ProfilePictureLookup, ContactError> {
+        let jid = options.jid;
+        // The system JID never answers this IQ; skip it.
         if jid.is_psa() {
-            return Ok(None);
+            return Ok(ProfilePictureLookup::NotFound);
         }
 
         debug!(
-            "get_profile_picture: fetching {} picture for {}",
-            if preview { "preview" } else { "full" },
-            jid
+            "lookup_profile_picture: fetching {:?} picture for {} (existing_id={:?})",
+            options.picture_type, jid, options.existing_id
         );
 
-        let picture_type = if preview {
-            ProfilePictureType::Preview
-        } else {
-            ProfilePictureType::Full
-        };
-        let mut spec = ProfilePictureSpec::new(jid, picture_type);
-        if let Some(timeout) = timeout {
+        let spec = self.profile_picture_spec(&options).await;
+        match self.client.execute(spec).await {
+            Ok(lookup) => Ok(lookup),
+            // Server-level IQ error mappings (WA Web parseIqResponse / whatspec GetResponseError):
+            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
+            Err(IqError::ServerError {
+                code: 401 | 403, ..
+            }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Builds the `<picture>` request for `options`, including the privacy-token
+    /// versus `common_gid` fallback. Shared by the typed lookup and the legacy
+    /// getter so the two agree on the wire.
+    async fn profile_picture_spec(
+        &self,
+        options: &ProfilePictureLookupOptions<'_>,
+    ) -> ProfilePictureSpec {
+        let jid = options.jid;
+        let mut spec = ProfilePictureSpec::new(jid, options.picture_type);
+        if let Some(id) = options.existing_id {
+            spec = spec.with_existing_id(id);
+        }
+        if let Some(invite) = options.invite {
+            spec = spec.with_invite(invite);
+        }
+        if let Some(persona_id) = options.persona_id {
+            spec = spec.with_persona_id(persona_id);
+        }
+        if let Some(timeout) = options.timeout {
             spec = spec.with_timeout(timeout);
         }
 
         // Skip own JID: server never responds when tctoken is sent for self
         let is_own_jid = self.client.is_own_jid(jid);
-        if !jid.is_group()
+        let tc_token = if !jid.is_group()
             && !jid.is_newsletter()
             && !jid.is_bot()
             && !jid.is_broadcast_list()
@@ -258,16 +355,68 @@ impl<'a> Contacts<'a> {
                 .ab_props
                 .is_enabled(wacore::iq::props::stale::PROFILE_PIC_PRIVACY_TOKEN)
                 .await
-            && let Some(token) = self.client.lookup_tc_token_for_jid(jid).await
         {
-            spec = spec.with_tc_token(token);
-        }
+            self.client.lookup_tc_token_for_jid(jid).await
+        } else {
+            None
+        };
 
+        // WhatsApp Web uses common_gid as a fallback only when no tctoken is present.
+        if let Some(token) = tc_token {
+            spec = spec.with_tc_token(token);
+        } else if let Some(common_gid) = options.common_gid {
+            spec = spec.with_common_gid(common_gid.clone());
+        }
+        spec
+    }
+
+    /// Fetch a profile picture URL for a given JID.
+    ///
+    /// Returns `Ok(Some(ProfilePicture))` if found, or `Ok(None)` if no picture is set,
+    /// unchanged, or unauthorized.
+    ///
+    /// For detailed outcome states (`Found`, `Unchanged`, `NotFound`, `NotAuthorized`),
+    /// prefer [`Self::lookup_profile_picture`].
+    pub async fn get_profile_picture(
+        &self,
+        jid: &Jid,
+        preview: bool,
+    ) -> Result<Option<ProfilePicture>, ContactError> {
+        self.get_profile_picture_with_timeout(jid, preview, None)
+            .await
+    }
+
+    /// Fetch a profile picture with an optional request timeout override.
+    ///
+    /// Returns `Ok(Some(ProfilePicture))` if found, or `Ok(None)` if no picture is set,
+    /// unchanged, or unauthorized.
+    ///
+    /// For detailed outcome states (`Found`, `Unchanged`, `NotFound`, `NotAuthorized`),
+    /// prefer [`Self::lookup_profile_picture`].
+    pub async fn get_profile_picture_with_timeout(
+        &self,
+        jid: &Jid,
+        preview: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Option<ProfilePicture>, ContactError> {
+        // The system JID never answers this IQ; skip it to save the full timeout.
+        if jid.is_psa() {
+            return Ok(None);
+        }
+        // Executed directly rather than through `lookup_profile_picture_with_options`
+        // so a 429 keeps its server `<iq type="error">` (the `backoff` a caller must
+        // honour), which the typed outcome does not carry.
+        let options = ProfilePictureLookupOptions::new(jid)
+            .preview(preview)
+            .timeout(timeout);
+        let spec = self.profile_picture_spec(&options).await;
         match self.client.execute(spec).await {
-            Ok(pic) => Ok(pic),
-            // 404/401 = no profile picture (or not authorized to see it).
-            // WhatsApp server returns type="error" IQ for these cases.
-            Err(IqError::ServerError { code, .. }) if code == 404 || code == 401 => Ok(None),
+            Ok(lookup) => Ok(lookup.into_found()),
+            // 404/401/403 = no profile picture (or not authorized to see it).
+            Err(IqError::ServerError {
+                code: 404 | 401 | 403,
+                ..
+            }) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }

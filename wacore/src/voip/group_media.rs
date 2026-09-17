@@ -102,7 +102,8 @@ pub struct ParticipantVideo {
     pub device_jid: Jid,
     pub pid: Option<u32>,
     pub header: RtpHeader,
-    pub access_units: Vec<Vec<u8>>,
+    pub access_units: Vec<(u32, Vec<u8>)>,
+    pub(crate) orientations: Vec<Option<u8>>,
 }
 
 struct ParticipantReceiver {
@@ -465,6 +466,10 @@ impl GroupMediaRegistry {
             return None;
         }
         let (header, access_units) = receiver.video.as_mut()?.unprotect_video_packet(packet)?;
+        let (access_units, orientations) = access_units
+            .into_iter()
+            .map(|(timestamp, data, orientation)| ((timestamp, data), orientation))
+            .unzip();
         Some(ParticipantVideo {
             participant_id,
             user_jid: receiver.user_jid.clone(),
@@ -472,6 +477,7 @@ impl GroupMediaRegistry {
             pid: receiver.pid,
             header,
             access_units,
+            orientations,
         })
     }
 
@@ -1308,7 +1314,9 @@ mod tests {
                 .find_map(|packet| registry.unprotect_video(packet))
                 .expect("participant video packet");
             assert_eq!(decoded.device_jid, *peer);
-            assert_eq!(decoded.access_units, [access_unit.to_vec()]);
+            assert_eq!(decoded.access_units.len(), 1);
+            assert_eq!(decoded.access_units[0].0, decoded.header.timestamp);
+            assert_eq!(decoded.access_units[0].1, access_unit);
         }
     }
 

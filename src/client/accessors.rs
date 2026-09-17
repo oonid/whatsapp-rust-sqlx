@@ -20,7 +20,7 @@ impl Client {
             Arc::new(
                 self.cache_config
                     .group_cache
-                    .build_typed_ttl(self.cache_config.cache_stores.group_cache.clone(), "group"),
+                    .build_typed_ttl(self.cache_config.group_cache_store.clone(), "group"),
             )
         })
     }
@@ -426,6 +426,9 @@ impl Client {
             CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
         let msg_secret_buffer = self.msg_secret_buffer.pending_len();
         let pending_device_sync = self.pending_device_sync.len();
+        let pending_group_device_resync = self.pending_group_device_resync.len();
+        let pending_group_message_repairs =
+            self.pending_group_device_resync.retained_message_count();
         let chatstate_handlers = self.chatstate_handler_count.load(Ordering::Acquire);
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(
@@ -488,7 +491,15 @@ impl Client {
             dm_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count_async().await,
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count_async().await,
-            dispatched_messages: self.dispatched_messages.entry_count_async().await,
+            dispatched_messages: self.dispatched_messages.entry_count(),
+            dispatched_message_contents: self.dispatched_messages.memory_stats(
+                // The identity is a 64-bit digest stored in the slot itself,
+                // so only the claim's payloads retain anything beside it.
+                |_key: &crate::message::DispatchKey, claim: &crate::message::DispatchClaim| {
+                    use wacore::stats::HeapSize;
+                    claim.heap_bytes()
+                },
+            ),
             pdo_pending_requests: self.pdo_pending_requests.entry_count_async().await,
             pdo_requested: self.pdo_requested.entry_count_async().await,
             history_sync_tasks,
@@ -498,6 +509,8 @@ impl Client {
             offline_receipt_buffer,
             msg_secret_buffer,
             pending_device_sync,
+            pending_group_device_resync,
+            pending_group_message_repairs,
             session_locks: self.session_locks.entry_count_async().await,
             ensure_inflight: self.ensure_inflight.len() as u64,
             group_metadata_inflight: self.group_metadata_inflight.len() as u64,

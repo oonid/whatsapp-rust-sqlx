@@ -625,11 +625,32 @@ pub enum CallEvent {
     /// Pushed by the signaling handler, not the engine; surfaced here so one event stream carries
     /// the whole call. For an upgrade request, pass `upgrade_token` to `accept_video`; a cancelled
     /// or superseded token cannot attach video endpoints.
+    /// Identity-aware consumers should use `PeerVideoStateChanged` instead and ignore this
+    /// compatibility event, rather than joining this queue with the global incoming-call stream.
     VideoStateChanged {
         state: crate::types::call::VideoState,
         orientation: Option<u8>,
         /// Accepting requires this exact token. `None` means simultaneous local and peer requests
         /// were already resolved by the signaling state machine.
+        upgrade_token: Option<super::VideoUpgradeToken>,
+    },
+    /// A committed peer video-state notification with its signaling identity.
+    ///
+    /// Published on the same handle queue, under the same transition lock, as video-upgrade
+    /// tokens. Direct calls publish this before the matching legacy `VideoStateChanged`;
+    /// consume one variant or the other, not both. Group participants publish only this variant
+    /// and never enter the direct-call upgrade state machine.
+    ///
+    /// `source` is the parsed stanza's `participant`, or `from` when absent, not the stored
+    /// winning device. PN aliases are retained. `call_creator` is also the stanza's value.
+    /// These fields report the existing handler's decision; they do not add authorization.
+    /// Queue pressure retains the existing bounded eviction policy, not lossless delivery of pairs.
+    PeerVideoStateChanged {
+        source: Jid,
+        call_creator: Jid,
+        state: crate::types::call::VideoState,
+        orientation: Option<u8>,
+        /// The same token as the direct-call compatibility event; always `None` for groups.
         upgrade_token: Option<super::VideoUpgradeToken>,
     },
     /// Outbound video needs an IDR before anything can go on the wire, and the
@@ -799,6 +820,11 @@ impl CallEvent {
                         .sum::<usize>()
             }
             Self::MediaSetupFailed(reason) => reason.capacity(),
+            Self::PeerVideoStateChanged {
+                source,
+                call_creator,
+                ..
+            } => source.heap_bytes() + call_creator.heap_bytes(),
             Self::RelayAllocated
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut
@@ -953,10 +979,6 @@ struct PcmAudioState {
     encoder: mlow::MlowEncoder,
     #[cfg(feature = "voip-mlow")]
     decoder: mlow::MlowDecoder,
-    /// Reused per outbound frame to hold the i16->f32 conversion, so the encode hot path doesn't
-    /// allocate a fresh Vec each frame.
-    #[cfg(feature = "voip-mlow")]
-    scratch: Vec<f32>,
     /// Reused codec output before SRTP copies it into the protected packet.
     #[cfg(feature = "voip-mlow")]
     encoded: Vec<u8>,
@@ -1333,8 +1355,6 @@ impl CallEngine {
                     encoder: mlow::MlowEncoder::new(),
                     #[cfg(feature = "voip-mlow")]
                     decoder: mlow::MlowDecoder::new(),
-                    #[cfg(feature = "voip-mlow")]
-                    scratch: Vec::with_capacity(config.audio.format.samples_per_frame as usize),
                     #[cfg(feature = "voip-mlow")]
                     encoded: Vec::with_capacity(MLOW_ENCODED_CAPACITY),
                     jitter: VecDeque::new(),
@@ -2236,6 +2256,15 @@ impl CallEngine {
         }
     }
 
+    /// Hold OUTBOUND video off the wire while inbound keeps decoding (our camera stopped; the
+    /// peer is still sending). A later [`enable_video`](Self::enable_video) ungates it like an
+    /// accepted upgrade, including the keyframe the peer needs for the fresh stream.
+    pub fn gate_video_outbound(&mut self) {
+        if let Some(v) = self.media.as_mut().and_then(|m| m.video.as_mut()) {
+            v.send_gated = true;
+        }
+    }
+
     /// Deactivate the video plane (downgrade): outbound AUs drop, inbound PT-97 is ignored. The
     /// pipeline (and its SRTP send seq/ROC) is PRESERVED so a later re-upgrade continues the
     /// keystream instead of resetting the packet index. The audio plane is untouched. Idempotent.
@@ -3009,15 +3038,17 @@ impl CallEngine {
                     now,
                     VIDEO_CLOCK_RATE,
                 );
-                for au in completed {
+                for (timestamp, au, orientation) in completed {
                     let keyframe = au_is_keyframe(&au);
                     self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                         data: au,
                         keyframe,
-                        orientation: self.peer_video_orientation,
+                        orientation: orientation.unwrap_or(self.peer_video_orientation),
                         sender: None,
                         device: None,
                         pid: None,
+                        timestamp,
+                        generation: 0,
                     }));
                 }
             }
@@ -3414,15 +3445,19 @@ impl CallEngine {
                 .or_else(|| group.video_orientations.get(&video.user_jid))
                 .copied()
                 .unwrap_or_default();
-            for access_unit in video.access_units {
+            for ((timestamp, access_unit), frame_orientation) in
+                video.access_units.into_iter().zip(video.orientations)
+            {
                 let keyframe = au_is_keyframe(&access_unit);
                 self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                     data: access_unit,
                     keyframe,
-                    orientation,
+                    orientation: frame_orientation.unwrap_or(orientation),
                     sender: Some(video.user_jid.clone()),
                     device: Some(video.device_jid.clone()),
                     pid: video.pid,
+                    timestamp,
+                    generation: 0,
                 }));
             }
             return;
@@ -3814,17 +3849,13 @@ impl CallEngine {
             self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
             return;
         }
-        pcm_state.scratch.clear();
-        pcm_state
-            .scratch
-            .extend(pcm.iter().map(|&s| s as f32 / 32768.0));
         // A transient encode failure drops just this frame; the next one resyncs. Counted the same
         // way the foreign encoder's refusal is: a run of them stops outbound RTP, and every other
         // counter here watches the inbound direction, so without this the peer stops hearing us
         // while `media_stats()` reports a healthy call.
         if pcm_state
             .encoder
-            .encode_into(&pcm_state.scratch, &mut pcm_state.encoded)
+            .encode_i16_into(pcm, &mut pcm_state.encoded)
             .is_err()
         {
             self.media_stats.outbound_frames_without_encoder = self
@@ -9114,28 +9145,35 @@ mod tests {
     }
 
     #[test]
-    fn group_video_uses_per_participant_orientation() {
-        let (mut eng, epoch) = group_engine(true);
-        let peer_device = PEER_LID.parse::<Jid>().expect("peer JID");
-        eng.set_participant_video_orientation(peer_device.clone(), 2);
-        let mut peer = group_peer_video(&epoch);
-        let packet = peer
-            .protect_video(&video_au(100))
-            .pop()
-            .expect("one-packet video");
-        eng.handle_input(1, Input::RelayPacket(&packet));
-        let (outputs, _) = drain(&mut eng);
-        let peer_user = Jid::new("222222222222222", Server::Lid);
-        assert!(outputs.iter().any(|output| matches!(
+    fn group_video_frame_metadata_overrides_participant_orientation() {
+        for has_frame_info in [true, false] {
+            let (mut eng, epoch) = group_engine(true);
+            let peer_device = PEER_LID.parse::<Jid>().expect("peer JID");
+            eng.set_participant_video_orientation(peer_device.clone(), 2);
+            let mut peer = group_peer_video(&epoch);
+            let packet = peer
+                .protect_video(&video_au(100))
+                .pop()
+                .expect("one-packet video");
+            let packet = if has_frame_info {
+                packet
+            } else {
+                without_video_frame_info(&packet, &epoch)
+            };
+            eng.handle_input(1, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            let peer_user = Jid::new("222222222222222", Server::Lid);
+            assert!(outputs.iter().any(|output| matches!(
             output,
             Output::VideoPlayout(VideoFrame {
-                orientation: 2,
+                orientation,
                 sender: Some(sender),
                 device: Some(device),
                 pid: Some(2),
                 ..
-            }) if *sender == peer_user && *device == peer_device
+            }) if *sender == peer_user && *device == peer_device && *orientation == if has_frame_info { 0 } else { 2 }
         )));
+        }
     }
 
     #[test]
@@ -10755,6 +10793,48 @@ mod tests {
         );
     }
 
+    // Gating only the outbound camera must not touch the inbound picture: our Stopped leaves
+    // the peer's stream decodable, so a local mute is not a remote blackout.
+    #[test]
+    fn gating_outbound_keeps_inbound_decoding() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+
+        eng.gate_video_outbound();
+        eng.handle_input(1, Input::VideoFrame(&video_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "a gated camera must not transmit our video"
+        );
+        let mut peer = peer_video_pipe();
+        for p in peer.protect_video(&video_au(120)) {
+            eng.handle_input(1, Input::RelayPacket(&p));
+        }
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::VideoPlayout(_))),
+            "gating our camera must not lose the peer's picture"
+        );
+
+        // Ungating resumes our camera; the peer's stream never left, so no new SSRC is needed.
+        assert!(eng.enable_video());
+        for p in peer.protect_video(&video_au(120)) {
+            eng.handle_input(2, Input::RelayPacket(&p));
+        }
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::VideoPlayout(_))),
+            "re-enabling after a local mute must play the peer at once"
+        );
+    }
+
     /// Ungating an upgrade drops every frame until an IDR arrives, and the
     /// engine cannot make one — it never touches pixels. Saying so is the
     /// difference between the peer's picture appearing at once and appearing a
@@ -10910,12 +10990,98 @@ mod tests {
         assert_eq!(frames.len(), 1, "N packets must reassemble into 1 AU");
         assert_eq!(frames[0].data, au);
         assert!(frames[0].keyframe, "IDR AU must be flagged as keyframe");
-        assert_eq!(frames[0].orientation, 2);
+        assert_eq!(
+            frames[0].orientation, 0,
+            "per-frame RTP rotation overrides stale device orientation"
+        );
         assert_eq!(
             eng.jitter_len(),
             0,
             "video must not leak into the audio jitter buffer"
         );
+    }
+
+    fn without_video_frame_info(packet: &[u8], call_key: &[u8]) -> Vec<u8> {
+        use crate::voip::{e2e_srtp, rtp};
+        let mut header = parse_rtp_header(packet).unwrap();
+        let payload_start = rtp::rtp_header_byte_length(packet).unwrap();
+        header.video_extension = None;
+        let mut result = Vec::new();
+        rtp::encode_rtp_header_into(&header, &mut result);
+        result.extend_from_slice(&packet[payload_start..packet.len() - WARP_MI_TAG_LEN]);
+        let keys =
+            e2e_srtp::derive_e2e_keys(call_key, &ssrc::format_e2e_srtp_participant_id(PEER_LID))
+                .unwrap();
+        e2e_srtp::append_warp_mi_tag_in_place(&keys.auth_key, &mut result, 0, WARP_MI_TAG_LEN);
+        result
+    }
+
+    #[test]
+    fn inbound_video_without_frame_metadata_keeps_signaling_fallback() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.set_peer_video_orientation(3);
+        let mut peer = peer_video_pipe();
+        let key: Vec<u8> = (0..32).collect();
+        for has_frame_info in [true, false, true] {
+            let packet = peer.protect_video(&video_au(100)).pop().unwrap();
+            let packet = if has_frame_info {
+                packet
+            } else {
+                without_video_frame_info(&packet, &key)
+            };
+            eng.handle_input(1, Input::RelayPacket(&packet));
+            let frames: Vec<_> = drain(&mut eng)
+                .0
+                .into_iter()
+                .filter_map(|output| match output {
+                    Output::VideoPlayout(frame) => Some(frame),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].orientation, if has_frame_info { 0 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn inbound_frame_info_only_overrides_signaling_without_other_extensions() {
+        use crate::voip::{e2e_srtp, rtp};
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.set_peer_video_orientation(1);
+        let mut peer = peer_video_pipe();
+        let key: Vec<u8> = (0..32).collect();
+        let keys = e2e_srtp::derive_e2e_keys(&key, &ssrc::format_e2e_srtp_participant_id(PEER_LID))
+            .unwrap();
+        let au = video_au(100);
+        for info in [Some(3u8), Some(0), None] {
+            let packet = peer.protect_video(&au).pop().unwrap();
+            let mut header = parse_rtp_header(&packet).unwrap();
+            let start = rtp::rtp_header_byte_length(&packet).unwrap();
+            header.video_extension = None;
+            header.extension_word = info.map(|info| u32::from_be_bytes([0x30, info, 0, 0]));
+            let mut rewritten = rtp::encode_rtp_header(&header);
+            rewritten.extend_from_slice(&packet[start..packet.len() - WARP_MI_TAG_LEN]);
+            e2e_srtp::append_warp_mi_tag_in_place(
+                &keys.auth_key,
+                &mut rewritten,
+                0,
+                WARP_MI_TAG_LEN,
+            );
+            eng.handle_input(1, Input::RelayPacket(&rewritten));
+            let frames: Vec<_> = drain(&mut eng)
+                .0
+                .into_iter()
+                .filter_map(|output| match output {
+                    Output::VideoPlayout(frame) => Some(frame),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].data, au);
+            assert_eq!(frames[0].orientation, info.unwrap_or(1));
+        }
     }
 
     #[test]

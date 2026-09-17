@@ -369,7 +369,7 @@ the reason for measuring against one.
 | --- | ---: | ---: |
 | HTTP: pooled TLS connection from the version fetch | 88 KiB | 0 KiB (#1243) |
 | noise: batch buffer after one 60 KiB frame | 60 KiB, vs 8 KiB small-traffic | 8 KiB (#1246) |
-| transport: retained `ClientConfig` | 14 KiB | 9 KiB (#1245) |
+| transport: retained `ClientConfig`, historical construction probe | 14 KiB | 9 KiB at #1245, not a warm-cache measurement |
 | topology log preallocation | 4 KiB | 0 KiB (#1244) |
 
 **The prekey window is a backend artifact, not a per-session cost.** Building a
@@ -396,10 +396,15 @@ and its in-call transient high-water from 63.1 KB to 42.1 KB — but retained is
 bit-identical at 42,072 B either way, because the final table is the same size.
 Reserving is worth it for the allocator traffic; it will never move the 41 KiB.
 
-**The rustls session cache is 5 KiB, not 44.** A whole retained
-`default_tls_connector()` measures 14.0 KiB; disabling resumption entirely takes
-it to 9.0 KiB, and sizing the store for the one host a factory dials takes it to
-9.4 KiB. The other 9 KiB is the config plus the webpki root store.
+**Historical rustls construction measurements.** At #1245, a retained
+`default_tls_connector()` measured 14.0 KiB; disabling resumption measured
+9.0 KiB, and the eight-ticket budget measured 9.4 KiB. These construction
+probes do not establish the footprint after processing session tickets.
+In rustls 0.23.43, that budget immediately evicts the first server-name entry.
+The corrected sixteen-ticket budget retains one name and its ticket deque;
+its empty and populated footprints have not been remeasured. Count an
+explicitly shared configuration once per owner, not once per socket. The
+transport resource estimate covers connection buffers, not this factory cache.
 
 ### Should a residency probe be permanent?
 
@@ -561,9 +566,29 @@ takes the idle-ping early return) still reaches them:
 
 | pass | cadence | what it does |
 | --- | --- | --- |
-| retention sweeps | every 12 ticks (~4.5 min) | `sent_messages`, `pending_inbound_messages`, `base_keys` and `msg_secrets` expiry, sequentially in one task, each through the store's write permit |
-| engine maintenance | ~1 h of ticks | `DeviceStore::maintenance()` — for SQLite, `analysis_limit` + `PRAGMA optimize` and an opportunistic `wal_checkpoint(TRUNCATE)` |
+| retention sweeps | every 12 ticks (~4.5 min), plus once at startup | `sent_messages`, `pending_inbound_messages`, `base_keys` and `msg_secrets` expiry, sequentially in one task, each through the store's write permit |
+| engine maintenance | ~1 h of ticks | `DeviceStore::maintenance()` — for SQLite, `analysis_limit` + `PRAGMA optimize`, an opportunistic `wal_checkpoint(TRUNCATE)`, and (only when opted in and the DB is already in `auto_vacuum=INCREMENTAL`) a bounded `incremental_vacuum` |
 | session maintenance | ~6 h of ticks | signed pre-key rotation check and the tcToken prune, both of which used to run only at connect |
+
+The retention sweep also runs once from `Client::run_startup_maintenance`, which
+client construction spawns detached in `start_services`. The keepalive cadence
+covers a connection that stays up; startup covers the gap where a process was
+closed long enough for secrets to expire, and the case of an app that opens the
+store without ever holding a connection (a batch job or an inspector), for which
+the keepalive tick may never fire at all. Startup runs the same
+`run_retention_cleanup` body as the tick, minus the pending-inbound prune (see
+below).
+
+Each delete in the sweep acquires and releases the store's write permit on its
+own, through the backend's `with_retry` wrapper; no permit is held across the
+whole sweep. An overlapping startup and keepalive sweep can therefore interleave
+their deletes, and on a store opened with `pool_size > 1` the individual
+operations can overlap outright. That is safe because every delete is idempotent
+and scoped by device and deadline: whichever sweep runs one, the result is the
+same. The startup pass does leave the pending-inbound durability buffer alone,
+because those rows are the only recoverable copy of a message whose hook has not
+committed yet; the keepalive pass, which runs only once the connection is up,
+prunes them.
 
 The last two exist because a process that holds one connection for weeks never
 reruns connect-time work: before them a session outliving the 27-day rotation
@@ -575,7 +600,10 @@ being bounded.
 `maintenance()` is a defaulted method on `DeviceStore`, for the same reason
 `resource_report` is. What it must never do is take an exclusive lock on the
 whole database: `VACUUM` (the only thing that returns free-list pages to the
-filesystem) stays an explicit embedder call.
+filesystem) stays an explicit embedder call. The SQLite incremental-vacuum
+support (`SqliteStoreConfig::incremental_vacuum`) is the safe subset: it is
+opt-in, it never switches an existing database out of its mode, and it reclaims
+at most a bounded page count per pass.
 
 ### `SqliteStoreConfig::mmap_size` — page-cache tuning knob
 

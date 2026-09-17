@@ -21,6 +21,7 @@ use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
+use crate::types::history_sync_admission::HistorySyncAdmission;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::runtime::Runtime;
 
@@ -115,6 +116,7 @@ pub struct ClientBuilder {
     cache_config: CacheConfig,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     skip_history_sync: bool,
     ab_props_fetch: bool,
     presence_policy: PresencePolicy,
@@ -150,6 +152,7 @@ impl ClientBuilder {
             cache_config: CacheConfig::default(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_admission: None,
             skip_history_sync: false,
             ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
@@ -272,6 +275,25 @@ impl ClientBuilder {
         hook: Arc<dyn InboundDurabilityHook>,
     ) -> Self {
         self.inbound_durability_hook = Some(hook);
+        self
+    }
+
+    /// Register a synchronous policy that can reject inbound history-sync
+    /// notifications before they create history-sync work.
+    pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
+    where
+        A: HistorySyncAdmission + 'static,
+    {
+        self.history_sync_admission = Some(Arc::new(admission));
+        self
+    }
+
+    /// Register an already-shared history-sync admission policy.
+    pub fn with_history_sync_admission_arc(
+        mut self,
+        admission: Arc<dyn HistorySyncAdmission>,
+    ) -> Self {
+        self.history_sync_admission = Some(admission);
         self
     }
 
@@ -555,6 +577,7 @@ impl ClientBuilder {
                 #[cfg(feature = "plugins")]
                 plugin_host,
                 noise_cert_policy: self.noise_cert_policy,
+                history_sync_admission: self.history_sync_admission,
             },
         );
         let client = assembly.client();
@@ -636,16 +659,9 @@ impl ClientBuilder {
 async fn probe_durability_backend(
     backend: &Arc<dyn crate::store::traits::Backend>,
 ) -> Result<(), ClientBuilderError> {
-    use portable_atomic::{AtomicU64, Ordering};
-
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     const PROBE_JID: &str = "0@s.whatsapp.net";
     const PROBE_PAYLOAD: &[u8] = b"probe";
-    let probe_id = format!(
-        "__wa_durability_probe_{}_{}__",
-        std::process::id(),
-        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let probe_id = super::durability_probe_id::next();
     let map_err =
         |error: StoreError| ClientBuilderError::UnsupportedDurabilityBackend(error.to_string());
 
@@ -713,6 +729,7 @@ pub(super) struct ClientExtensions {
     #[cfg(feature = "plugins")]
     pub(super) plugin_host: Option<Arc<PluginHost>>,
     pub(super) noise_cert_policy: NoiseCertPolicy,
+    pub(super) history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
 }
 
 impl ClientAssembly {
@@ -888,6 +905,17 @@ mod tests {
         spawns: Arc<AtomicUsize>,
     }
 
+    struct CountingHistorySyncAdmission {
+        decisions: Arc<AtomicUsize>,
+    }
+
+    impl HistorySyncAdmission for CountingHistorySyncAdmission {
+        fn decide(&self, _metadata: &crate::HistorySyncMetadata<'_>) -> crate::HistorySyncDecision {
+            self.decisions.fetch_add(1, Ordering::SeqCst);
+            crate::HistorySyncDecision::Accept
+        }
+    }
+
     #[async_trait::async_trait]
     impl Runtime for CountingRuntime {
         fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
@@ -922,6 +950,38 @@ mod tests {
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
+    }
+
+    #[tokio::test]
+    async fn durability_probes_round_trip_and_clean_up_without_deleting_other_rows() {
+        let backend: Arc<dyn crate::store::traits::Backend> =
+            Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        backend
+            .store_pending_inbound("0@s.whatsapp.net", "0@s.whatsapp.net", "existing", b"keep")
+            .await
+            .expect("seed unrelated row");
+
+        let (first, second) = futures::join!(
+            probe_durability_backend(&backend),
+            probe_durability_backend(&backend)
+        );
+        first.expect("first probe");
+        second.expect("second probe");
+        assert_eq!(
+            backend
+                .get_pending_inbound("0@s.whatsapp.net", "0@s.whatsapp.net", "existing")
+                .await
+                .expect("read unrelated row"),
+            Some(b"keep".to_vec())
+        );
+        assert_eq!(
+            backend
+                .delete_expired_pending_inbound(i64::MAX)
+                .await
+                .expect("count remaining rows"),
+            1,
+            "only the unrelated row should remain"
+        );
     }
 
     #[tokio::test]
@@ -1013,6 +1073,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_sync_admission_reaches_the_built_client() {
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let client = complete_builder()
+            .await
+            .with_history_sync_admission(CountingHistorySyncAdmission {
+                decisions: Arc::clone(&decisions),
+            })
+            .build()
+            .await
+            .expect("build")
+            .into_parts()
+            .0;
+
+        let admission = client
+            .history_sync_admission
+            .as_ref()
+            .expect("builder-installed history-sync admission");
+        assert_eq!(
+            admission.decide(&crate::HistorySyncMetadata {
+                sync_type: None,
+                chunk_order: None,
+                progress: None,
+                file_length: None,
+                inline_payload_len: None,
+                peer_data_request_session_id: None,
+            }),
+            crate::HistorySyncDecision::Accept
+        );
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn assembly_is_inert_until_started() {
         let persistence_manager = Arc::new(
             PersistenceManager::new(crate::test_utils::create_test_backend().await)
@@ -1036,7 +1128,9 @@ mod tests {
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
 
         let build = assembly.start();
-        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        // Two spawns: the LID-PN warm-up, and the startup retention sweep that
+        // reaps rows expired while the process was closed.
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
         build.into_client().signal_shutdown_sync();
     }
 
@@ -1266,7 +1360,9 @@ mod tests {
                 .is_some_and(|installed| Arc::ptr_eq(installed, &meter))
         );
         assert!(client.saver_handle.get().is_some());
-        assert_eq!(spawns.load(Ordering::SeqCst), 3);
+        // LID-PN warm-up, the startup retention sweep, and the background
+        // saver.
+        assert_eq!(spawns.load(Ordering::SeqCst), 4);
         client.signal_shutdown_sync();
     }
 

@@ -8,7 +8,7 @@ use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::call::{
-    CAPABILITY_INDEX_MLOW_V1, CapabilityBit, REJECT_REASON_BUSY,
+    CAPABILITY_INDEX_MLOW_V1, CapabilityBit, REJECT_REASON_BUSY, REJECT_REASON_ENC,
     TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
     VideoStateParams, build_call_video_ack, build_terminate, build_video_state, capability_bit,
@@ -520,9 +520,10 @@ impl StanzaHandler for CallHandler {
                             client.core.event_bus.dispatch(outcome);
                         }
                     }
-                    // A `busy` reject speaks for one device, and a group reject speaks for one
-                    // invited participant. Neither tears down the registered call; authoritative
-                    // timeout/terminate or the group roster owns the corresponding final state.
+                    // A per-device reject (`reject_is_device_busy`) speaks for one device, and a group
+                    // reject speaks for one invited participant. Neither tears down the registered
+                    // call; authoritative timeout/terminate or the group roster owns the
+                    // corresponding final state.
                     #[cfg(feature = "voip-runtime")]
                     if let CallAction::Terminate { .. } = &call.action
                         && let Some(generation) = group_transition_generation
@@ -861,6 +862,19 @@ impl StanzaHandler for CallHandler {
                             // A group participant's `<video>` state describes only that sender.
                             // The authoritative roster owns group media mode; never feed this into
                             // the 1:1 negotiation state machine or tear down the local plane.
+                            if dispatch_call {
+                                registry.send_call_event_if_current(
+                                    call_id,
+                                    generation,
+                                    CallEvent::PeerVideoStateChanged {
+                                        source: sender,
+                                        call_creator: call.action.call_creator().clone(),
+                                        state: *state,
+                                        orientation: *orientation,
+                                        upgrade_token: None,
+                                    },
+                                );
+                            }
                             drop(event_permit);
                             drop(_transition_guard);
                             if dispatch_call {
@@ -995,11 +1009,21 @@ impl StanzaHandler for CallHandler {
                                 );
                             }
                             let event_delivered = event_permit.as_ref().is_some_and(|permit| {
-                                permit.send(CallEvent::VideoStateChanged {
+                                let sourced = permit.send(CallEvent::PeerVideoStateChanged {
+                                    source: routed_call_sender(&call),
+                                    call_creator: call.action.call_creator().clone(),
                                     state: *state,
                                     orientation: *orientation,
                                     upgrade_token,
-                                })
+                                });
+                                // Keep the legacy event last so a custom single-slot queue retains
+                                // its previous behavior. Normal handles have room for both events.
+                                let legacy = permit.send(CallEvent::VideoStateChanged {
+                                    state: *state,
+                                    orientation: *orientation,
+                                    upgrade_token,
+                                });
+                                sourced && legacy
                             });
                             if !event_delivered {
                                 warn!("call: video state event receiver closed after typed ack");
@@ -1441,13 +1465,17 @@ async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow:
 /// Whether a `<reject>` says the DEVICE is unavailable rather than that the callee declined.
 ///
 /// `busy` is a per-device statement (already in a call, or a companion with no voice support); the
-/// callee's other devices go on ringing and may still answer. Any other reason - including none -
-/// is the callee's own decision and ends the call.
+/// callee's other devices go on ringing and may still answer. `enc` is the same shape: the device
+/// could not decrypt the offer (its registration changed device-side, observed with registration
+/// bytes on the reject), so it decided nothing for the callee either. Any other reason - including
+/// none - is the callee's own decision and ends the call.
 #[cfg(feature = "voip-runtime")]
 fn reject_is_device_busy(action: &CallAction) -> bool {
     matches!(
         action,
-        CallAction::Reject { reason, .. } if reason.as_deref() == Some(REJECT_REASON_BUSY)
+        CallAction::Reject { reason, .. }
+            if reason.as_deref() == Some(REJECT_REASON_BUSY)
+                || reason.as_deref() == Some(REJECT_REASON_ENC)
     )
 }
 
@@ -1455,7 +1483,7 @@ fn reject_is_device_busy(action: &CallAction) -> bool {
 async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     let reason = match &call.action {
         CallAction::Accept { .. } => TERMINATE_REASON_ACCEPTED_ELSEWHERE,
-        // A `busy` device has not decided anything for the callee, so its siblings must keep
+        // A `busy`/`enc` device has not decided anything for the callee, so its siblings must keep
         // ringing. Returning BEFORE take_dismiss_targets matters: that take is one-shot, and
         // consuming the rung set here would leave a later genuine accept with nothing to dismiss.
         CallAction::Reject { .. } if reject_is_device_busy(&call.action) => return,
@@ -1558,6 +1586,18 @@ mod tests {
 
     fn fake_caller_lid() -> Jid {
         Jid::new("111111111111111", Server::Lid)
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    fn next_legacy_event(
+        events: &async_channel::Receiver<CallEvent>,
+    ) -> Result<CallEvent, async_channel::TryRecvError> {
+        loop {
+            let event = events.try_recv()?;
+            if !matches!(event, CallEvent::PeerVideoStateChanged { .. }) {
+                return Ok(event);
+            }
+        }
     }
 
     fn offer_stanza() -> wacore_binary::Node {
@@ -1985,7 +2025,7 @@ mod tests {
         );
         let stanza = NodeBuilder::new("call")
             .attr("from", Jid::new("GROUP-CALL", Server::Call))
-            .attr("participant", participant_pn)
+            .attr("participant", participant_pn.clone())
             .attr("id", "PN-ORIENTATION")
             .attr("t", "1766847151")
             .children([NodeBuilder::new("video")
@@ -2015,8 +2055,13 @@ mod tests {
             "participant signaling must not tear down the local group video plane"
         );
         assert!(
+            matches!(event_rx.try_recv(), Ok(CallEvent::PeerVideoStateChanged {
+            source, call_creator, state: VideoState::Disabled, orientation: Some(3), upgrade_token: None,
+        }) if source == participant_pn && call_creator == fake_caller_lid())
+        );
+        assert!(
             event_rx.try_recv().is_err(),
-            "the 1:1 video event lacks participant identity and must stay unused for group peers"
+            "groups must not emit the call-wide legacy event"
         );
         let controls = std::iter::from_fn(|| control_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(
@@ -2055,6 +2100,12 @@ mod tests {
                 .await
         );
         let device_controls = std::iter::from_fn(|| control_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            matches!(event_rx.try_recv(), Ok(CallEvent::PeerVideoStateChanged {
+            source, state: VideoState::Disabled, orientation: Some(1), upgrade_token: None, ..
+        }) if source == routed_device)
+        );
+        assert!(event_rx.try_recv().is_err());
         assert!(
             device_controls.iter().any(|control| matches!(
                 control,
@@ -3331,7 +3382,7 @@ mod tests {
             fake_caller_lid(),
             fake_caller_lid(),
         ));
-        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
+        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(2);
         let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
@@ -3363,6 +3414,12 @@ mod tests {
         };
         assert!(handled);
         assert!(cancelled);
+        assert!(
+            matches!(event_rx.try_recv(), Ok(CallEvent::PeerVideoStateChanged {
+            source, call_creator, state: VideoState::UpgradeRequestV2,
+            upgrade_token: Some(_), ..
+        }) if source == fake_caller_lid() && call_creator == fake_caller_lid())
+        );
         assert!(matches!(
             event_rx.try_recv(),
             Ok(CallEvent::VideoStateChanged { .. })
@@ -3401,7 +3458,7 @@ mod tests {
                 )
                 .await
         );
-        let token = match event_rx.try_recv().expect("upgrade request event") {
+        let token = match next_legacy_event(&event_rx).expect("upgrade request event") {
             CallEvent::VideoStateChanged {
                 state: VideoState::UpgradeRequestV2,
                 upgrade_token: Some(token),
@@ -3423,7 +3480,7 @@ mod tests {
         );
         assert!(!registry.peer_video_request_is_current("CALL-ID-0001", token));
         assert!(matches!(
-            event_rx.try_recv(),
+            next_legacy_event(&event_rx),
             Ok(CallEvent::VideoStateChanged {
                 state: VideoState::Disabled,
                 upgrade_token: None,
@@ -3650,7 +3707,7 @@ mod tests {
                 .await
         );
 
-        let ev = ev_rx.try_recv().expect("event must be forwarded");
+        let ev = next_legacy_event(&ev_rx).expect("event must be forwarded");
         assert!(matches!(
             ev,
             CallEvent::VideoStateChanged {
@@ -4250,6 +4307,59 @@ mod tests {
                 .take_dismiss_targets("CALL-ID-0001")
                 .is_some(),
             "the one-shot rung set must survive a busy reject, or a later genuine accept has \
+             nothing to dismiss and the sibling rings until the call times out"
+        );
+    }
+
+    // Per-device reject (see `reject_is_device_busy`): keeps the call and rung set.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn enc_reject_keeps_the_call_and_the_rung_set() {
+        let client = make_client().await;
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let (stale_device, other) = (peer.with_device(75), peer.with_device(2));
+
+        let mut session =
+            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        session.ring_devices = vec![stale_device.clone(), other.clone()];
+        client.call_registry().insert(session);
+
+        let reject = NodeBuilder::new("call")
+            .attr("from", stale_device.clone())
+            .attr("id", "STANZA-ENC")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", creator.clone())
+                .attr("call-id", "CALL-ID-0001")
+                .attr("count", "0")
+                .attr("reason", "enc")
+                .children([NodeBuilder::new("registration")
+                    .bytes(0x12345678u32.to_be_bytes().to_vec())
+                    .build()])
+                .build()])
+            .build();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&reject), &mut cancelled)
+                .await
+        );
+
+        assert!(
+            client
+                .call_registry()
+                .generation_of("CALL-ID-0001")
+                .is_some(),
+            "a device that failed to decrypt must not end the call for the others"
+        );
+        assert!(
+            client
+                .call_registry()
+                .take_dismiss_targets("CALL-ID-0001")
+                .is_some(),
+            "the one-shot rung set must survive an enc reject, or a later genuine accept has \
              nothing to dismiss and the sibling rings until the call times out"
         );
     }

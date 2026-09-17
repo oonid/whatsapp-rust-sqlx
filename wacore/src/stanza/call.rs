@@ -394,9 +394,9 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             }
         }
         CallActionTag::Reject => {
-            // `reason` distinguishes a device that CANNOT take the call (`busy`) from the callee
-            // actually declining; dropping it made both look identical and ended calls the peer's
-            // other devices were still answering.
+            // `reason` distinguishes a device that CANNOT take the call (`busy`, `enc`) from the
+            // callee actually declining; dropping it made both look identical and ended calls the
+            // peer's other devices were still answering.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
             CallAction::Reject {
@@ -493,10 +493,13 @@ pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13]
 pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07];
 /// Legacy offer order observed on WhatsApp Web.
 pub const DEFAULT_AUDIO_RATES: &[&str] = &["8000", "16000"];
-/// Capability blob a client places in a VIDEO `<offer>`: byte 5 is `0xfa` (video) vs the audio
-/// `0xbb`. Observed in a real from-start video offer. A video CALLEE preaccepts with [`CAPABILITY_OFFER`]
-/// (`0xbb`), not this.
-pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
+/// Capability blob a client places in a VIDEO `<offer>`, byte-matching the captured J engine driven
+/// with the video flag set (`JgwtTQVeWPm.wasm`, `video_offer_matches_the_vendor_engine`). The `0xfa`
+/// byte 5 seen in one early capture belongs to another platform's offer and must not be sent here:
+/// against Android it left callees answering a call whose video never rendered, while every flow
+/// that renders — our own video preaccepts, audio offers, and the engine's audio and video offers —
+/// stays in the `0xbb` family. A video CALLEE preaccepts with [`CAPABILITY_OFFER`], not this.
+pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x53];
 
 /// Capability index for `use_mlow_codec_v1`.
 ///
@@ -653,6 +656,9 @@ pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
 /// companion that does not do voice at all. It is a statement about ONE DEVICE, not the callee's
 /// decision: the peer's remaining devices go on ringing and may still answer.
 pub const REJECT_REASON_BUSY: &str = "busy";
+
+/// Like `busy`, but the device could not decrypt the offer (stale registration). Per-device.
+pub const REJECT_REASON_ENC: &str = "enc";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.
 pub fn encode_latency(rtt_ms: u32) -> String {
@@ -842,10 +848,15 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
 /// is where one is set and what carries it from there.
 const INITIAL_DEVICE_ORIENTATION: &str = "0";
 
-/// Default initiator-side geometry used by the WaCalls reference.
-const VIDEO_SCREEN_WIDTH: &str = "1920";
-const VIDEO_SCREEN_HEIGHT: &str = "1080";
-
+/// A 1:1 video offer carries no geometry: the captured J engine
+/// (`JgwtTQVeWPm.wasm`, SHA-256
+/// `97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db`,
+/// driven via `startVoipCall` with the video flag set) emits
+/// `screen_width="0" screen_height="0"`, and the captured JS never patches
+/// those attributes before the wire. The `1920x1080` we used to send is the
+/// group-call shape (`group_call.rs` keeps it); on a 1:1 offer it left the
+/// callee answering while never rendering our stream.
+///
 /// The codec names a `<video>` advertisement carries. The two attributes use
 /// *different* spellings of the same codec, which is not a typo on either side.
 ///
@@ -879,8 +890,8 @@ fn video_offer_node() -> Node {
     NodeBuilder::new("video")
         .attr("enc", VIDEO_ENC_H264)
         .attr("dec", VIDEO_DEC_H264)
-        .attr("screen_width", VIDEO_SCREEN_WIDTH)
-        .attr("screen_height", VIDEO_SCREEN_HEIGHT)
+        .attr("screen_width", "0")
+        .attr("screen_height", "0")
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
@@ -927,7 +938,7 @@ fn capability_node(blob: &[u8]) -> Node {
 
 /// `<preaccept>`: audio → \[video\] → encopt → capability. `id` is the random call-wrapper id. A video
 /// callee advertises the `<video>` decoder here; the default capability stays the `0xbb`
-/// [`CAPABILITY_OFFER`] blob (the `0xfa` variant is the caller's offer).
+/// [`CAPABILITY_OFFER`] blob (a video offer carries [`CAPABILITY_VIDEO_OFFER`]).
 pub fn build_preaccept(
     call_id: &str,
     to: &Jid,
@@ -1994,6 +2005,33 @@ mod tests {
         }
     }
 
+    /// A `<reject>` from a device that could not decrypt the offer carries `reason="enc"`. The
+    /// pinned whatspec IR models `reason` as an opaque string (`WAWebHandleVoipCall` dispatcher,
+    /// `WAWebHandleVoipCallReceipt` parser; no reject-reason wire enum in the catalog), so the
+    /// parser must preserve it verbatim for the handler's per-device dispatch.
+    #[test]
+    fn reject_preserves_an_enc_reason() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .attr("count", "0")
+                .attr("reason", "enc")
+                .children([NodeBuilder::new("registration")
+                    .bytes(0x12345678u32.to_be_bytes().to_vec())
+                    .build()])
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some(REJECT_REASON_ENC));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
     /// The failure case for the above: an explicit decline carries no `reason`, and must not be
     /// confused with a busy device.
     #[test]
@@ -2569,7 +2607,7 @@ mod tests {
             video.attrs().optional_string("screen_width").as_deref(),
             Some("0")
         );
-        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the 0xfa offer blob.
+        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the video offer blob.
         let cap = action.get_optional_child("capability").unwrap();
         assert_eq!(cap.content_bytes().unwrap(), &CAPABILITY_OFFER);
 
@@ -3090,6 +3128,14 @@ mod tests {
         );
         assert_eq!(
             ovr.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("screen_width").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("screen_height").as_deref(),
             Some("0")
         );
 

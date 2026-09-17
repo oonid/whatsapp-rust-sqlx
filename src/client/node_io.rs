@@ -101,6 +101,21 @@ fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| jid.is_status_broadcast())
 }
 
+fn group_repair_time_left(
+    ack_at: wacore::time::Instant,
+    now: wacore::time::Instant,
+    minutes: i64,
+) -> Duration {
+    let duration = Duration::from_secs(
+        u64::try_from(minutes)
+            .ok()
+            .filter(|minutes| *minutes > 0)
+            .unwrap_or(5)
+            .saturating_mul(60),
+    );
+    (ack_at + duration).saturating_duration_since(now)
+}
+
 impl Client {
     /// Read the current semaphore generation and Arc atomically under the mutex.
     pub(crate) fn read_message_semaphore(&self) -> (u64, Arc<async_lock::Semaphore>) {
@@ -613,7 +628,7 @@ impl Client {
                     subsystem::on_response(self, nr);
                     sink(StreamedResponse::Node(&node));
                 }
-                ResponseWaiter::Phash(_) => {
+                ResponseWaiter::Phash(_) | ResponseWaiter::GroupPhash(_, _) => {
                     warn!(target: "Client/IQ", "IQ id collided with a pending phash waiter; dropping the phash check");
                 }
             }
@@ -1312,7 +1327,9 @@ impl Client {
                 debug!("Skipping active IQ: connection closed");
                 return;
             }
-            if let Err(e) = client_clone.set_passive(false).await
+            // Release the IQ future before the offline drain instead of retaining
+            // its tracing-expanded storage in this task for the whole backlog.
+            if let Err(e) = Box::pin(client_clone.set_passive(false)).await
                 && !client_clone.is_shutting_down()
             {
                 warn!("Failed to send post-connect active IQ: {e:?}");
@@ -1724,7 +1741,10 @@ impl Client {
                     Self::warn_ack_waiter_dropped(&rejected);
                 }
             }
-            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
+            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter, None),
+            ResponseWaiter::GroupPhash(waiter, devices) => {
+                self.check_phash_against_ack(node.get(), waiter, Some(devices))
+            }
             ResponseWaiter::Stream(_) => Self::warn_ack_for_stream_waiter(),
         }
         true
@@ -1748,7 +1768,10 @@ impl Client {
                     Self::warn_ack_waiter_dropped(&rejected);
                 }
             }
-            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
+            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter, None),
+            ResponseWaiter::GroupPhash(waiter, devices) => {
+                self.check_phash_against_ack(node.get(), waiter, Some(devices))
+            }
             ResponseWaiter::Stream(_) => Self::warn_ack_for_stream_waiter(),
         }
         true
@@ -1799,6 +1822,7 @@ impl Client {
         self: &Arc<Self>,
         node: &wacore_binary::NodeRef<'_>,
         waiter: PhashWaiter,
+        group_devices: Option<crate::send::group_repair::GroupSendSnapshot>,
     ) {
         let Some(server) = node.get_attr("phash") else {
             return;
@@ -1806,34 +1830,93 @@ impl Client {
         if server.as_str() == waiter.expected {
             return;
         }
+        let generation = group_devices.as_ref().map_or_else(
+            || self.connection_generation.load(Ordering::Acquire),
+            |sent| sent.connection_generation,
+        );
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let ack_at = wacore::time::Instant::now();
         let client = Arc::clone(self);
         let server = server.as_str().to_string();
         // Read off the ack rather than stored on the waiter: the id is only
         // needed on this path, and a copy per send is a copy per send.
-        let message_id = waiter
-            .dm_devices
-            .is_some()
+        let message_id = (waiter.dm_devices.is_some() || group_devices.is_some())
             .then(|| node.get_attr("id").map(|id| id.as_str().to_string()))
             .flatten();
         let unreached = waiter.dm_unreached;
+        let shutdown = self.connection_shutdown_signal();
+        let group_abort = group_devices.as_ref().and(message_id.as_deref()).map(|id| {
+            self.pending_group_device_resync
+                .start_message(generation, &waiter.jid, id)
+        });
         self.runtime.spawn_detached(Box::pin(async move {
-            let resend = match (message_id.as_deref(), waiter.dm_devices) {
-                (Some(message_id), Some(addressed)) => Some(crate::send::DmDeltaResend {
-                    message_id,
-                    addressed,
-                    unreached,
-                }),
-                _ => None,
+            let (group_abort, group_handle) = match group_abort {
+                Some((abort, handle)) => (Some(abort), Some(handle)),
+                None => (None, None),
             };
-            client
-                .handle_phash_mismatch(
-                    &waiter.jid,
-                    &waiter.expected,
-                    &server,
-                    waiter.invalidate_group_cache,
-                    resend,
-                )
-                .await;
+            let _release = scopeguard::guard((), |()| {
+                if let (Some(handle), Some(id)) = (group_handle.as_ref(), message_id.as_deref()) {
+                    client.pending_group_device_resync.finish_message(
+                        generation,
+                        &waiter.jid,
+                        id,
+                        handle,
+                    );
+                }
+            });
+            let work = async {
+                if client.connection_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                if let (Some(devices), Some(id)) = (group_devices, message_id.as_deref()) {
+                    let minutes = client
+                        .ab_props
+                        .get_int(wacore::iq::abprops::web::WEB_E2E_BACKFILL_EXPIRE_TIME)
+                        .await;
+                    let remaining =
+                        group_repair_time_left(ack_at, wacore::time::Instant::now(), minutes);
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    let timeout = client.runtime.sleep(remaining);
+                    let repair = client.repair_group_message(&waiter.jid, id, devices, generation);
+                    futures::pin_mut!(repair, timeout);
+                    if let futures::future::Either::Left((Err(error), _)) =
+                        futures::future::select(repair, timeout).await
+                    {
+                        warn!("Group phash repair failed: {error}");
+                    }
+                    return;
+                }
+                let resend = match (message_id.as_deref(), waiter.dm_devices) {
+                    (Some(message_id), Some(addressed)) => Some(crate::send::DmDeltaResend {
+                        message_id,
+                        addressed,
+                        unreached,
+                    }),
+                    _ => None,
+                };
+                client
+                    .handle_phash_mismatch(
+                        &waiter.jid,
+                        &waiter.expected,
+                        &server,
+                        waiter.invalidate_group_cache,
+                        resend,
+                    )
+                    .await;
+            };
+            futures::pin_mut!(work);
+            let cancelled = wacore::runtime::wait_for_shutdown(&shutdown);
+            futures::pin_mut!(cancelled);
+            let scoped = futures::future::select(cancelled, work);
+            if let Some(abort) = group_abort {
+                let _ = futures::future::Abortable::new(scoped, abort).await;
+            } else {
+                let _ = scoped.await;
+            }
         }));
     }
 
@@ -2246,6 +2329,58 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn group_repair_deadline_includes_task_and_property_delay() {
+        let ack = wacore::time::Instant::ZERO;
+        assert_eq!(
+            group_repair_time_left(ack, ack + Duration::from_secs(299), 5),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            group_repair_time_left(ack, ack + Duration::from_secs(300), 5),
+            Duration::ZERO
+        );
+        assert_eq!(
+            group_repair_time_left(ack, ack + Duration::from_secs(301), 5),
+            Duration::ZERO
+        );
+        assert_eq!(
+            group_repair_time_left(ack, ack + Duration::from_secs(299), 0),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn group_ack_removed_before_reconnect_cannot_start_new_connection_repair() {
+        let client = crate::test_utils::create_test_client().await;
+        let group = "120363000000000001@g.us".parse().unwrap();
+        let waiter = PhashWaiter {
+            expected: "2:old".into(),
+            jid: group,
+            invalidate_group_cache: true,
+            dm_devices: None,
+            dm_unreached: Vec::new(),
+            registered_epoch: 0,
+        };
+        let sent = crate::send::group_repair::GroupSendSnapshot {
+            connection_generation: 1,
+            identity: crate::send::group_repair::GroupIdentitySnapshot::capture(&client),
+            devices: Arc::new(wacore::send::ResolvedGroupDevices::new(Vec::new())),
+            message_secret: None,
+            addressing_mode: wacore::types::message::AddressingMode::Pn,
+        };
+        client.connection_generation.store(2, Ordering::Release);
+        let ack = NodeBuilder::new("ack")
+            .attr("id", "OLDGROUPACK")
+            .attr("phash", "2:new")
+            .build();
+        client.check_phash_against_ack(&ack.as_node_ref(), waiter, Some(sent));
+        assert_eq!(
+            client.pending_group_device_resync.retained_message_count(),
+            0
+        );
+        assert_eq!(client.pending_group_device_resync.len(), 0);
+    }
     use super::*;
     use crate::runtime_impl::TokioRuntime;
     use crate::store::persistence_manager::PersistenceManager;
@@ -2256,7 +2391,7 @@ mod tests {
     use std::time::Duration;
     use wacore::runtime::{AbortHandle, Runtime};
 
-    /// Records the concrete size of every future handed to the runtime.
+    /// Records the concrete size of every spawned future without polling it.
     ///
     /// `size_of_val` on the unsized `dyn Future` behind the `Pin<Box<_>>` reads
     /// the vtable, so what it reports is exactly the coroutine layout the boxing
@@ -2273,7 +2408,8 @@ mod tests {
                 .lock()
                 .expect("sizes mutex")
                 .push(size_of_val(&*future));
-            self.inner.spawn(future)
+            drop(future);
+            AbortHandle::noop()
         }
 
         fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
@@ -2281,7 +2417,7 @@ mod tests {
                 .lock()
                 .expect("sizes mutex")
                 .push(size_of_val(&*future));
-            self.inner.spawn_detached(future);
+            drop(future);
         }
 
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -2303,10 +2439,10 @@ mod tests {
     /// The post-login task is spawned on every connection and stays parked in
     /// `wait_for_offline_delivery_end` for the whole offline drain, so its
     /// future is resident for minutes on a client with a backlog. Inlining the
-    /// fresh-pairing arm — a branch that runs once per device lifetime — put the
-    /// union of its locals in there and made it 8,224 B; boxing the arm brought
-    /// it to ~1.2 KB. This pins the shape, not the exact number: a future above
-    /// the bound means an arm has been inlined back in.
+    /// fresh-pairing arm made it 8,224 B. The active IQ also needs a box when
+    /// tracing expands its future. Neither belongs in the drain's resident
+    /// storage. This bounds the spawned task, not the temporary boxed work.
+    /// Budget: rebaseline per [layout asserts](../../agent_docs/layout_asserts.md).
     #[tokio::test]
     async fn the_post_login_task_does_not_carry_the_fresh_pairing_arm() {
         const MAX_POST_LOGIN_FUTURE_BYTES: usize = 2048;
@@ -2342,6 +2478,7 @@ mod tests {
             "<success> must spawn the post-login task"
         );
         let largest = spawned.iter().copied().max().unwrap_or(0);
+        eprintln!("post-login spawned={spawned:?}");
         assert!(
             largest < MAX_POST_LOGIN_FUTURE_BYTES,
             "post-login future grew to {largest} B (spawned: {spawned:?}); \

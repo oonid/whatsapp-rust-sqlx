@@ -944,6 +944,7 @@ impl Client {
 
         let chat_key = chat.to_string();
         let distribution_guard = self.group_distribution_lock(&chat).await;
+        let topology_generation = self.device_topology.current();
         let group_info = wacore::client::context::GroupInfo::new(
             Vec::new(),
             wacore::types::message::AddressingMode::Lid,
@@ -999,8 +1000,13 @@ impl Client {
             }
         };
         self.send_retry_stanza(prepared.node).await?;
-        self.update_sender_key_devices(&chat_key, &prepared.skdm_devices)
-            .await;
+        self.update_sender_key_devices(
+            &chat_key,
+            &prepared.skdm_devices,
+            topology_generation,
+            Some(&group_info),
+        )
+        .await;
         drop(distribution_guard);
         for user in &prepared.stale_device_users {
             self.invalidate_device_cache(user).await;
@@ -4615,6 +4621,7 @@ mod tests {
         assert!(client.jids_share_user_identity(&lid, &pn).await.unwrap());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn public_retransmission_recaches_the_supplied_message() {
         let mut config = crate::cache_config::CacheConfig::default();

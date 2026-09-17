@@ -3569,6 +3569,245 @@ async fn test_custom_cache_config_is_respected() {
 }
 
 #[tokio::test]
+async fn runtime_cache_config_propagates_nondefault_settings() {
+    use crate::cache_config::{CacheEntryConfig, CacheStores, MsgSecretPolicy, MsgSecretRetention};
+    use std::time::Duration;
+
+    struct StubStore;
+    #[async_trait::async_trait]
+    impl crate::cache_store::CacheStore for StubStore {
+        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StubResolver;
+    #[async_trait::async_trait]
+    impl crate::cache_config::OriginalMessageResolver for StubResolver {
+        async fn resolve_msg_secret(&self, _: &str, _: &str, _: &str) -> Option<[u8; 32]> {
+            Some([0xABu8; 32])
+        }
+    }
+
+    let store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let resolver: Arc<dyn crate::cache_config::OriginalMessageResolver> = Arc::new(StubResolver);
+    let config = CacheConfig {
+        group_cache: CacheEntryConfig::new(Some(Duration::from_secs(60)), 10),
+        recent_messages: CacheEntryConfig::new(Some(Duration::from_secs(300)), 64),
+        sent_message_ttl_secs: 60,
+        msg_secret_policy: MsgSecretPolicy::Full,
+        msg_secret_retention: MsgSecretRetention {
+            text: Duration::from_secs(7 * 86_400),
+            poll_event: Duration::from_secs(7 * 86_400),
+            bot: Duration::from_secs(7 * 86_400),
+        },
+        seed_msg_secrets_from_history: false,
+        original_message_resolver: Some(Arc::clone(&resolver)),
+        msg_secret_resolver_timeout: Duration::from_secs(1),
+        cache_stores: CacheStores {
+            group_cache: Some(Arc::clone(&store)),
+            ..Default::default()
+        },
+        ..CacheConfig::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "runtime_config_propagates",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    assert_eq!(client.cache_config.group_cache.capacity, 10);
+    assert_eq!(
+        client.cache_config.group_cache.timeout,
+        Some(Duration::from_secs(60))
+    );
+    assert!(
+        client.cache_config.group_cache_store.is_some(),
+        "custom group-cache store must be retained for lazy init"
+    );
+    assert!(client.cache_config.recent_messages_enabled);
+    assert_eq!(client.cache_config.sent_message_ttl_secs, 60);
+    assert_eq!(client.cache_config.msg_secret_policy, MsgSecretPolicy::Full);
+    assert_eq!(
+        client.cache_config.msg_secret_retention.text,
+        Duration::from_secs(7 * 86_400)
+    );
+    assert!(!client.cache_config.seed_msg_secrets_from_history);
+    assert!(client.cache_config.original_message_resolver.is_some());
+    assert_eq!(
+        client.cache_config.msg_secret_resolver_timeout,
+        Duration::from_secs(1)
+    );
+    // Lazy init must reuse the retained store, not build a local cache.
+    let _ = client.get_group_cache();
+    assert!(client.group_cache.get().is_some());
+}
+
+#[tokio::test]
+async fn runtime_cache_config_honors_disabled_recent_cache() {
+    let client = crate::test_utils::create_test_client_with_config(
+        "runtime_config_recent_disabled",
+        Arc::new(MockHttpClient),
+        CacheConfig::default(),
+    )
+    .await;
+    assert!(
+        !client.cache_config.recent_messages_enabled,
+        "default capacity 0 must surface as disabled"
+    );
+    let chat: Jid = "120363000000000099@g.us".parse().unwrap();
+    assert!(
+        client.peek_recent_message(&chat, "MISSING").await.is_none(),
+        "disabled L1 must fall through to the DB miss path"
+    );
+}
+
+/// PR #1482 replaced the per-client `cache_config: CacheConfig` field with
+/// the runtime-retained `RuntimeCacheConfig` (456 B down to 136 B on the
+/// structs). A struct-level delta alone does not prove the per-client saving,
+/// since neighbor-field padding could absorb part of it. The current fixed
+/// client layout is 4312 B before feature-sized fields. The history-sync
+/// admission policy is an immutable optional `Arc`, so it avoids the
+/// synchronization-cell cost of the former `OnceLock` field.
+///
+/// Rebaseline: the failure message prints the current size; set the base just
+/// above it. Test cfg only: `#[cfg(test)]` fields shift the number versus a
+/// production build. General procedure:
+/// [layout asserts](../../agent_docs/layout_asserts.md).
+#[test]
+fn client_size_pins_runtime_cache_config_saving() {
+    use std::mem::size_of;
+
+    // Measured fixed part of `size_of::<Client>()` at the head of the #1482
+    // follow-ups, default features, no subsystem attached. Every
+    // size-varying attachment is measured in this same build and stacked on
+    // top, so no feature combination false-fails: only an unaccounted layout
+    // move trips the assert.
+    let mut expected = 4312 + size_of::<subsystem::Subsystems>();
+    if cfg!(feature = "client-lifecycle") {
+        expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
+    }
+    if cfg!(feature = "plugins") {
+        expected += size_of::<Option<Arc<()>>>();
+    }
+    assert_eq!(
+        size_of::<Client>(),
+        expected,
+        "Client layout moved; if a field was added or removed on purpose, \
+         re-measure with `cargo test -p whatsapp-rust --lib \
+         client_size_pins_runtime_cache_config_saving` under default, \
+         `--features client-lifecycle,plugins`, and the CI feature set, \
+         then update the base",
+    );
+}
+
+#[tokio::test]
+async fn non_group_cache_stores_are_owned_by_live_caches_only() {
+    use crate::cache_config::CacheStores;
+    use std::time::Duration;
+
+    struct StubStore;
+    #[async_trait::async_trait]
+    impl crate::cache_store::CacheStore for StubStore {
+        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let lid_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let registry_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let group_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let config = CacheConfig {
+        cache_stores: CacheStores {
+            group_cache: Some(Arc::clone(&group_store)),
+            device_registry_cache: Some(Arc::clone(&registry_store)),
+            lid_pn_cache: Some(Arc::clone(&lid_store)),
+        },
+        ..CacheConfig::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "non_group_store_lifetime",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    // Device-registry store: same allocation, held once by the test plus once
+    // by the live cache.
+    let retained_registry = client
+        .device_registry_cache
+        .custom_store_for_tests()
+        .expect("device-registry cache must retain its custom store");
+    assert!(
+        Arc::ptr_eq(&registry_store, &retained_registry),
+        "device-registry cache must reuse the configured store allocation"
+    );
+    drop(retained_registry);
+    assert_eq!(
+        Arc::strong_count(&registry_store),
+        2,
+        "device-registry store must be owned by the test handle plus the live cache only"
+    );
+
+    // LID-PN store: same allocation in both direction maps, held once by the
+    // test plus twice by the cache.
+    let retained_lid = client.lid_pn_cache.custom_stores_for_tests();
+    assert_eq!(
+        retained_lid.len(),
+        2,
+        "LID-PN cache must back both direction maps with the custom store"
+    );
+    for store in &retained_lid {
+        assert!(
+            Arc::ptr_eq(&lid_store, store),
+            "LID-PN cache must reuse the configured store allocation"
+        );
+    }
+    drop(retained_lid);
+    assert_eq!(
+        Arc::strong_count(&lid_store),
+        3,
+        "LID-PN store must be owned by the test handle plus the two live direction maps only"
+    );
+
+    // Control: the group store stays pinned by the runtime config for lazy init.
+    let retained_group = client
+        .cache_config
+        .group_cache_store
+        .clone()
+        .expect("group-cache store must be retained for lazy init");
+    assert!(
+        Arc::ptr_eq(&group_store, &retained_group),
+        "group cache must reuse the configured store allocation"
+    );
+    drop(retained_group);
+    assert_eq!(
+        Arc::strong_count(&group_store),
+        2,
+        "group store must be owned by the test handle plus the runtime config only"
+    );
+}
+
+#[tokio::test]
 async fn held_group_distribution_lane_survives_capacity_pressure() {
     let config = CacheConfig {
         group_distribution_locks_capacity: 1,
@@ -5253,19 +5492,169 @@ async fn cache_maintenance_sweeps_expired_entries() {
     .await;
 
     let chat: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
-    let key =
-        wacore::types::message::SenderMessageId::new(chat.clone(), "3EB0EXPIRING".into(), chat);
-    client.dispatched_messages.insert(key, ()).await;
+    let info = Arc::new(crate::types::message::MessageInfo {
+        id: "3EB0EXPIRING".into(),
+        source: crate::types::message::MessageSource {
+            chat: chat.clone(),
+            sender: chat,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .mark_message_dispatched(&info, &wa::Message::default())
+        .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(
-        client.dispatched_messages.entry_count_async().await,
+        client.dispatched_messages.entry_count(),
         1,
         "a quiet cache keeps its expired entry until swept"
     );
 
     client.run_cache_maintenance().await;
-    assert_eq!(client.dispatched_messages.entry_count_async().await, 0);
+    assert_eq!(client.dispatched_messages.entry_count(), 0);
     assert_eq!(client.memory_report().await.dispatched_messages, 0);
+}
+
+/// Startup reaps what expired while the process was closed, without waiting for
+/// a connection to reach the keepalive tick. `expires_at = 0` (never) and
+/// future deadlines must survive.
+#[tokio::test]
+async fn startup_maintenance_sweeps_expired_secrets_without_a_connection() {
+    use wacore::store::traits::MsgSecretEntry;
+
+    let now = wacore::time::now_secs();
+    let backend = crate::test_utils::create_test_backend().await;
+    backend
+        .put_msg_secrets(vec![
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_NEVER".into(),
+                secret: [1u8; 32],
+                expires_at: 0,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_FUTURE".into(),
+                secret: [2u8; 32],
+                expires_at: now + 86_400,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_EXPIRED".into(),
+                secret: [3u8; 32],
+                expires_at: now - 86_400,
+                message_ts: 0,
+            },
+        ])
+        .await
+        .expect("seed secrets");
+
+    let client = crate::test_utils::create_test_client_with_backend(Arc::clone(&backend)).await;
+    // Construction spawns the sweep detached; run the startup body directly so
+    // the test is deterministic instead of racing a task.
+    client.run_startup_retention_cleanup().await;
+
+    let present = |id: &'static str| {
+        let backend = Arc::clone(&backend);
+        async move {
+            backend
+                .get_msg_secret(
+                    "19045550180@s.whatsapp.net",
+                    "19045550180@s.whatsapp.net",
+                    id,
+                )
+                .await
+                .expect("lookup")
+                .is_some()
+        }
+    };
+    assert!(
+        present("STARTUP_NEVER").await,
+        "expires_at = 0 must survive"
+    );
+    assert!(
+        present("STARTUP_FUTURE").await,
+        "a future deadline must survive"
+    );
+    assert!(
+        !present("STARTUP_EXPIRED").await,
+        "the startup pass must reap a passed deadline"
+    );
+}
+
+/// The startup pass must not touch the pending-inbound durability buffer: a
+/// message whose hook has not committed is still replayable, and deleting its
+/// buffered copy before the server redelivers it turns the redelivery into an
+/// acked duplicate that never reaches the hook.
+#[tokio::test]
+async fn startup_maintenance_leaves_the_pending_inbound_buffer_alone() {
+    use crate::store::SqliteStore;
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let db_name = format!(
+        "file:startup_pending_{}_{}?mode=memory&cache=shared",
+        std::process::id(),
+        unique_id
+    );
+    let sqlite = SqliteStore::new(&db_name)
+        .await
+        .expect("backend initializes");
+    let shared = sqlite.shared();
+    let store: Arc<dyn crate::store::traits::Backend> = Arc::new(sqlite);
+    let chat = "19045550180@s.whatsapp.net";
+    store
+        .store_pending_inbound(chat, chat, "STARTUP_PENDING", b"plaintext")
+        .await
+        .expect("seed pending inbound");
+
+    // Age the row past the 7-day pending-inbound TTL so a full sweep would
+    // delete it. The backend trait has no UPDATE, so this goes through the
+    // store's own query handle.
+    shared
+        .run(|conn| {
+            use diesel::RunQueryDsl;
+            diesel::sql_query(
+                "UPDATE pending_inbound_messages SET inserted_at = 0 WHERE id = 'STARTUP_PENDING';",
+            )
+            .execute(conn)
+            .map_err(|e| crate::store::error::StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .expect("age the row");
+
+    let client = crate::test_utils::create_test_client_with_backend(Arc::clone(&store)).await;
+    client.run_startup_retention_cleanup().await;
+
+    assert!(
+        store
+            .get_pending_inbound(chat, chat, "STARTUP_PENDING")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the startup pass must preserve a buffered message awaiting redelivery"
+    );
+
+    // The control: the full sweep does prune it, so the assertion above is
+    // about the scope, not about a row that could never be deleted.
+    client.run_retention_cleanup(7200).await;
+    assert!(
+        store
+            .get_pending_inbound(chat, chat, "STARTUP_PENDING")
+            .await
+            .expect("lookup")
+            .is_none(),
+        "the keepalive sweep must still prune an expired pending-inbound row"
+    );
 }
 
 #[tokio::test]

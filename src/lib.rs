@@ -235,6 +235,9 @@ pub use client::{
     SignalMaintenanceError,
 };
 pub use types::durability_hook::InboundDurabilityHook;
+pub use types::history_sync_admission::{
+    HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
+};
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
 pub mod error;
@@ -319,20 +322,21 @@ pub use features::{
     EventCreationParams, EventResponseType, Events, GroupAppealStatus, GroupCreateOptions,
     GroupDescription, GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter,
     GroupMetadata, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo, ImporterAddress,
-    InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
-    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
-    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
-    MessageEditError, MessageRetransmission, Mex, MexError, MexErrorExtensions, MexFatalError,
-    MexGraphQLError, MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter,
-    NewsletterAdminInfo, NewsletterAdminProfile, NewsletterError, NewsletterFollower,
-    NewsletterMessage, NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount,
-    NewsletterRole, NewsletterState, NewsletterVerification, Order, OrderPriceDetails,
-    OrderProduct, OwnUsername, ParticipantChangeResponse, ParticipantType, PictureType, PollError,
-    PollOptionResult, PollVoteCiphertext, Polls, Presence, PresenceError, PresencePolicy,
-    PresenceStatus, PreviousDescription, Price, Product, ProductAvailability, ProductImage,
-    ProductVideo, Profile, ProfileError, ProfilePicture, QuickReplies, ReachoutTimelock,
-    ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
+    GroupPictureEntry, GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, GroupType,
+    Groups, GrowthLockInfo, ImporterAddress, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult,
+    Labels, LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadError,
+    MediaReuploadRequest, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
+    MembershipApprovalMode, MembershipRequest, MessageEditError, MessageRetransmission, Mex,
+    MexError, MexErrorExtensions, MexFatalError, MexGraphQLError, MexRequest, MexResponse,
+    NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo, NewsletterAdminProfile,
+    NewsletterError, NewsletterFollower, NewsletterMessage, NewsletterMessageType,
+    NewsletterMetadata, NewsletterReactionCount, NewsletterRole, NewsletterState,
+    NewsletterVerification, Order, OrderPriceDetails, OrderProduct, OwnUsername,
+    ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
+    PollVoteCiphertext, Polls, Presence, PresenceError, PresencePolicy, PresenceStatus,
+    PreviousDescription, Price, Product, ProductAvailability, ProductImage, ProductVideo, Profile,
+    ProfileError, ProfilePicture, ProfilePictureLookup, ProfilePictureLookupOptions, QuickReplies,
+    ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
     RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
     SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
     StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
@@ -382,7 +386,7 @@ pub mod prelude {
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
     #[cfg(feature = "sqlite-storage")]
-    pub use crate::store::SqliteStore;
+    pub use crate::store::{SqliteStore, StoredDeviceSummary};
     pub use crate::types::events::{
         BatchOrigin, ChannelEventHandler, ChannelEventStats, Event, EventHandler, EventInterest,
         EventKind, InboundMessage, MessageBatch, Subscription,
@@ -407,6 +411,10 @@ pub mod bench_support;
 
 #[cfg(test)]
 pub mod test_utils;
+
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub mod test_support;
 
 #[cfg(test)]
 mod reexports_test;

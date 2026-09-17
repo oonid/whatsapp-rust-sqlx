@@ -785,6 +785,9 @@ fn unprotect_srtp_packet(
 /// per media type) and WARP MI tag, but H.264 packetization on top and its own
 /// SSRC/sequencer. One access unit fans out to N RTP packets on send and is
 /// reassembled from them on receive.
+type TimestampedAccessUnit = (u32, Vec<u8>, Option<u8>);
+type VideoPacketResult = (RtpHeader, Vec<TimestampedAccessUnit>);
+
 pub struct VideoPipeline {
     send_keys: E2eSrtpKeys,
     recv_keys: E2eSrtpKeys,
@@ -793,6 +796,7 @@ pub struct VideoPipeline {
     send_roc: RocTracker,
     recv_streams: SrtpRecvStreams,
     depacketizer: H264Depacketizer,
+    frame_orientation: Option<(u32, Option<u8>)>,
     /// SSRC whose fragments the depacketizer currently holds, once one has authenticated.
     ///
     /// The receive table tracks several SSRCs so a renumbering peer keeps its own rollover counter
@@ -869,6 +873,7 @@ impl VideoPipeline {
             send_roc: RocTracker::default(),
             recv_streams: SrtpRecvStreams::default(),
             depacketizer: H264Depacketizer::default(),
+            frame_orientation: None,
             depacketizer_ssrc: None,
             retired_ssrcs: Vec::new(),
             contender_ssrc: None,
@@ -997,6 +1002,7 @@ impl VideoPipeline {
     /// would otherwise be completed by fewer stragglers than it takes to earn.
     pub(crate) fn reset_reassembly(&mut self) {
         self.depacketizer.reset();
+        self.frame_orientation = None;
         self.depacketizer_ssrc = None;
         self.contender_ssrc = None;
         self.packets_since_stream_change = 0;
@@ -1005,6 +1011,7 @@ impl VideoPipeline {
 
     pub(crate) fn reset_depacketizer(&mut self) {
         self.depacketizer.reset();
+        self.frame_orientation = None;
         self.depacketizer_ssrc = None;
         self.retired_ssrcs.clear();
         self.contender_ssrc = None;
@@ -1048,13 +1055,15 @@ impl VideoPipeline {
     /// the reassembled access unit is returned on the AU's marker packet.
     pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<Vec<Vec<u8>>> {
         let completed = self.unprotect_video_packet(packet)?.1;
-        (!completed.is_empty()).then_some(completed)
+        (!completed.is_empty()).then_some(
+            completed
+                .into_iter()
+                .map(|(_, access_unit, _)| access_unit)
+                .collect(),
+        )
     }
 
-    pub(crate) fn unprotect_video_packet(
-        &mut self,
-        packet: &[u8],
-    ) -> Option<(RtpHeader, Vec<Vec<u8>>)> {
+    pub(crate) fn unprotect_video_packet(&mut self, packet: &[u8]) -> Option<VideoPacketResult> {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_streams,
@@ -1104,6 +1113,7 @@ impl VideoPipeline {
             }
             if self.depacketizer_ssrc.is_some() {
                 self.depacketizer.reset();
+                self.frame_orientation = None;
             }
             if let Some(left) = self.depacketizer_ssrc {
                 self.retired_ssrcs.retain(|ssrc| *ssrc != left);
@@ -1119,6 +1129,17 @@ impl VideoPipeline {
             self.retired_ssrc_run = 0;
             self.contender_ssrc = None;
         }
+        let previous = self.frame_orientation;
+        let rotation = super::rtp::parse_whatsapp_media_frame_info(packet).map(|info| info & 3);
+        match self.frame_orientation {
+            Some((timestamp, ref mut orientation)) if timestamp == header.timestamp => {
+                if rotation.is_some() {
+                    *orientation = rotation;
+                }
+            }
+            Some((timestamp, _)) if (header.timestamp.wrapping_sub(timestamp) as i32) <= 0 => {}
+            _ => self.frame_orientation = Some((header.timestamp, rotation)),
+        }
         let first = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
@@ -1126,11 +1147,17 @@ impl VideoPipeline {
             header.marker,
         );
         let mut completed = Vec::with_capacity(if first.is_some() { 2 } else { 0 });
-        if let Some(au) = first {
-            completed.push(au);
-        }
-        while let Some(au) = self.depacketizer.pop_ready() {
-            completed.push(au);
+        // Ready AUs are drained after every push, so at most the previous unmarked
+        // AU and the current AU complete here. Keep each one's own orientation.
+        let mut next = first;
+        while let Some((timestamp, au)) = next {
+            let orientation = self
+                .frame_orientation
+                .filter(|(stamp, _)| *stamp == timestamp)
+                .or_else(|| previous.filter(|(stamp, _)| *stamp == timestamp))
+                .and_then(|(_, orientation)| orientation);
+            completed.push((timestamp, au, orientation));
+            next = self.depacketizer.pop_ready();
         }
         Some((header, completed))
     }
@@ -1891,6 +1918,188 @@ mod tests {
     }
 
     #[test]
+    fn frame_orientation_survives_camera_changes_and_timestamp_boundaries() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+        let mut previous = None;
+        for info in 0..=255u8 {
+            let mut header = tx.rtp.next_video_packet(true, info);
+            header.marker = info % 2 != 0;
+            let packet =
+                protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, &[0x65, 0x88]);
+            let completed = rx.unprotect_video_packet(&packet).unwrap().1;
+            let mut expected = Vec::new();
+            if let Some((stamp, orientation)) = previous.take() {
+                expected.push((stamp, vec![0, 0, 0, 1, 0x65, 0x88], Some(orientation)));
+            }
+            if header.marker {
+                expected.push((
+                    header.timestamp,
+                    vec![0, 0, 0, 1, 0x65, 0x88],
+                    Some(info & 3),
+                ));
+            } else {
+                previous = Some((header.timestamp, info & 3));
+            }
+            assert_eq!(completed, expected, "info={info:#04x}");
+        }
+
+        let mut header = tx.rtp.next_video_packet(true, 3);
+        header.video_extension = None;
+        let packet = protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, &[0x65, 0x88]);
+        assert_eq!(
+            rx.unprotect_video_packet(&packet).unwrap().1[0].2,
+            None,
+            "an absent extension must not inherit the previous camera rotation"
+        );
+    }
+
+    #[test]
+    fn frame_orientation_preserves_presence_across_fragments_and_rejects_forgery() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+        for (index, (first, last, expected)) in [
+            (Some(0), None, Some(0)),
+            (None, Some(3), Some(3)),
+            (Some(1), Some(1), Some(1)),
+            (None, None, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let timestamp = index as u32 * 6000;
+            for (marker, info) in [(false, first), (true, last)] {
+                let mut header = tx.rtp.next_video_packet(marker, info.unwrap_or(0));
+                header.timestamp = timestamp;
+                if info.is_none() {
+                    header.video_extension = None;
+                }
+                let payload: &[u8] = if marker {
+                    &[0x7c, 0x45, 0x99]
+                } else {
+                    &[0x7c, 0x85, 0x88]
+                };
+                let packet =
+                    protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, payload);
+                let held = rx.frame_orientation;
+                let mut forged = packet.clone();
+                *forged.last_mut().unwrap() ^= 1;
+                assert!(rx.unprotect_video_packet(&forged).is_none());
+                assert_eq!(
+                    rx.frame_orientation, held,
+                    "forgery cannot change orientation or fall back"
+                );
+                let completed = rx.unprotect_video_packet(&packet).unwrap().1;
+                if marker {
+                    assert_eq!(
+                        completed,
+                        [(timestamp, vec![0, 0, 0, 1, 0x65, 0x88, 0x99], expected)]
+                    );
+                } else {
+                    assert!(completed.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_info_only_packets_preserve_authenticated_rotation() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+        for info in 0..=255u8 {
+            for marker in [false, true] {
+                let mut header = tx.rtp.next_video_packet(marker, info);
+                header.video_extension = None;
+                header.extension_word = Some(u32::from_be_bytes([0x30, info, 0, 0]));
+                let payload: &[u8] = if marker {
+                    &[0x7c, 0x45, 0x99]
+                } else {
+                    &[0x7c, 0x85, 0x88]
+                };
+                let packet =
+                    protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, payload);
+                let held = rx.frame_orientation;
+                let mut forged = packet.clone();
+                forged[17] ^= 3;
+                assert!(rx.unprotect_video_packet(&forged).is_none());
+                assert_eq!(rx.frame_orientation, held);
+                let completed = rx.unprotect_video_packet(&packet).unwrap().1;
+                if marker {
+                    assert_eq!(
+                        completed,
+                        [(
+                            header.timestamp,
+                            vec![0, 0, 0, 1, 0x65, 0x88, 0x99],
+                            Some(info & 3)
+                        )]
+                    );
+                } else {
+                    assert!(completed.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_orientation_follows_wrap_reorder_and_stream_resets() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+        let au = vec![0, 0, 0, 1, 0x65, 0x88];
+        for (timestamp, marker, info, expected) in [
+            (u32::MAX - 5, false, 1, vec![]),
+            (2, false, 3, vec![(u32::MAX - 5, au.clone(), Some(1))]),
+            (u32::MAX - 4, true, 2, vec![]),
+            (
+                3,
+                true,
+                0,
+                vec![(2, au.clone(), Some(3)), (3, au.clone(), Some(0))],
+            ),
+        ] {
+            let mut header = tx.rtp.next_video_packet(marker, info);
+            header.timestamp = timestamp;
+            let packet =
+                protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, &[0x65, 0x88]);
+            assert_eq!(rx.unprotect_video_packet(&packet).unwrap().1, expected);
+        }
+        for reset in 0..4 {
+            let mut header = tx.rtp.next_video_packet(false, 3);
+            let packet =
+                protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, &[0x65, 0x88]);
+            assert!(rx.unprotect_video_packet(&packet).unwrap().1.is_empty());
+            match reset {
+                0 => rx.reset_reassembly(),
+                1 => rx.reset_depacketizer(),
+                2 => assert!(rx.rekey_recv(&key, a)),
+                _ => header.ssrc ^= 0x100,
+            }
+            header.sequence_number += 1;
+            header.marker = true;
+            header.video_extension = None;
+            let packet =
+                protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, &[0x65, 0x88]);
+            assert_eq!(
+                rx.unprotect_video_packet(&packet).unwrap().1,
+                [(header.timestamp, au.clone(), None)],
+                "reset {reset}"
+            );
+            tx.rtp.next_video_packet(true, 0);
+        }
+    }
+
+    #[test]
     fn video_pipeline_round_trips_multi_packet_au() {
         let call_key: Vec<u8> = (0u8..32).collect();
         let a = "111111111111111:0@lid";
@@ -2285,7 +2494,7 @@ mod tests {
         assert_eq!(
             header.video_extension.unwrap().media_frame_info,
             VIDEO_MEDIA_FRAME_INFO_IDR,
-            "an IDR AU carries WhatsApp's keyframe and IDR bits"
+            "an IDR AU carries WhatsApp's keyframe bit without rotation"
         );
 
         // Pin the send keystream to the SELF lid (same inversion guard as audio).
@@ -2302,8 +2511,60 @@ mod tests {
         assert_eq!(body, expect.as_slice(), "video send must key on self LID");
     }
 
+    /// Lock the wire shape Android renders: an IDR AU leaves protect_video as
+    /// STAP-A(SPS, PPS) plus slice packets, with PT 97, the keyframe bit on
+    /// every fragment, and the marker on the last packet only. Production
+    /// preview confirmed Android decodes from the first such IDR with no PLI
+    /// storm, after never rendering the old single-NAL parameter sets.
     #[test]
-    fn video_frame_info_is_constant_across_every_au_fragment() {
+    fn protected_idr_opens_with_stap_a_parameter_sets() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let self_lid = "111111111111111:0@lid";
+        let peer_lid = "222222222222222:0@lid";
+        let mut pipe = VideoPipeline::new(&video_params(&call_key, self_lid, peer_lid)).unwrap();
+        let sps = [0x67, 0x42, 0xc0, 0x1f, 0x08, 0x80];
+        let pps = [0x68, 0xce, 0x06, 0xe2];
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&sps);
+        au.extend_from_slice(&[0, 0, 0, 1]);
+        au.extend_from_slice(&pps);
+        au.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x01, 0x02, 0x03]);
+        let packets = pipe.protect_video(&au);
+        assert_eq!(packets.len(), 2, "STAP-A plus the IDR slice");
+
+        let keys = derive_e2e_keys(&call_key, self_lid).unwrap();
+        let first = &packets[0][..packets[0].len() - WARP_MI_TAG_LEN];
+        let header = parse_rtp_header(first).unwrap();
+        assert_eq!(header.payload_type, crate::voip::rtp::RTP_PAYLOAD_TYPE_H264);
+        assert!(!header.marker, "only the last packet of the AU marks");
+        assert_eq!(
+            header.video_extension.unwrap().media_frame_info,
+            VIDEO_MEDIA_FRAME_INFO_IDR
+        );
+        let header_len = rtp_header_byte_length(first).unwrap();
+        let mut stap = vec![0x78]; // STAP-A, NRI 3: the unit tests pin the const mapping.
+        stap.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        stap.extend_from_slice(&sps);
+        stap.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        stap.extend_from_slice(&pps);
+        let expect = crypt_payload(&keys, header.ssrc, 0, 0, &stap);
+        assert_eq!(&first[header_len..], expect.as_slice());
+
+        let last = &packets[1][..packets[1].len() - WARP_MI_TAG_LEN];
+        let header = parse_rtp_header(last).unwrap();
+        assert_eq!(header.payload_type, crate::voip::rtp::RTP_PAYLOAD_TYPE_H264);
+        assert!(header.marker, "the AU closes with the marker");
+        assert_eq!(
+            header.video_extension.unwrap().media_frame_info,
+            VIDEO_MEDIA_FRAME_INFO_IDR
+        );
+        let header_len = rtp_header_byte_length(last).unwrap();
+        let expect = crypt_payload(&keys, header.ssrc, 1, 0, &[0x65, 0x01, 0x02, 0x03]);
+        assert_eq!(&last[header_len..], expect.as_slice());
+    }
+
+    #[test]
+    fn upright_video_frame_info_is_constant_across_every_au_fragment() {
         let call_key: Vec<u8> = (0u8..32).collect();
         let mut pipe = VideoPipeline::new(&video_params(
             &call_key,
@@ -2318,7 +2579,7 @@ mod tests {
         assert!(idr_packets.iter().all(|packet| {
             parse_rtp_header(packet)
                 .and_then(|header| header.video_extension)
-                .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_IDR)
+                .is_some_and(|extension| extension.media_frame_info == 0x08)
         }));
 
         let mut delta = vec![0, 0, 0, 1, 0x41];
@@ -2328,7 +2589,7 @@ mod tests {
         assert!(delta_packets.iter().all(|packet| {
             parse_rtp_header(packet)
                 .and_then(|header| header.video_extension)
-                .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_DELTA)
+                .is_some_and(|extension| extension.media_frame_info == 0x00)
         }));
     }
 

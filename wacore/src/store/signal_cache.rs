@@ -17,6 +17,128 @@ use crate::store::traits::SignalStore;
 
 type StoreIncarnation = [u8; 16];
 
+const IDENTITY_CHANGE_CAPACITY: usize = 1024;
+
+/// Process-local account changes for historical sends. Fingerprint collisions
+/// only exclude an extra account; pruned history excludes every older token.
+#[derive(Default)]
+pub struct IdentityContinuity {
+    state: SyncMutex<IdentityChanges>,
+}
+
+#[derive(Default)]
+struct IdentityChanges {
+    generation: u64,
+    floor: u64,
+    active: usize,
+    active_since: u64,
+    users: VecDeque<(u64, u64)>,
+}
+
+impl IdentityContinuity {
+    pub fn unavailable() -> Self {
+        Self {
+            state: SyncMutex::new(IdentityChanges {
+                generation: u64::MAX,
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        // A send starting during a mutation must include that mutation in its
+        // later checks, even if cleanup is cancelled. Pin to before the first
+        // overlapping mutation instead of copying or retaining an active set.
+        (state.generation != u64::MAX).then_some(if state.active == 0 {
+            state.generation
+        } else {
+            state.active_since
+        })
+    }
+
+    pub fn unchanged_for<'a>(
+        &self,
+        snapshot: Option<u64>,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let Some(since) = snapshot else {
+            return false;
+        };
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        if since < state.floor || since > state.generation || state.generation == u64::MAX {
+            return false;
+        }
+        users.into_iter().all(|user| {
+            let fingerprint = user_fingerprint(user);
+            state
+                .users
+                .iter()
+                .rev()
+                .take_while(|(generation, _)| *generation > since)
+                .all(|(_, changed)| *changed != fingerprint)
+        })
+    }
+
+    /// Hold through the entire mutation, including its asynchronous cleanup.
+    /// Pass every known alias. An empty set means unknown scope, such as a reset.
+    pub fn changing<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> IdentityContinuityChange<'_> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.active == 0 {
+            state.active_since = state.generation;
+        }
+        state.generation = state.generation.saturating_add(1);
+        state.active += 1;
+        let generation = state.generation;
+        if generation == u64::MAX {
+            return IdentityContinuityChange(self);
+        }
+        let mut scoped = false;
+        for user in users {
+            scoped = true;
+            if state.users.len() == IDENTITY_CHANGE_CAPACITY
+                && let Some((evicted, _)) = state.users.pop_front()
+            {
+                // The evicted mutation is no longer examined, so the floor
+                // must move past its generation: a snapshot stamped exactly
+                // there can no longer prove that mutation left its accounts
+                // untouched.
+                state.floor = evicted.saturating_add(1);
+            }
+            state.users.push_back((generation, user_fingerprint(user)));
+        }
+        if !scoped {
+            state.floor = generation;
+            state.users.clear();
+        }
+        IdentityContinuityChange(self)
+    }
+
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .users
+            .capacity()
+            * size_of::<(u64, u64)>()
+    }
+}
+
+#[must_use]
+pub struct IdentityContinuityChange<'a>(&'a IdentityContinuity);
+
+impl Drop for IdentityContinuityChange<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.active -= 1;
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PrekeyProbe {
     Needed,
@@ -489,6 +611,7 @@ pub struct SignalStoreCache {
     has_pending_session_restores: AtomicBool,
     pending_session_restores: SyncMutex<Vec<PendingSessionRestore>>,
     identities: Mutex<ByteStoreState>,
+    pub identity_continuity: IdentityContinuity,
     sender_keys: Mutex<SenderKeyStoreState>,
     sender_key_wire_gate: Arc<AtomicBool>,
     /// Fast-path guard for the normally-empty pending distribution map. Warm
@@ -929,6 +1052,7 @@ impl SignalStoreCache {
             has_pending_session_restores: AtomicBool::new(false),
             pending_session_restores: SyncMutex::new(Vec::new()),
             identities: Mutex::new(ByteStoreState::new()),
+            identity_continuity: IdentityContinuity::default(),
             sender_keys: Mutex::new(sender_keys),
             has_pending_sender_key_distributions: AtomicBool::new(false),
             removed_prekeys: Mutex::new(HashMap::new()),
@@ -1596,6 +1720,7 @@ impl SignalStoreCache {
 
     pub async fn put_identity(&self, address: &ProtocolAddress, data: &[u8]) {
         let mut state = self.identities.lock().await;
+        let _change = self.identity_write_change(&state, address, data);
         state.put_dedup(address.as_str(), data);
         state.evict_if_needed(self.max_entries);
     }
@@ -1613,6 +1738,7 @@ impl SignalStoreCache {
     pub fn try_put_identity(&self, address: &ProtocolAddress, data: &[u8]) -> bool {
         match self.identities.try_lock() {
             Some(mut state) => {
+                let _change = self.identity_write_change(&state, address, data);
                 state.put_dedup(address.as_str(), data);
                 state.evict_if_needed(self.max_entries);
                 true
@@ -1623,7 +1749,28 @@ impl SignalStoreCache {
 
     pub async fn delete_identity(&self, address: &ProtocolAddress) {
         let mut state = self.identities.lock().await;
+        let _change = self
+            .identity_continuity
+            .changing([user_of_protocol_address(address.name())]);
         state.delete(address.as_str());
+    }
+
+    fn identity_write_change(
+        &self,
+        state: &ByteStoreState,
+        address: &ProtocolAddress,
+        data: &[u8],
+    ) -> Option<IdentityContinuityChange<'_>> {
+        match state.cache.get(address.as_str()) {
+            Some(None) => None,
+            Some(Some(previous)) if previous.as_ref() == data => None,
+            // An uncached write cannot prove this is a first identity. Normal
+            // Signal saves load the old row before writing, including absence.
+            _ => Some(
+                self.identity_continuity
+                    .changing([user_of_protocol_address(address.name())]),
+            ),
+        }
     }
 
     // === Sender Keys ===
@@ -2206,7 +2353,8 @@ impl SignalStoreCache {
                 .sum::<usize>()
                 + i.cache.overhead_bytes()
                 + crate::stats::hash_table_bytes(i.dirty.capacity(), size_of::<Arc<str>>())
-                + crate::stats::hash_table_bytes(i.deleted.capacity(), size_of::<Arc<str>>());
+                + crate::stats::hash_table_bytes(i.deleted.capacity(), size_of::<Arc<str>>())
+                + self.identity_continuity.estimated_heap_bytes();
             CollectionStats::new(i.cache.len() as u64, bytes as u64)
         };
 
@@ -2262,6 +2410,7 @@ impl SignalStoreCache {
     }
 
     async fn clear_with_incarnation(&self, incarnation: StoreIncarnation) {
+        let _identity_change = self.identity_continuity.changing([]);
         self.session_recovery_generation
             .fetch_add(1, Ordering::AcqRel);
         let _flush_guard = self.flush_lock.lock().await;
@@ -7478,3 +7627,173 @@ mod flush_contention_reproduction_tests {
 #[cfg(test)]
 #[path = "signal_cache_durability_chaos.rs"]
 mod durability_chaos_tests;
+
+#[cfg(test)]
+mod identity_continuity_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_changes_and_cancelled_snapshots_fail_closed() {
+        let continuity = IdentityContinuity::default();
+        let original = continuity.snapshot();
+        let first = continuity.changing(["first"]);
+        let during = continuity.snapshot();
+        let second = continuity.changing(["second"]);
+        assert!(!continuity.unchanged_for(original, ["first"]));
+        assert!(!continuity.unchanged_for(during, ["first"]));
+        assert!(continuity.unchanged_for(during, ["unrelated"]));
+        drop(first);
+        assert_eq!(continuity.snapshot(), original);
+        drop(second);
+        assert!(!continuity.unchanged_for(original, ["first"]));
+        assert!(!continuity.unchanged_for(during, ["second"]));
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["first", "second"]));
+    }
+
+    #[test]
+    fn identity_revision_saturation_never_restores_trust() {
+        let continuity = IdentityContinuity {
+            state: SyncMutex::new(IdentityChanges {
+                generation: u64::MAX - 1,
+                ..Default::default()
+            }),
+        };
+        let original = continuity.snapshot();
+        drop(continuity.changing(["first"]));
+        assert!(!continuity.unchanged_for(original, ["unrelated"]));
+        assert_eq!(continuity.snapshot(), None);
+        drop(continuity.changing(["second"]));
+        assert_eq!(continuity.snapshot(), None);
+    }
+
+    #[tokio::test]
+    async fn identity_history_survives_clean_clear_but_not_lossy_reset() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550000001", 0.into());
+        cache.get_identity(&address, &backend).await.unwrap();
+        cache.put_identity(&address, &[1; 32]).await;
+        let original = cache.identity_continuity.snapshot();
+        cache.flush(&backend).await.unwrap();
+        cache.clear_after_flush().await;
+        assert!(
+            cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+        cache.get_identity(&address, &backend).await.unwrap();
+        cache.put_identity(&address, &[2; 32]).await;
+        cache.flush(&backend).await.unwrap();
+        cache.clear_after_flush().await;
+        cache.get_identity(&address, &backend).await.unwrap();
+        cache.put_identity(&address, &[1; 32]).await;
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+        let current = cache.identity_continuity.snapshot();
+        cache.clear().await;
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(current, ["unrelated"])
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_identity_write_and_delete_cannot_erase_history() {
+        let cache = SignalStoreCache::new();
+        let address = ProtocolAddress::new("15550000001", 0.into());
+        let original = cache.identity_continuity.snapshot();
+        assert!(cache.try_put_identity(&address, &[1; 32]));
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+        let original = cache.identity_continuity.snapshot();
+        cache.delete_identity(&address).await;
+        cache.put_identity(&address, &[1; 32]).await;
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+    }
+
+    #[test]
+    fn bounded_identity_history_fails_closed_after_pruning() {
+        let continuity = IdentityContinuity::default();
+        let original = continuity.snapshot();
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["changed"]));
+        }
+        assert!(continuity.unchanged_for(original, ["unrelated"]));
+        drop(continuity.changing(["changed"]));
+        assert!(!continuity.unchanged_for(original, ["unrelated"]));
+        assert_eq!(
+            continuity.state.lock().unwrap().users.len(),
+            IDENTITY_CHANGE_CAPACITY
+        );
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["unrelated"]));
+    }
+
+    #[test]
+    fn evicted_generation_snapshots_cannot_authorize_replacement() {
+        let continuity = IdentityContinuity::default();
+        drop(continuity.changing(["replaced"]));
+        let stamped = continuity.snapshot();
+        assert_eq!(stamped, Some(1));
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["other"]));
+        }
+        // The mutation that replaced the account is gone from the journal;
+        // the stale snapshot must not clear that account or anything else.
+        assert!(!continuity.unchanged_for(stamped, ["replaced"]));
+        assert!(!continuity.unchanged_for(stamped, ["other"]));
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["other"]));
+    }
+
+    #[test]
+    fn pruning_an_active_change_never_authorizes_an_in_progress_snapshot() {
+        let continuity = IdentityContinuity::default();
+        let active = continuity.changing(["first"]);
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["other"]));
+        }
+        let during = continuity.snapshot();
+        assert!(!continuity.unchanged_for(during, ["first"]));
+        assert!(!continuity.unchanged_for(during, ["unrelated"]));
+        drop(active);
+        assert!(!continuity.unchanged_for(during, ["first"]));
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["first"]));
+    }
+
+    #[tokio::test]
+    async fn identity_journal_normalizes_protocol_accounts_and_skips_unchanged_saves() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        for name in ["15550000001@c.us", "15550000001:2@c.us", "15550000001@lid"] {
+            let address = ProtocolAddress::new(name, 0.into());
+            cache.get_identity(&address, &backend).await.unwrap();
+            let original = cache.identity_continuity.snapshot();
+            cache.put_identity(&address, &[1; 32]).await;
+            let bytes = cache.identity_continuity.estimated_heap_bytes();
+            assert!(cache.try_put_identity(&address, &[1; 32]));
+            assert_eq!(cache.identity_continuity.snapshot(), original);
+            assert_eq!(cache.identity_continuity.estimated_heap_bytes(), bytes);
+            assert!(cache.try_put_identity(&address, &[2; 32]));
+            assert!(
+                !cache
+                    .identity_continuity
+                    .unchanged_for(original, ["15550000001"])
+            );
+            assert!(
+                cache
+                    .identity_continuity
+                    .unchanged_for(original, ["15550000002"])
+            );
+        }
+    }
+}

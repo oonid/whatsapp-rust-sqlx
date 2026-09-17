@@ -243,9 +243,26 @@ impl GroupInfo {
         self.pn_order = build_pn_order(&self.lid_pn);
     }
 
-    /// Rebuild both slices from an edited pair list. The reverse index is
-    /// derived, so every write goes through here and no caller can leave the
-    /// two out of step.
+    /// Fill absent LID mappings without changing membership or existing pairs.
+    /// Duplicate LIDs in the batch keep their first mapping. Non-LID groups
+    /// are unchanged; callers select the participant LIDs to resolve.
+    pub fn fill_missing_lid_to_pn_mappings(&mut self, mut mappings: Vec<(CompactString, Jid)>) {
+        if self.addressing_mode != AddressingMode::Lid {
+            return;
+        }
+        mappings.retain(|(lid, _)| self.lid_index(lid).is_none());
+        if mappings.is_empty() {
+            return;
+        }
+
+        mappings.extend(std::mem::take(&mut self.lid_pn).into_vec());
+        let mut pairs = sort_pairs(mappings).into_vec();
+        pairs.dedup_by(|later, earlier| later.0 == earlier.0);
+        self.lid_pn = pairs.into_boxed_slice();
+        self.pn_order = build_pn_order(&self.lid_pn);
+    }
+
+    /// Rebuild both slices from an edited pair list.
     fn store_pairs(&mut self, pairs: Vec<LidPnPair>) {
         self.lid_pn = sort_pairs(pairs);
         self.pn_order = build_pn_order(&self.lid_pn);
@@ -480,6 +497,57 @@ mod tests {
         info.add_participants([(&bob, None), (&carol, None)]);
         assert_eq!(info.participants.len(), 3);
         assert!(info.participants.iter().any(|p| p.user == "bob"));
+    }
+
+    #[test]
+    fn fill_missing_lid_mappings_preserves_membership_and_existing_pairs() {
+        let mut info = GroupInfo::with_lid_to_pn_map(
+            vec![lid("100000000000101"), lid("100000000000102")],
+            AddressingMode::Lid,
+            HashMap::from([
+                ("100000000000101".into(), pn("15555550101")),
+                ("100000000000199".into(), pn("15555550199")),
+            ]),
+        );
+        info.is_community_announce = Some(true);
+        let participants = info.participants.clone();
+        let allocation = info.participants.as_ptr();
+        let capacity = info.participants.capacity();
+        info.fill_missing_lid_to_pn_mappings(vec![
+            ("100000000000102".into(), pn("15555550102")),
+            ("100000000000101".into(), pn("15555550103")),
+            ("100000000000102".into(), pn("15555550104")),
+        ]);
+        assert_eq!(info.participants, participants);
+        assert_eq!(info.participants.as_ptr(), allocation);
+        assert_eq!(info.participants.capacity(), capacity);
+        assert_eq!(info.is_community_announce, Some(true));
+        assert_eq!(info.lid_pn.len(), 3);
+        for (lid, phone) in [
+            ("100000000000101", "15555550101"),
+            ("100000000000102", "15555550102"),
+            ("100000000000199", "15555550199"),
+        ] {
+            assert_eq!(info.phone_jid_for_lid_user(lid), Some(&pn(phone)));
+            assert_eq!(
+                info.lid_user_for_phone_user(phone).map(|s| s.as_str()),
+                Some(lid)
+            );
+        }
+        assert!(info.lid_user_for_phone_user("15555550103").is_none());
+        assert!(info.lid_user_for_phone_user("15555550104").is_none());
+
+        let pairs = info.lid_pn.as_ptr();
+        let reverse = info.pn_order.as_ptr();
+        info.fill_missing_lid_to_pn_mappings(Vec::new());
+        info.fill_missing_lid_to_pn_mappings(vec![("100000000000101".into(), pn("15555550103"))]);
+        assert_eq!(info.lid_pn.as_ptr(), pairs);
+        assert_eq!(info.pn_order.as_ptr(), reverse);
+
+        info.addressing_mode = AddressingMode::Pn;
+        info.fill_missing_lid_to_pn_mappings(vec![("100000000000103".into(), pn("15555550103"))]);
+        assert_eq!(info.lid_pn.as_ptr(), pairs);
+        assert_eq!(info.pn_order.as_ptr(), reverse);
     }
 
     #[test]
@@ -807,7 +875,8 @@ mod tests {
     /// `(CompactString, Jid)` pair and a 4-byte reverse index — 92 bytes, with
     /// every identifier short enough to live inline in its `CompactString`.
     /// The two `HashMap`s this replaced needed 2048 buckets for the same 1024
-    /// entries and spent 212 bytes per participant.
+    /// entries and spent 212 bytes per participant. Budget: rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
     fn retained_bytes_per_participant_stay_bounded() {
         use crate::stats::HeapSize;

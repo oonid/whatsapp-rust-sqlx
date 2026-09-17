@@ -315,7 +315,9 @@ impl Client {
             crate::cache::Freshness::CachePreferred => {
                 self.get_user_devices_owned(jids_to_resolve).await?
             }
-            crate::cache::Freshness::Refresh => self.refresh_user_devices(jids_to_resolve).await?,
+            crate::cache::Freshness::Refresh => {
+                self.refresh_group_user_devices(jids_to_resolve).await?
+            }
         };
         if is_lid_mode {
             // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
@@ -829,6 +831,17 @@ impl Client {
     ) -> Result<()> {
         use anyhow::Context;
 
+        // Test-only fault hook (see `Client::fail_next_device_list_write`):
+        // fail before touching cache or backend so the caller observes a
+        // write that never happened.
+        #[cfg(test)]
+        if self
+            .fail_next_device_list_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected device-list write failure");
+        }
+
         if records.is_empty() {
             return Ok(());
         }
@@ -1001,6 +1014,21 @@ impl Client {
 
         if let Some(bytes) = signed_bytes {
             if let Some(decoded) = wacore::adv::decode_key_index_list(bytes) {
+                // Clear tracking before pruning, including an ID re-added by
+                // this same notification with a different key index.
+                let identity_changed = record.raw_id.is_some_and(|raw_id| raw_id != decoded.raw_id);
+                for previous in &record.devices {
+                    if previous.device_id() != 0
+                        && (identity_changed
+                            || !wacore::adv::is_key_index_valid(previous.key_index(), &decoded))
+                        && let Err(error) = self
+                            .delete_sender_key_rows_for_device(user, previous.device_id())
+                            .await
+                    {
+                        warn!("patch_device_add: sender-key cleanup failed for {user}: {error}");
+                        return;
+                    }
+                }
                 // Check raw_id mismatch (identity change)
                 // TODO: WA Web also triggers clearRecord on advAccountType change
                 // (HOSTED ↔ E2EE), gated behind bizCoexGatingUtils.bizHostedDevicesEnabled().
@@ -1057,10 +1085,6 @@ impl Client {
                 devices.push(wacore::store::traits::DeviceInfo::new(0, None))
             });
         }
-
-        // New devices are picked up automatically by `resolve_skdm_targets`:
-        // unknown device → `device_has_key()` returns `None` → falls into
-        // `needs_skdm`. No global cache invalidation needed.
 
         if let Err(e) = self.update_device_list_guarded(record, &guard).await {
             warn!("patch_device_add: failed to persist: {e}");
@@ -1125,6 +1149,7 @@ impl Client {
         _server: &str,
         record: &wacore::store::traits::DeviceListRecord,
     ) {
+        let _identity_change = self.signal_cache.identity_continuity.changing([user]);
         let non_primary_ids: Vec<u16> = record
             .devices
             .iter()
@@ -1208,7 +1233,7 @@ impl Client {
     /// error is propagated so the caller can leave both DB and cache in their
     /// pre-call state rather than half-applying the cleanup.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.delete_sender_key_rows", level = "debug", skip_all, fields(device_id = device_id), err(Debug)))]
-    async fn delete_sender_key_rows_for_device(
+    pub(crate) async fn delete_sender_key_rows_for_device(
         &self,
         user: &str,
         device_id: u16,
@@ -3292,6 +3317,66 @@ mod tests {
         assert!(rows.iter().all(|(jid, _)| jid != &device_jid));
     }
 
+    #[tokio::test]
+    async fn device_add_key_index_pruning_makes_reused_id_cold() {
+        let client = create_test_client().await;
+        let user = "12025550126";
+        let group = "120363000000000126@g.us";
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: user.into(),
+                devices: [
+                    wacore::store::traits::DeviceInfo::new(0, None),
+                    wacore::store::traits::DeviceInfo::new(7, Some(3)),
+                ]
+                .into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: Some(1),
+            })
+            .await
+            .unwrap();
+        let device = Jid::pn(user).with_device(7).to_string();
+        client
+            .persistence_manager
+            .set_sender_key_status(group, &[(device.as_str(), true)])
+            .await
+            .unwrap();
+        let info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(make_signed_key_index_bytes(1, 4, vec![4])),
+        };
+        client
+            .patch_device_add(
+                user,
+                &wacore::stanza::devices::DeviceElement {
+                    jid: Jid::pn(user).with_device(7),
+                    key_index: Some(4),
+                    lid: None,
+                },
+                Some(&info),
+            )
+            .await;
+        assert!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let record = client.load_device_record(user).await.unwrap();
+        assert_eq!(
+            record
+                .devices
+                .iter()
+                .find(|device| device.device_id() == 7)
+                .unwrap()
+                .key_index(),
+            Some(4)
+        );
+    }
+
     // A remove targeting the primary (device 0) must be a no-op: WA Web never
     // drops device 0. Regression guard for the symmetric failure to the add path
     // — dropping the primary persists a record that suppresses usync forever.
@@ -4250,7 +4335,8 @@ mod tests {
     /// The memo is per group and lives as long as the group stays warm, so its
     /// cost has to be a bound rather than a comment. Measured per (member,
     /// device) pair because both halves scale with it: the membership index is
-    /// keyed by user and the device list by device.
+    /// keyed by user and the device list by device. Budget: rebaseline per
+    /// [layout asserts](../../agent_docs/layout_asserts.md).
     #[test]
     fn group_devices_memo_retained_bytes_stay_bounded() {
         use wacore::stats::HeapSize;

@@ -200,11 +200,13 @@ impl ResolvedDmDevices {
         self.partitioned.valid_devices()
     }
 
-    pub(crate) fn recipient_devices(&self) -> &[Jid] {
+    /// The recipient partition, preceding own companions in [`Self::devices`].
+    pub fn recipient_devices(&self) -> &[Jid] {
         self.partitioned.recipient_devices()
     }
 
-    pub(crate) fn own_other_devices(&self) -> &[Jid] {
+    /// Our PN/LID companions, excluding the sending device itself.
+    pub fn own_other_devices(&self) -> &[Jid] {
         self.partitioned.own_other_devices()
     }
 

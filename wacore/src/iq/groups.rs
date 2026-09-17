@@ -2800,7 +2800,7 @@ impl JoinLinkedGroupIq {
 }
 
 impl IqSpec for JoinLinkedGroupIq {
-    type Response = GroupInfoResponse;
+    type Response = JoinGroupResult;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = NodeBuilder::new("join_linked_group")
@@ -2815,9 +2815,33 @@ impl IqSpec for JoinLinkedGroupIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let linked_node = required_child(response, "linked_group")?;
-        let group_node = required_child(linked_node, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        // Bare joins the request's own subgroup (same shape pair as the V4
+        // accept — see the generated shapes).
+        if response.content.is_none() {
+            return Ok(JoinGroupResult::Joined(self.subgroup_jid.clone()));
+        }
+        // Compatibility allowance, not a bundle shape: some servers answer
+        // with the query-shaped `<linked_group><group id/></linked_group>`
+        // metadata instead of the bare result. It carries a real group
+        // identity (the same `id` the query parser reads), so joining it
+        // cannot misreport a non-joined state — but only as the complete
+        // shape: siblings beside the wrapper (an approval request, unknown
+        // nodes) fall through to the strict parser below instead of being
+        // silently ignored.
+        //
+        // TODO: drop this allowance once servers answer the bare result and
+        // re-tighten to bare-or-approval only; the wrapper exists for a
+        // transitional server behavior, not the protocol.
+        if let Some([linked]) = response.children()
+            && linked.tag.as_ref() == "linked_group"
+            && let Some([group]) = linked.children()
+            && group.tag.as_ref() == "group"
+            && let Ok(id_str) = required_attr(group, "id")
+            && let Ok(jid) = parse_group_id(&id_str)
+        {
+            return Ok(JoinGroupResult::Joined(jid));
+        }
+        parse_join_group_response(response)
     }
 }
 
@@ -2902,11 +2926,17 @@ fn parse_group_id(id_str: &str) -> Result<Jid> {
     }
 }
 
+/// Child tags of the join-response shapes, shared by the strict parser and
+/// the bare-result fallbacks below so the two cannot drift apart.
+const JOIN_GROUP_CHILD: &str = "group";
+const JOIN_COMMUNITY_CHILD: &str = "community";
+const JOIN_APPROVAL_CHILD: &str = "membership_approval_request";
+
 /// Shared response parser for group join IQs (both code-based and V4 invite).
 fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> {
     if let Some(group_node) = response
-        .get_optional_child("group")
-        .or_else(|| response.get_optional_child("community"))
+        .get_optional_child(JOIN_GROUP_CHILD)
+        .or_else(|| response.get_optional_child(JOIN_COMMUNITY_CHILD))
     {
         let jid_str = required_attr(group_node, "jid")?;
         let jid: Jid = jid_str
@@ -2914,16 +2944,29 @@ fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> 
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::Joined(jid));
     }
-    if let Some(approval_node) = response.get_optional_child("membership_approval_request") {
+    if let Some(approval_node) = response.get_optional_child(JOIN_APPROVAL_CHILD) {
         let jid_str = required_attr(approval_node, "jid")?;
         let jid: Jid = jid_str
             .parse()
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::PendingApproval(jid));
     }
+    // NOTE: this message is matched downstream (bridge/baileyrs surfaces it);
+    // keep it byte-identical when touching the tags above.
     Err(anyhow!(
         "expected <group>, <community>, or <membership_approval_request> in join response"
     ))
+}
+
+/// Parse a join response that may be a bare `<iq type="result">`: with no
+/// content at all the join succeeded and the group is the request's own
+/// addressee (`fallback`); anything present but unrecognized falls through to
+/// the strict parser and fails loudly instead of reporting `Joined`.
+fn parse_join_or_bare(response: &NodeRef<'_>, fallback: &Jid) -> Result<JoinGroupResult> {
+    if response.content.is_none() {
+        return Ok(JoinGroupResult::Joined(fallback.clone()));
+    }
+    parse_join_group_response(response)
 }
 
 /// ```xml
@@ -3003,7 +3046,10 @@ impl IqSpec for AcceptGroupInviteV4Iq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        parse_join_group_response(response)
+        // Bare joins the request's own `to` (`AcceptGroupAddResponseSuccess`
+        // in the generated shapes); the code-based join keeps the strict
+        // parser, whose bare result carries no group identity.
+        parse_join_or_bare(response, &self.group_jid)
     }
 }
 
@@ -3409,8 +3455,25 @@ impl IqSpec for BatchGetGroupInfoIq {
 // Get group profile pictures (batch)
 // ---------------------------------------------------------------------------
 
-/// A single group profile picture result.
-#[derive(Debug, Clone)]
+/// Detailed outcome of a single group profile picture entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupProfilePictureOutcome {
+    /// Found group profile picture.
+    Found {
+        url: String,
+        direct_path: Option<String>,
+        photo_id: Option<String>,
+    },
+    /// Picture unchanged (status 304).
+    Unchanged,
+    /// Picture not found / no picture set (status 204 or missing).
+    NotFound,
+    /// Server or permission error for this item (status 500, 405, etc.).
+    Error { code: u16 },
+}
+
+/// Profile picture information for a group in a batch query.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupProfilePicture {
     pub group_jid: Jid,
     /// Direct URL to the picture.
@@ -3419,6 +3482,46 @@ pub struct GroupProfilePicture {
     pub direct_path: Option<String>,
     /// Photo ID / version tag.
     pub photo_id: Option<String>,
+    /// HTTP-like status code returned by the server for this entry (e.g. 200, 304, 204, 500, 405).
+    pub status: Option<u16>,
+}
+
+impl GroupProfilePicture {
+    /// Returns `true` if the server returned status 304 (picture unchanged).
+    pub fn is_unchanged(&self) -> bool {
+        self.status == Some(304)
+    }
+
+    /// Returns `true` if the server returned status 204 (picture not found).
+    pub fn is_not_found(&self) -> bool {
+        self.status == Some(204)
+    }
+
+    /// Returns `true` if a picture URL was returned.
+    pub fn is_found(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// Converts this item into a typed outcome.
+    pub fn outcome(&self) -> GroupProfilePictureOutcome {
+        if self.status == Some(304) {
+            GroupProfilePictureOutcome::Unchanged
+        } else if self.status == Some(204) {
+            GroupProfilePictureOutcome::NotFound
+        } else if let Some(code) = self.status
+            && code >= 400
+        {
+            GroupProfilePictureOutcome::Error { code }
+        } else if let Some(url) = &self.url {
+            GroupProfilePictureOutcome::Found {
+                url: url.clone(),
+                direct_path: self.direct_path.clone(),
+                photo_id: self.photo_id.clone(),
+            }
+        } else {
+            GroupProfilePictureOutcome::NotFound
+        }
+    }
 }
 
 /// Profile picture query type.
@@ -3428,34 +3531,96 @@ pub enum PictureType {
     Image,
 }
 
+/// Single group request item in a batch profile picture query.
+#[derive(Debug, Clone)]
+pub struct GroupPictureEntry {
+    pub jid: Jid,
+    pub picture_type: PictureType,
+    pub existing_id: Option<String>,
+    pub is_parent_group: bool,
+}
+
+impl GroupPictureEntry {
+    pub fn new(jid: &Jid, picture_type: PictureType) -> Self {
+        Self {
+            jid: jid.clone(),
+            picture_type,
+            existing_id: None,
+            is_parent_group: false,
+        }
+    }
+
+    pub fn with_existing_id(mut self, id: impl Into<String>) -> Self {
+        self.existing_id = Some(id.into());
+        self
+    }
+
+    pub fn as_parent_group(mut self, is_parent_group: bool) -> Self {
+        self.is_parent_group = is_parent_group;
+        self
+    }
+}
+
 /// Batch fetch group profile pictures.
 ///
+/// In WhatsApp Web (`WASmaxOutGroupsGetGroupProfilePicturesRequest`):
 /// ```xml
 /// <iq type="get" xmlns="w:g2" to="@g.us">
 ///   <pictures>
-///     <picture jid="{group_jid}" type="preview"/>
+///     <picture sub_group_jid="{group_jid}" type="preview" query="url"/>
 ///   </pictures>
 /// </iq>
 /// ```
 #[derive(Debug, Clone)]
 pub struct GetGroupProfilePicturesIq {
-    pub groups: Vec<(Jid, PictureType)>,
+    pub entries: Vec<GroupPictureEntry>,
+    /// Target destination: either the group server `@g.us` or a community parent JID.
+    pub to_jid: Option<Jid>,
+    /// Optional linked groups membership hint on `<pictures>`.
+    pub membership_hint: Option<Jid>,
 }
 
 impl GetGroupProfilePicturesIq {
     pub fn new(group_jids: &[Jid]) -> Self {
         Self {
-            groups: group_jids
+            entries: group_jids
                 .iter()
-                .map(|jid| (jid.clone(), PictureType::Preview))
+                .map(|jid| GroupPictureEntry::new(jid, PictureType::Preview))
                 .collect(),
+            to_jid: None,
+            membership_hint: None,
         }
     }
 
     pub fn with_type(groups: &[(Jid, PictureType)]) -> Self {
         Self {
-            groups: groups.to_vec(),
+            entries: groups
+                .iter()
+                .map(|(jid, pic_type)| GroupPictureEntry::new(jid, *pic_type))
+                .collect(),
+            to_jid: None,
+            membership_hint: None,
         }
+    }
+
+    pub fn with_entries(entries: Vec<GroupPictureEntry>) -> Self {
+        Self {
+            entries,
+            to_jid: None,
+            membership_hint: None,
+        }
+    }
+
+    /// Set the destination JID (e.g. community parent JID). Defaults to `@g.us`.
+    pub fn with_to_jid(mut self, to: Jid) -> Self {
+        self.to_jid = Some(to);
+        self
+    }
+
+    /// Set the linked groups membership hint.
+    pub fn with_membership_hint(mut self, hint: Jid) -> Self {
+        self.membership_hint = Some(hint);
+        self
     }
 }
 
@@ -3464,26 +3629,45 @@ impl IqSpec for GetGroupProfilePicturesIq {
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
-            .groups
+            .entries
             .iter()
-            .map(|(jid, pic_type)| {
-                let type_str = match pic_type {
+            .map(|entry| {
+                let type_str = match entry.picture_type {
                     PictureType::Preview => "preview",
                     PictureType::Image => "image",
                 };
-                NodeBuilder::new("picture")
-                    .attr("jid", jid)
+                let mut b = NodeBuilder::new("picture")
                     .attr("type", type_str)
-                    .build()
+                    .attr("query", "url");
+
+                if entry.is_parent_group {
+                    b = b.attr("parent_group_jid", &entry.jid);
+                } else {
+                    b = b.attr("sub_group_jid", &entry.jid);
+                }
+
+                if let Some(id) = &entry.existing_id {
+                    b = b.attr("id", id);
+                }
+
+                b.build()
             })
             .collect();
 
-        let pictures_node = NodeBuilder::new("pictures").children(children).build();
+        let mut pictures_builder = NodeBuilder::new("pictures").children(children);
+        if let Some(hint) = &self.membership_hint {
+            pictures_builder = pictures_builder.attr("linked_groups_membership_hint", hint);
+        }
+
+        let to_jid = self
+            .to_jid
+            .clone()
+            .unwrap_or_else(|| Jid::new("", Server::Group));
 
         InfoQuery::get(
             GROUP_IQ_NAMESPACE,
-            Jid::new("", Server::Group),
-            Some(NodeContent::Nodes(vec![pictures_node])),
+            to_jid,
+            Some(NodeContent::Nodes(vec![pictures_builder.build()])),
         )
     }
 
@@ -3493,13 +3677,29 @@ impl IqSpec for GetGroupProfilePicturesIq {
 
         for pic_node in pictures_node.get_children_by_tag("picture") {
             let mut attrs = pic_node.attrs();
-            if let Some(jid_str) = attrs.optional_string("jid") {
-                let jid = parse_group_id(&jid_str)?;
+            // Protocol ground truth: WhatsApp Web uses sub_group_jid or parent_group_jid,
+            // with jid supported as a legacy/compatibility fallback.
+            let group_jid = attrs
+                .optional_string("sub_group_jid")
+                .or_else(|| attrs.optional_string("parent_group_jid"))
+                .or_else(|| attrs.optional_string("jid"))
+                .map(|jid_str| parse_group_id(&jid_str))
+                .transpose()?;
+
+            if let Some(jid) = group_jid {
+                let status = attrs
+                    .optional_string("status")
+                    .and_then(|s| s.parse::<u16>().ok());
+                let url = attrs.optional_string("url").map(|s| s.to_string());
+                let direct_path = attrs.optional_string("direct_path").map(|s| s.to_string());
+                let photo_id = attrs.optional_string("id").map(|s| s.to_string());
+
                 results.push(GroupProfilePicture {
                     group_jid: jid,
-                    url: attrs.optional_string("url").map(|s| s.to_string()),
-                    direct_path: attrs.optional_string("direct_path").map(|s| s.to_string()),
-                    photo_id: attrs.optional_string("id").map(|s| s.to_string()),
+                    url,
+                    direct_path,
+                    photo_id,
+                    status,
                 });
             }
         }
@@ -5754,5 +5954,406 @@ mod tests {
             accept.attrs().optional_string("admin").as_deref(),
             Some("5511999887766@s.whatsapp.net"),
         );
+    }
+
+    const TEST_GROUP_JID: &str = "120363000000000042@g.us";
+    const TEST_PARENT_JID: &str = "120363000000000001@g.us";
+    const TEST_ADMIN_JID: &str = "5511999887766@s.whatsapp.net";
+    const TEST_INVITE_CODE: &str = "A1B2C3D4";
+    const TEST_INVITE_EXPIRATION: i64 = 1_700_000_123;
+
+    fn v4_spec() -> (Jid, AcceptGroupInviteV4Iq) {
+        let group_jid: Jid = TEST_GROUP_JID.parse().unwrap();
+        let admin_jid: Jid = TEST_ADMIN_JID.parse().unwrap();
+        let spec = AcceptGroupInviteV4Iq::new(
+            &group_jid,
+            TEST_INVITE_CODE,
+            TEST_INVITE_EXPIRATION,
+            &admin_jid,
+        );
+        (group_jid, spec)
+    }
+
+    /// `<iq type="result" from=...>` carrying `children` (empty means a bare
+    /// result: no content at all, not an empty child list).
+    fn result_iq(from: &str, children: Vec<Node>) -> Node {
+        let mut iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", from);
+        if !children.is_empty() {
+            iq = iq.children(children);
+        }
+        iq.build()
+    }
+
+    fn bare_join_result() -> Node {
+        result_iq(TEST_GROUP_JID, Vec::new())
+    }
+
+    fn approval_child(jid: &str) -> Node {
+        NodeBuilder::new(JOIN_APPROVAL_CHILD)
+            .attr("jid", jid)
+            .build()
+    }
+
+    /// Locks the parser above to the generated join-shape constants: if the next
+    /// sync flips them, this fails and the parser owes a re-read.
+    #[test]
+    fn test_join_success_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::ACCEPT_GROUP_ADD_SUCCESS,
+            &[
+                (
+                    "AcceptGroupAddResponseGroupJoinRequestSuccess",
+                    &["membership_approval_request"][..]
+                ),
+                ("AcceptGroupAddResponseSuccess", &[][..]),
+            ]
+        );
+    }
+
+    /// A bare result joins with the request's group JID.
+    #[test]
+    fn test_accept_group_invite_v4_bare_result_joins() {
+        let (group_jid, spec) = v4_spec();
+        let iq = bare_join_result();
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(group_jid));
+    }
+
+    /// Reject an unrecognized child.
+    #[test]
+    fn test_join_linked_group_unknown_child_is_rejected() {
+        let (_, spec) = linked_spec();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![NodeBuilder::new("unexpected").build()],
+        );
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    #[test]
+    fn test_join_linked_group_wrapper_with_sibling_is_not_enough() {
+        // The tolerance covers exactly the wrapper shape; an approval request
+        // beside it still reports pending, and any other sibling still fails.
+        let (subgroup, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let approval = approval_child(TEST_GROUP_JID);
+        let iq = result_iq(TEST_PARENT_JID, vec![wrapper, approval]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+
+        let (_, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![wrapper, NodeBuilder::new("unexpected").build()],
+        );
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    /// Reject scalar response content.
+    #[test]
+    fn test_accept_group_invite_v4_scalar_content_is_rejected() {
+        let (_, spec) = v4_spec();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", TEST_GROUP_JID)
+            .apply_content(Some(NodeContent::String("unexpected payload".into())))
+            .build();
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    #[test]
+    fn test_accept_group_invite_v4_group_child_still_joins() {
+        let (group_jid, spec) = v4_spec();
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("jid", TEST_GROUP_JID)
+            .build();
+        let iq = result_iq(TEST_GROUP_JID, vec![group]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(group_jid));
+    }
+
+    #[test]
+    fn test_accept_group_invite_v4_approval_child_stays_pending() {
+        let (group_jid, spec) = v4_spec();
+        let iq = result_iq(TEST_GROUP_JID, vec![approval_child(TEST_GROUP_JID)]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(group_jid));
+    }
+
+    fn linked_spec() -> (Jid, JoinLinkedGroupIq) {
+        let parent: Jid = TEST_PARENT_JID.parse().unwrap();
+        let subgroup: Jid = TEST_GROUP_JID.parse().unwrap();
+        let spec = JoinLinkedGroupIq::new(&parent, &subgroup);
+        (subgroup, spec)
+    }
+
+    /// Locks the linked-group join parser to its generated shapes: a bare
+    /// result and an approval-gated variant, like the V4 accept.
+    #[test]
+    fn test_join_linked_group_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::JOIN_LINKED_GROUP_SUCCESS,
+            &[
+                (
+                    "JoinLinkedGroupResponseGroupJoinRequestSuccess",
+                    &["membership_approval_request"][..]
+                ),
+                ("JoinLinkedGroupResponseSuccess", &[][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_join_linked_group_bare_result_joins_subgroup() {
+        let (subgroup, spec) = linked_spec();
+        let iq = result_iq(TEST_PARENT_JID, Vec::new());
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_approval_child_stays_pending() {
+        let (subgroup, spec) = linked_spec();
+        let iq = result_iq(TEST_PARENT_JID, vec![approval_child(TEST_GROUP_JID)]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_linked_group_wrapper_is_tolerated() {
+        // Compatibility allowance: a query-shaped answer joins its inner group.
+        let (_, spec) = linked_spec();
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("id", "120363000000000042")
+            .build();
+        let linked = NodeBuilder::new("linked_group")
+            .attr("jid", TEST_GROUP_JID)
+            .children([group])
+            .build();
+        let iq = result_iq(TEST_PARENT_JID, vec![linked]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(
+            result,
+            JoinGroupResult::Joined(TEST_GROUP_JID.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_build_iq_server_routing() {
+        let group1: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group2: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let iq = GetGroupProfilePicturesIq::with_type(&[
+            (group1.clone(), PictureType::Preview),
+            (group2.clone(), PictureType::Image),
+        ])
+        .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.to, Jid::new("", Server::Group));
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "pictures");
+
+        let pics: Vec<_> = nodes[0].get_children_by_tag("picture").collect();
+        assert_eq!(pics.len(), 2);
+
+        assert_eq!(
+            pics[0]
+                .attrs
+                .get("sub_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000001@g.us")
+        );
+        assert_eq!(
+            pics[0].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("preview")
+        );
+        assert_eq!(
+            pics[0].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+
+        assert_eq!(
+            pics[1]
+                .attrs
+                .get("sub_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000002@g.us")
+        );
+        assert_eq!(
+            pics[1].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("image")
+        );
+        assert_eq!(
+            pics[1].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_build_iq_community_routing() {
+        let community: Jid = "120363000000000099@g.us".parse().unwrap();
+        let entry = GroupPictureEntry::new(&community, PictureType::Image)
+            .with_existing_id("photo-42")
+            .as_parent_group(true);
+
+        let iq = GetGroupProfilePicturesIq::with_entries(vec![entry])
+            .with_to_jid(community.clone())
+            .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.to, community);
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes[0].tag, "pictures");
+
+        let pics: Vec<_> = nodes[0].get_children_by_tag("picture").collect();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(
+            pics[0]
+                .attrs
+                .get("parent_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000099@g.us")
+        );
+        assert_eq!(
+            pics[0].attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("photo-42")
+        );
+        assert_eq!(
+            pics[0].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("image")
+        );
+        assert_eq!(
+            pics[0].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_parse_response_with_status_codes() {
+        let group1: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group2: Jid = "120363000000000002@g.us".parse().unwrap();
+        let group3: Jid = "120363000000000003@g.us".parse().unwrap();
+        let group4: Jid = "120363000000000004@g.us".parse().unwrap();
+
+        let spec = GetGroupProfilePicturesIq::new(&[
+            group1.clone(),
+            group2.clone(),
+            group3.clone(),
+            group4.clone(),
+        ]);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("pictures")
+                .children([
+                    // 1. Success
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000001@g.us")
+                        .attr("id", "pic-1")
+                        .attr("url", "https://pps.whatsapp.net/pic1.jpg")
+                        .attr("direct_path", "/v/pic1.jpg")
+                        .build(),
+                    // 2. Unchanged (status 304)
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000002@g.us")
+                        .attr("status", "304")
+                        .build(),
+                    // 3. Not found (status 204)
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000003@g.us")
+                        .attr("status", "204")
+                        .build(),
+                    // 4. Server error (status 500)
+                    NodeBuilder::new("picture")
+                        .attr("parent_group_jid", "120363000000000004@g.us")
+                        .attr("status", "500")
+                        .build(),
+                ])
+                .build()])
+            .build();
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results.len(), 4);
+
+        // Group 1: Found
+        assert_eq!(results[0].group_jid, group1);
+        assert!(results[0].is_found());
+        assert!(!results[0].is_unchanged());
+        assert!(!results[0].is_not_found());
+        assert_eq!(
+            results[0].url.as_deref(),
+            Some("https://pps.whatsapp.net/pic1.jpg")
+        );
+        assert_eq!(results[0].photo_id.as_deref(), Some("pic-1"));
+        assert_eq!(
+            results[0].outcome(),
+            GroupProfilePictureOutcome::Found {
+                url: "https://pps.whatsapp.net/pic1.jpg".to_string(),
+                direct_path: Some("/v/pic1.jpg".to_string()),
+                photo_id: Some("pic-1".to_string()),
+            }
+        );
+
+        // Group 2: Unchanged (304)
+        assert_eq!(results[1].group_jid, group2);
+        assert!(results[1].is_unchanged());
+        assert_eq!(results[1].status, Some(304));
+        assert_eq!(results[1].outcome(), GroupProfilePictureOutcome::Unchanged);
+
+        // Group 3: NotFound (204)
+        assert_eq!(results[2].group_jid, group3);
+        assert!(results[2].is_not_found());
+        assert_eq!(results[2].status, Some(204));
+        assert_eq!(results[2].outcome(), GroupProfilePictureOutcome::NotFound);
+
+        // Group 4: Server Error (500)
+        assert_eq!(results[3].group_jid, group4);
+        assert_eq!(results[3].status, Some(500));
+        assert_eq!(
+            results[3].outcome(),
+            GroupProfilePictureOutcome::Error { code: 500 }
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_parse_malformed_jid_fails() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetGroupProfilePicturesIq::new(&[group]);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("pictures")
+                .children([NodeBuilder::new("picture")
+                    .attr("sub_group_jid", "invalid@@@")
+                    .attr("status", "200")
+                    .build()])
+                .build()])
+            .build();
+
+        assert!(spec.parse_response(&response.as_node_ref()).is_err());
     }
 }

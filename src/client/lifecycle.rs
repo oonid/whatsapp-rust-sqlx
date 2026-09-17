@@ -1,6 +1,7 @@
 //! Client construction and connection lifecycle: connect, run, reconnect, shutdown.
 
 use super::*;
+use crate::cache_config::CacheConfig;
 use wacore::net::DisconnectReason;
 
 /// Why [`Client::run`] stopped supervising the session.
@@ -463,6 +464,7 @@ impl Client {
             #[cfg(feature = "plugins")]
             plugin_host,
             noise_cert_policy,
+            history_sync_admission,
         } = extensions;
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
@@ -483,6 +485,7 @@ impl Client {
         let device_topology = device_topology::DeviceTopology::new();
         let sent_frame_tap = Arc::new(SentFrameTap::new(core.event_bus.clone()));
         let stream_waiter_count = Arc::new(AtomicUsize::new(0));
+        let runtime_cache_config = RuntimeCacheConfig::from(&cache_config);
         let this = Self {
             runtime: runtime.clone(),
             core,
@@ -517,7 +520,7 @@ impl Client {
             stats: Arc::new(wacore::stats::SessionStats::new()),
 
             transport: Arc::new(Mutex::new(None)),
-            transport_events: Arc::new(Mutex::new(None)),
+            transport_events: Mutex::new(None),
             transport_factory,
             noise_socket: Arc::new(std::sync::Mutex::new(None)),
 
@@ -573,6 +576,11 @@ impl Client {
 
             pending_device_sync: crate::pending_device_sync::PendingDeviceSync::new(),
 
+            pending_group_device_resync: crate::send::group_repair::GroupRepair::new(),
+
+            #[cfg(test)]
+            fail_next_device_list_write: AtomicBool::new(false),
+
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
             pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -589,7 +597,10 @@ impl Client {
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
-            dispatched_messages: cache_config.dispatched_messages.build_with_ttl(),
+            dispatched_messages: crate::portable_cache::SyncTtlCache::new(
+                cache_config.dispatched_messages.capacity,
+                cache_config.dispatched_messages.timeout,
+            ),
             duplicate_dispatch_suppressed: AtomicU64::new(0),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {
@@ -615,7 +626,7 @@ impl Client {
             app_state_processor: std::sync::OnceLock::new(),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
             app_state_syncing: app_state::SyncInFlight::new(),
-            app_state_send_lock: Arc::new(Mutex::new(())),
+            app_state_send_lock: Mutex::new(()),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
             initial_app_state_keys_received: AtomicBool::new(false),
             prekey_upload_lock: Arc::new(Mutex::new(())),
@@ -659,7 +670,8 @@ impl Client {
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
-            chatstate_handlers: Arc::new(std::sync::RwLock::new(Arc::from([]))),
+            history_sync_admission,
+            chatstate_handlers: std::sync::RwLock::new(Arc::from([])),
             chatstate_handler_count: AtomicUsize::new(0),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),
@@ -699,7 +711,7 @@ impl Client {
             ab_props_fetch: AtomicBool::new(true),
             automatic_presence: AtomicBool::new(true),
             wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
-            cache_config,
+            cache_config: runtime_cache_config,
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),
             alloc_meter: std::sync::OnceLock::new(),
@@ -731,6 +743,12 @@ impl Client {
                 }
             }))
             .detach();
+        // Reap rows that expired while the process was closed, without waiting
+        // for a connection to reach the keepalive tick. Detached and behind the
+        // store's write permit, so it neither delays construction nor races the
+        // migrations the store already ran before this client existed. See
+        // `Client::run_startup_maintenance`.
+        self.run_startup_maintenance();
     }
 
     /// Run the session: connect, read the socket until the connection ends,
@@ -1473,18 +1491,15 @@ impl Client {
         // buffered receipts stay unsent too, because their SKDM/session state
         // may not be durable yet (receipting an SKDM whose sender key only
         // lives in the cache would lose it to a crash with no redelivery).
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(5))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(5))
+            .await;
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, Duration::from_secs(5))
             .await;
         self.notify_connection_shutdown();
+        self.pending_group_device_resync.clear();
 
         if let Err(e) = self.persistence_manager.flush().await {
             log::error!("Failed to flush device state during disconnect: {e}");
@@ -1556,12 +1571,8 @@ impl Client {
         self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
 
         // Same durable-before-receipts gate as disconnect().
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(2))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(2))
+            .await;
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, Duration::from_secs(2))
@@ -1592,12 +1603,8 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
         // Same durable-before-receipts gate as disconnect().
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(2))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(2))
+            .await;
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, Duration::from_secs(2))
@@ -1714,12 +1721,8 @@ impl Client {
         self.pause_state_notifier.notify(usize::MAX);
 
         // Same durable-before-receipts gate as disconnect().
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(2))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(2))
+            .await;
         // Everything from here touches connection-scoped shared state, and a
         // `resume()` across the await above can have a replacement installed
         // that has already reopened the outbound scope and reset the
@@ -1911,6 +1914,7 @@ impl Client {
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
         let closed_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        self.pending_group_device_resync.clear();
         #[cfg(feature = "client-lifecycle")]
         let scope_close = self.lifecycle.as_ref().map(|lifecycle| {
             let lifecycle = Arc::clone(lifecycle);
@@ -2643,6 +2647,7 @@ mod tests {
                     #[cfg(feature = "plugins")]
                     plugin_host: None,
                     noise_cert_policy: wacore::handshake::NoiseCertPolicy::default(),
+                    history_sync_admission: None,
                 },
             )
         };
@@ -2665,6 +2670,9 @@ mod tests {
         // up to `CLIENTS - 1` over the scaled budget round down into it.
         let bytes_per_client = bytes / CLIENTS as i64;
         let allocs_per_client = allocs / CLIENTS as u64;
+        eprintln!(
+            "fixed structure {bytes_per_client} B {allocs_per_client} allocations; totals={bytes}/{allocs}"
+        );
         assert!(
             bytes <= MAX_BYTES_PER_CLIENT * CLIENTS as i64
                 && allocs <= MAX_ALLOCS_PER_CLIENT * CLIENTS as u64,
@@ -2899,7 +2907,8 @@ mod tests {
 
     /// The connection handed back by `connect` is a borrow, so the happy path
     /// carries the same bytes and the same allocations it did when connecting
-    /// resolved to `()`.
+    /// resolved to `()`. Compositional, so widths and repacks do not matter.
+    /// Rebaseline per [layout asserts](../../agent_docs/layout_asserts.md).
     #[test]
     fn handing_back_a_connection_costs_the_caller_nothing() {
         assert_eq!(

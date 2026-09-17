@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use wacore::client::context::GroupInfo;
-use wacore::iq::contacts::SetProfilePictureSpec;
-// Returned by set/remove_profile_picture; re-exported so callers don't reach
-// into wacore directly (consistent with GroupProfilePicture below).
+pub use wacore::iq::contacts::ProfilePictureLookup;
 pub use wacore::iq::contacts::SetProfilePictureResponse;
+use wacore::iq::contacts::SetProfilePictureSpec;
+use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType as ContactPictureType};
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
@@ -30,10 +30,10 @@ use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
 pub use wacore::iq::groups::{
     GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings,
     GroupJoinError, GroupMessageReporter, GroupParticipantDetails, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult,
-    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
-    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
-    ReportedGroupMessage, ReportedGroupMessages,
+    GroupPictureEntry, GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject,
+    GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    ParticipantType, PictureType, ReportedGroupMessage, ReportedGroupMessages,
 };
 
 /// Error returned by group operations (metadata queries, participant and
@@ -800,12 +800,14 @@ impl<'a> Groups<'a> {
                 {
                     GroupInfoOutcome::NotModified => {
                         if let Some(metadata) = cold_metadata.take() {
-                            let info = Arc::new(persisted.ok_or_else(|| {
+                            let mut info = persisted.ok_or_else(|| {
                                 GroupError::InvalidRequest(
                                     "server returned not-modified group but nothing was cached"
                                         .into(),
                                 )
-                            })?);
+                            })?;
+                            self.fill_group_info_pns(&mut info).await;
+                            let info = Arc::new(info);
                             metadata.cache(Arc::clone(&info)).await;
                             return Ok(info);
                         }
@@ -815,6 +817,37 @@ impl<'a> Groups<'a> {
                         // check and the decision below.
                         let metadata = self.client.lock_group_metadata(jid).await;
                         if let Some(current) = metadata.current().await {
+                            // A warm snapshot can predate mappings learned since
+                            // it was published; enrich a copy rather than serve
+                            // stale LIDs to the device query.
+                            let missing = current.addressing_mode == AddressingMode::Lid
+                                && current.participants.iter().any(|participant| {
+                                    participant.is_lid()
+                                        && current
+                                            .phone_jid_for_lid_user(&participant.user)
+                                            .is_none()
+                                });
+                            if missing {
+                                let mut enriched = (*current).clone();
+                                self.fill_group_info_pns(&mut enriched).await;
+                                let learned = enriched.participants.iter().any(|participant| {
+                                    participant.is_lid()
+                                        && current
+                                            .phone_jid_for_lid_user(&participant.user)
+                                            .is_none()
+                                        && enriched
+                                            .phone_jid_for_lid_user(&participant.user)
+                                            .is_some()
+                                });
+                                // Publish only on actual learning: publish
+                                // rewrites the durable blob, which a plain
+                                // warm hit must not pay for.
+                                if learned {
+                                    let enriched = Arc::new(enriched);
+                                    metadata.publish(Arc::clone(&enriched)).await;
+                                    return Ok(enriched);
+                                }
+                            }
                             return Ok(current);
                         }
 
@@ -870,6 +903,7 @@ impl<'a> Groups<'a> {
                 if !lid_to_pn_map.is_empty() {
                     info.set_lid_to_pn_map(lid_to_pn_map);
                 }
+                self.fill_group_info_pns(&mut info).await;
                 let info = Arc::new(info);
 
                 // Compare and publish while holding the same lane as participant
@@ -900,6 +934,38 @@ impl<'a> Groups<'a> {
                 return Ok(info);
             }
         }
+    }
+
+    async fn fill_group_info_pns(&self, info: &mut GroupInfo) {
+        if info.addressing_mode != AddressingMode::Lid {
+            return;
+        }
+        let pending: Vec<wacore_binary::CompactString> = info
+            .participants
+            .iter()
+            .filter(|jid| jid.is_lid() && info.phone_jid_for_lid_user(&jid.user).is_none())
+            .map(|jid| jid.user.clone())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        use futures::StreamExt;
+        let resolved = futures::stream::iter(pending)
+            .map(|lid| async move {
+                self.client
+                    .get_lid_pn_entry_by_user(&lid, true)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|entry| (lid, Jid::pn(&*entry.phone_number)))
+            })
+            .buffer_unordered(16)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+
+        info.fill_missing_lid_to_pn_mappings(resolved);
     }
 
     /// Backfills each LID participant's `phone_number` from the client's LID-PN
@@ -1690,6 +1756,61 @@ impl<'a> Groups<'a> {
             .await?)
     }
 
+    /// Lookup an individual group's profile picture preserving detailed protocol outcomes:
+    /// `Found`, `Unchanged`, `NotFound`, `NotAuthorized`.
+    pub async fn lookup_profile_picture(
+        &self,
+        group_jid: &Jid,
+        preview: bool,
+        existing_id: Option<&str>,
+    ) -> Result<ProfilePictureLookup, GroupError> {
+        let picture_type = if preview {
+            ContactPictureType::Preview
+        } else {
+            ContactPictureType::Full
+        };
+        let mut spec = ProfilePictureSpec::new(group_jid, picture_type);
+        if let Some(id) = existing_id {
+            spec = spec.with_existing_id(id);
+        }
+        match self.client.execute(spec).await {
+            Ok(lookup) => Ok(lookup),
+            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
+            Err(IqError::ServerError {
+                code: 401 | 403, ..
+            }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Lookup a community parent group's profile picture via `w:g2`.
+    pub async fn lookup_community_profile_picture(
+        &self,
+        community_jid: &Jid,
+        preview: bool,
+        existing_id: Option<&str>,
+    ) -> Result<ProfilePictureLookup, GroupError> {
+        let picture_type = if preview {
+            ContactPictureType::Preview
+        } else {
+            ContactPictureType::Full
+        };
+        let mut spec = ProfilePictureSpec::community(community_jid, picture_type);
+        if let Some(id) = existing_id {
+            spec = spec.with_existing_id(id);
+        }
+        match self.client.execute(spec).await {
+            Ok(lookup) => Ok(lookup),
+            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
+            Err(IqError::ServerError {
+                code: 401 | 403, ..
+            }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Set a group's profile picture (admin operation).
     ///
     /// Sends a JPEG; the caller should size/crop it (WhatsApp uses 640x640).
@@ -2060,6 +2181,387 @@ mod tests {
         };
         client.groups().fill_participant_pns(&mut meta).await;
         assert_eq!(meta.participants[0].phone_number, None);
+    }
+
+    #[tokio::test]
+    async fn query_info_backfills_known_pns_without_overriding_response() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+        use wacore::store::traits::LidPnMappingEntry;
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+        let participants: Vec<Jid> = (1..=4)
+            .map(|i| Jid::lid(format!("10000000000010{i}")))
+            .collect();
+        for i in [1, 3] {
+            client
+                .lid_pn_cache
+                .add(&LidPnEntry::new(
+                    format!("10000000000010{i}"),
+                    format!("1555555010{i}"),
+                    LearningSource::Usync,
+                ))
+                .await;
+        }
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: participants[1].user.to_string(),
+                phone_number: "15555550102".into(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "usync".into(),
+            })
+            .await
+            .unwrap();
+
+        let query = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().query_info(&group).await })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .attr("from", &group)
+            .children([NodeBuilder::new("group")
+                .attr("id", group.to_string())
+                .attr("subject", "Alias test")
+                .attr("addressing_mode", "lid")
+                .children(participants.iter().enumerate().map(|(i, jid)| {
+                    let node = NodeBuilder::new("participant").attr("jid", jid);
+                    if i == 2 {
+                        node.attr("phone_number", Jid::pn("15555550199")).build()
+                    } else {
+                        node.build()
+                    }
+                }))
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let info = query.await.unwrap().unwrap();
+        assert_eq!(info.participants, participants);
+        for (i, pn) in [(0, "15555550101"), (1, "15555550102"), (2, "15555550199")] {
+            assert_eq!(
+                info.phone_jid_for_lid_user(&participants[i].user),
+                Some(&Jid::pn(pn))
+            );
+            assert_eq!(
+                info.lid_user_for_phone_user(pn),
+                Some(&participants[i].user)
+            );
+        }
+        assert!(info.phone_jid_for_lid_user(&participants[3].user).is_none());
+        let persisted: GroupInfo = serde_json::from_slice(
+            &client
+                .persistence_manager
+                .backend()
+                .get_group_metadata(&group.to_string())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap(),
+            serde_json::to_value(info.as_ref()).unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            &info,
+            &client.groups().query_info(&group).await.unwrap()
+        ));
+        let reconcile = crate::test_utils::decode_sent_iq(&transport, 1).await;
+        let reconcile_node = reconcile.get();
+        assert_eq!(
+            reconcile_node.attrs().optional_string("xmlns").as_deref(),
+            Some("usync")
+        );
+        let usync = reconcile_node.get_optional_child("usync").unwrap();
+        assert_eq!(
+            usync.attrs().optional_string("context").as_deref(),
+            Some("background")
+        );
+        let protocols = usync.get_optional_child("query").unwrap();
+        assert_eq!(protocols.children().unwrap().len(), 1);
+        assert!(protocols.get_optional_child("lid").is_some());
+        let users = usync.get_optional_child("list").unwrap();
+        assert_eq!(users.children().unwrap().len(), 1);
+        assert_eq!(
+            users.children().unwrap()[0].attrs().optional_jid("jid"),
+            Some(Jid::pn("15555550199"))
+        );
+        let reconcile_id = reconcile_node.attrs().optional_string("id").unwrap();
+        crate::test_utils::answer_iq(
+            &client,
+            &reconcile_id,
+            &iq_error(&reconcile_id, &Jid::pn(""), "500", "internal-server-error"),
+        )
+        .await;
+
+        let devices = {
+            let client = client.clone();
+            let info = info.clone();
+            tokio::spawn(async move {
+                client
+                    .resolve_group_devices_uncached(
+                        &info,
+                        &info.participants[0],
+                        crate::cache::Freshness::CachePreferred,
+                    )
+                    .await
+            })
+        };
+        let request = crate::test_utils::decode_sent_iq(&transport, 2).await;
+        let request_node = request.get();
+        assert_eq!(
+            request_node.attrs().optional_string("xmlns").as_deref(),
+            Some("usync")
+        );
+        let usync = request_node.get_optional_child("usync").unwrap();
+        assert!(
+            usync
+                .get_optional_child("query")
+                .unwrap()
+                .get_optional_child("devices")
+                .is_some()
+        );
+        let mut requested: Vec<Jid> = usync
+            .get_optional_child("list")
+            .unwrap()
+            .children()
+            .unwrap()
+            .iter()
+            .map(|user| user.attrs().optional_jid("jid").unwrap())
+            .collect();
+        let mut expected = vec![
+            Jid::pn("15555550101"),
+            Jid::pn("15555550102"),
+            Jid::pn("15555550199"),
+            participants[3].clone(),
+        ];
+        requested.sort_by(|a, b| a.user.cmp(&b.user));
+        expected.sort_by(|a, b| a.user.cmp(&b.user));
+        assert_eq!(requested, expected);
+        let request_id = request_node.attrs().optional_string("id").unwrap();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", request_id.as_ref())
+            .attr("from", Jid::pn(""))
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children(requested.iter().map(|jid| {
+                        NodeBuilder::new("user")
+                            .attr("jid", jid)
+                            .children([NodeBuilder::new("devices")
+                                .children([NodeBuilder::new("device-list")
+                                    .children([NodeBuilder::new("device").attr("id", "0").build()])
+                                    .build()])
+                                .build()])
+                            .build()
+                    }))
+                    .build()])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &request_id, &response).await;
+        let mut devices = devices.await.unwrap().unwrap();
+        devices.sort_by(|a, b| a.user.cmp(&b.user));
+        let mut expected_devices = participants.clone();
+        expected_devices.sort_by(|a, b| a.user.cmp(&b.user));
+        assert_eq!(devices, expected_devices);
+        let mut group_queries = 0;
+        for index in 0..transport.sent().len() {
+            let frame = crate::test_utils::decode_sent_iq(&transport, index).await;
+            let node = frame.get();
+            match node.attrs().optional_string("xmlns").as_deref() {
+                Some("w:g2") => group_queries += 1,
+                Some("usync") => assert!(index == 1 || index == 2, "unexpected usync: {node:?}"),
+                _ => panic!("unexpected outbound frame: {node:?}"),
+            }
+        }
+        assert_eq!(group_queries, 1);
+    }
+
+    #[tokio::test]
+    async fn fill_group_info_pns_future_is_send() {
+        fn assert_send(_: impl Send) {}
+
+        let client = crate::test_utils::create_test_client().await;
+        let groups = client.groups();
+        let mut info = GroupInfo::new(vec![Jid::lid("100000000000101")], AddressingMode::Lid);
+        assert_send(groups.fill_group_info_pns(&mut info));
+    }
+
+    #[tokio::test]
+    async fn query_info_not_modified_backfills_persisted_pns() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+        let participants = vec![
+            Jid::lid("100000000000101"),
+            Jid::lid("100000000000102"),
+            Jid::lid("100000000000103"),
+        ];
+        let mut persisted = GroupInfo::with_lid_to_pn_map(
+            participants.clone(),
+            AddressingMode::Lid,
+            HashMap::from([(participants[1].user.clone(), Jid::pn("15555550199"))]),
+        );
+        persisted.is_community_announce = Some(true);
+        client
+            .persistence_manager
+            .backend()
+            .put_group_metadata(&group.to_string(), &serde_json::to_vec(&persisted).unwrap())
+            .await
+            .unwrap();
+        for i in [1, 2] {
+            client
+                .lid_pn_cache
+                .add(&LidPnEntry::new(
+                    format!("10000000000010{i}"),
+                    format!("1555555010{i}"),
+                    LearningSource::Usync,
+                ))
+                .await;
+        }
+        let query = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().query_info(&group).await })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        assert_eq!(
+            sent.get()
+                .get_optional_child("query")
+                .unwrap()
+                .attrs()
+                .optional_string("phash")
+                .as_deref(),
+            Some(
+                wacore::messages::MessageUtils::participant_list_hash(&participants)
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        crate::test_utils::answer_iq(&client, &id, &iq_result(&id, &group)).await;
+        let info = query.await.unwrap().unwrap();
+        assert_eq!(info.participants, participants);
+        assert_eq!(info.is_community_announce, Some(true));
+        assert_eq!(
+            info.phone_jid_for_lid_user(&participants[0].user),
+            Some(&Jid::pn("15555550101"))
+        );
+        assert_eq!(
+            info.lid_user_for_phone_user("15555550101"),
+            Some(&participants[0].user)
+        );
+        assert_eq!(
+            info.phone_jid_for_lid_user(&participants[1].user),
+            Some(&Jid::pn("15555550199"))
+        );
+        assert!(info.phone_jid_for_lid_user(&participants[2].user).is_none());
+        assert!(Arc::ptr_eq(
+            &info,
+            &client.groups().query_info(&group).await.unwrap()
+        ));
+        assert_eq!(transport.sent().len(), 1);
+    }
+
+    /// A warm snapshot can predate mappings learned since it was published.
+    /// A Refresh that the server answers with not-modified must enrich its
+    /// copy from the mapping cache rather than serve stale LIDs.
+    #[tokio::test]
+    async fn query_info_not_modified_enriches_warm_snapshot() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+        let participants = vec![Jid::lid("100000000000101"), Jid::lid("100000000000102")];
+        client
+            .get_group_cache()
+            .insert(
+                group.clone(),
+                Arc::new(GroupInfo::new(participants.clone(), AddressingMode::Lid)),
+            )
+            .await;
+        // Learned after the snapshot was published, e.g. from an inbound
+        // message carrying both identifiers.
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                participants[0].user.to_string(),
+                "15555550101",
+                LearningSource::Usync,
+            ))
+            .await;
+        let query = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move {
+                client
+                    .groups()
+                    .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+                    .await
+            })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        crate::test_utils::answer_iq(&client, &id, &iq_result(&id, &group)).await;
+        let info = query.await.unwrap().unwrap();
+        assert_eq!(
+            info.phone_jid_for_lid_user(&participants[0].user),
+            Some(&Jid::pn("15555550101")),
+            "the warm snapshot must gain the mapping learned since it was cached"
+        );
+        assert!(info.phone_jid_for_lid_user(&participants[1].user).is_none());
+        assert!(Arc::ptr_eq(
+            &info,
+            &client.groups().query_info(&group).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_info_pn_group_does_not_backfill_lid_aliases() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+        let lid = Jid::lid("100000000000101");
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                lid.user.to_string(),
+                "15555550101",
+                LearningSource::Usync,
+            ))
+            .await;
+        let query = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().query_info(&group).await })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .attr("from", &group)
+            .children([NodeBuilder::new("group")
+                .attr("id", group.to_string())
+                .attr("subject", "PN group")
+                .attr("addressing_mode", "pn")
+                .children([NodeBuilder::new("participant").attr("jid", &lid).build()])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let info = query.await.unwrap().unwrap();
+        assert_eq!(info.addressing_mode, AddressingMode::Pn);
+        assert_eq!(info.participants, vec![lid.clone()]);
+        assert!(info.phone_jid_for_lid_user(&lid.user).is_none());
+        assert_eq!(transport.sent().len(), 1);
     }
 
     #[test]

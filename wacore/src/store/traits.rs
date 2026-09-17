@@ -222,7 +222,8 @@ mod device_info_tests {
     use super::DeviceInfo;
 
     /// The packed layout is the whole point; a field added carelessly would
-    /// undo it silently.
+    /// undo it silently. Exact: the packing is the contract. Rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
     fn a_device_entry_is_eight_bytes() {
         assert_eq!(size_of::<DeviceInfo>(), 8);
@@ -292,10 +293,16 @@ mod device_info_tests {
     /// The record is held per known contact for the life of a cache entry, so
     /// its inline size is part of the budget: `Arc<str>` + `Box<[_]>` +
     /// `Option<Box<str>>` rather than `String` + `Vec` + `Option<String>` is
-    /// what keeps it at 64 bytes instead of 88.
+    /// what keeps it within 64 bytes instead of 88. Budget, not contract:
+    /// a smaller record is never a failure. Rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
-    fn a_device_list_record_is_sixty_four_bytes() {
-        assert_eq!(size_of::<super::DeviceListRecord>(), 64);
+    fn a_device_list_record_fits_sixty_four_bytes() {
+        assert!(
+            size_of::<super::DeviceListRecord>() <= 64,
+            "DeviceListRecord grew to {} B (budget 64)",
+            size_of::<super::DeviceListRecord>()
+        );
     }
 
     /// The record now serializes through a shadow struct; the blob it writes
@@ -1100,6 +1107,21 @@ pub trait ProtocolStore: Send + Sync {
         message_id: &str,
         payload: &[u8],
     ) -> Result<()>;
+
+    /// Read a sent payload without removing it or refreshing its expiry.
+    /// Cancellation, including detached backend I/O, must leave the row unchanged.
+    /// Backends without this read return an error rather than emulate it with
+    /// take + store, which can lose the payload on cancellation.
+    async fn get_sent_message(
+        &self,
+        _chat_jid: &str,
+        _message_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(crate::store::error::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "backend does not support non-consuming sent-message reads",
+        )))
+    }
 
     /// Retrieve and delete a sent message (atomic take). Returns serialized payload.
     /// Called when a retry receipt arrives; consuming prevents double-retry.

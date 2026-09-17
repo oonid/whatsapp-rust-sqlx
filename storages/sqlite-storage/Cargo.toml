@@ -34,6 +34,7 @@ serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 thiserror = { workspace = true }
 wacore = { workspace = true }
+wacore-binary = { workspace = true }
 
 [build-dependencies]
 buffa-build = { workspace = true }
@@ -43,12 +44,12 @@ sha2 = { workspace = true }
 divan = { workspace = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 # Tokio's timer requires a runtime time driver, which the single-agent browser
 # target does not provide. This future wraps the platform's real setTimeout.
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 
 [[bench]]
 name = "signal_flush"
